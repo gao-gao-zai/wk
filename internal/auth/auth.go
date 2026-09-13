@@ -193,7 +193,39 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	// 凭证字段会直接进请求头（X-User-Id / X-Enterprise-Id / X-Refresh-Token，
+	// 见 internal/upstream/headers.go）。Go 的 net/http 目前会把头值里的 CR/LF
+	// "中和"掉而不是拒绝，所以这不是可用的请求拆分；但结果是发出去的头被静默
+	// 改形（两个头被折成一行），对应账号会持续失败且很难排查。而且这层保护来自
+	// 标准库而不是本代码 —— 一旦将来换成代理/自写写出逻辑就会消失。
+	// 在唯一的入口做严格校验：凭证文件里的这些字段只应该是普通可见 ASCII。
+	for name, value := range map[string]string{
+		"accessToken":  a.AccessToken,
+		"refreshToken": a.RefreshToken,
+		"uid":          a.UID,
+		"enterpriseId": a.EnterpriseID,
+		"domain":       a.Domain,
+	} {
+		if !isSafeCredentialField(value) {
+			return nil, fmt.Errorf("parse_error: %s contains illegal characters", name)
+		}
+	}
 	return &a, nil
+}
+
+// isSafeCredentialField 校验一个会进请求头/URL 的凭证字段。
+//
+// 规则：可打印 ASCII（0x21-0x7E），不含空格、控制字符与 DEL。
+// 这覆盖了 token、uid、企业 ID 与域名的实际形态，同时挡掉 CR/LF/NUL/tab
+// 以及任何非 ASCII 注入尝试。
+func isSafeCredentialField(value string) bool {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < 0x21 || c > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持 CPA 插件可读格式。
@@ -228,6 +260,14 @@ func (a *Auth) SaveAtomic() error {
 	}
 	tmp := snapshot.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	// WriteFile 的 perm 参数只在**新建**文件时生效：如果上一轮留下了同名的
+	// .tmp（崩溃、并发写、人工放置），它会沿用那个文件的旧权限，随后 rename
+	// 把旧权限一起带到凭证文件上。凭证里有 access/refresh token，必须是 0600，
+	// 所以这里显式再 chmod 一次，让结果不依赖临时文件的历史状态。
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, snapshot.FilePath)

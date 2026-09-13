@@ -1,11 +1,12 @@
 FROM alpine:3.20
 RUN apk add --no-cache wget ca-certificates tzdata && adduser -D -u 10001 app && mkdir -p /app/auths /app/data && chown -R app:app /app
+ENV WB2A_LISTEN=:7863
 USER app
 WORKDIR /app
 COPY wb2api /app/wb2api
 COPY login /app/login
 COPY frontend /app/frontend
-COPY config.example.json /app/config.json
+# 不预置 config.json（同 Dockerfile）：缺配置时走 env，占位符会被拒绝启动。
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
 ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]

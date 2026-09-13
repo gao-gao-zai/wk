@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -30,7 +31,7 @@ func TestLargeSSEFrameSurvivesSmallInitialBuffers(t *testing.T) {
 }
 
 func TestPrepareBodyForcesStream(t *testing.T) {
-	out := PrepareBodyOpt([]byte(`{"model":"glm-5.2","messages":[]}`), true)
+	out := mustPrepareBody(t, []byte(`{"model":"glm-5.2","messages":[]}`), true)
 	var m map[string]any
 	json.Unmarshal(out, &m)
 	if m["stream"] != true {
@@ -39,7 +40,7 @@ func TestPrepareBodyForcesStream(t *testing.T) {
 }
 
 func TestPrepareBodyToolChoiceFunctionObject(t *testing.T) {
-	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"function","function":{"name":"get_weather"}},"tools":[{"type":"function"}]}`), true)
+	out := mustPrepareBody(t, []byte(`{"tool_choice":{"type":"function","function":{"name":"get_weather"}},"tools":[{"type":"function"}]}`), true)
 	var m map[string]any
 	json.Unmarshal(out, &m)
 	if m["tool_choice"] != "get_weather" {
@@ -55,7 +56,7 @@ func TestPrepareBodyToolChoiceNone(t *testing.T) {
 		`{"tool_choice":"none","tools":[{}],"functions":[{}]}`,
 		`{"tool_choice":{"type":"none"},"tools":[{}]}`,
 	} {
-		out := PrepareBodyOpt([]byte(in), true)
+		out := mustPrepareBody(t, []byte(in), true)
 		var m map[string]any
 		json.Unmarshal(out, &m)
 		if _, ok := m["tool_choice"]; ok {
@@ -71,7 +72,7 @@ func TestPrepareBodyToolChoiceNone(t *testing.T) {
 }
 
 func TestPrepareBodyToolChoiceAuto(t *testing.T) {
-	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"auto"}}`), true)
+	out := mustPrepareBody(t, []byte(`{"tool_choice":{"type":"auto"}}`), true)
 	var m map[string]any
 	json.Unmarshal(out, &m)
 	if m["tool_choice"] != "auto" {
@@ -79,11 +80,43 @@ func TestPrepareBodyToolChoiceAuto(t *testing.T) {
 	}
 }
 
+// TestPrepareBodyInvalidJSON is the MEDIUM-006 regression. The old contract was
+// "invalid JSON passes through unchanged", which meant a body that
+// encoding/json rejects but the upstream accepts reached the vendor with no
+// sanitization and without stream being forced. The contract is now fail-closed.
 func TestPrepareBodyInvalidJSON(t *testing.T) {
 	in := []byte(`{broken`)
-	out := PrepareBodyOpt(in, true)
-	if string(out) != string(in) {
-		t.Error("invalid json should pass through unchanged")
+	out, err := PrepareBodyOpt(in, true)
+	if err == nil {
+		t.Fatal("undecodable body must be rejected, not forwarded unsanitized")
+	}
+	if !errors.Is(err, ErrUnprocessableBody) {
+		t.Errorf("err = %v, want ErrUnprocessableBody", err)
+	}
+	if out != nil {
+		t.Errorf("no body should be produced on failure, got %q", out)
+	}
+}
+
+// TestPrepareBodyRejectsNonObjectJSON: a valid JSON value that is not an object
+// also cannot be rewritten, so it must be refused rather than passed through.
+func TestPrepareBodyRejectsNonObjectJSON(t *testing.T) {
+	for _, in := range []string{`[1,2,3]`, `"str"`, `42`, `null`} {
+		if out, err := PrepareBodyOpt([]byte(in), true); err == nil {
+			t.Errorf("PrepareBodyOpt(%s) accepted a non-object body: %q", in, out)
+		}
+	}
+}
+
+// TestPrepareBodyEmptyStaysEmpty: an empty body is the caller's validation
+// concern, not a decoding failure, so it must keep returning nil error.
+func TestPrepareBodyEmptyStaysEmpty(t *testing.T) {
+	out, err := PrepareBodyOpt(nil, true)
+	if err != nil {
+		t.Fatalf("empty body should not error: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("got %q, want empty", out)
 	}
 }
 

@@ -19,6 +19,14 @@ type Config struct {
 	AuthDir          string `json:"auth_dir"`          // ./auths
 	StateFile        string `json:"state_file"`        // ./data/state.json
 	Region           string `json:"region"`            // "cn" / "global" / "all"
+	// FrontendDir 静态控制台资源目录，默认 "frontend"（相对进程工作目录）。
+	// 只有 index.html 与 assets/index-<hash>.{js,css} 会被放行。
+	FrontendDir string `json:"frontend_dir"`
+	// TrustedProxies 允许其 X-Forwarded-For / X-Real-IP 生效的反向代理地址
+	// （单地址或 CIDR）。默认空 = 谁都不信，直接用 RemoteAddr。
+	// 只有服务确实只在代理后面可达时才配置：否则攻击者伪造这两个头就能
+	// 绕开基于 IP 的解锁锁定。
+	TrustedProxies []string `json:"trusted_proxies"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -124,6 +132,11 @@ type Config struct {
 		Enabled    bool   `json:"enabled"`     // 默认 true
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
+		// Salt 给会话键 HMAC 加盐（hex）。为空则启动时生成随机盐并在日志告警：
+		// 会话粘性可用，但重启后全部重新分配，且键可被预计算。
+		Salt string `json:"salt"`
+		// MaxEntries 粘性绑定表上限，默认 10000。TTL 无法在单个窗口内封顶。
+		MaxEntries int `json:"max_entries"`
 	} `json:"session_sticky"`
 
 	// 解析后
@@ -140,11 +153,15 @@ type Config struct {
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:    ":7863",
+		// 只监听回环：默认部署是本机给编辑器/脚本用的，",7863" 会 bind 所有网卡。
+		// 需要对外暴露（含容器）时显式设置 listen 或 WB2A_LISTEN=:7863。
+		Listen:    "127.0.0.1:7863",
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
 		Region:    "cn",
+		// 静态控制台资源目录。空表示用 "frontend"（NewHandler 内部兜底）。
+		FrontendDir: "frontend",
 	}
 	c.Cooldown.SoftRate = "60s"
 	c.Schedule.CheckinHours = []int{9, 21}
@@ -205,6 +222,22 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_REGION"); v != "" {
 		c.Region = v
+	}
+	if v := os.Getenv("WB2A_FRONTEND_DIR"); v != "" {
+		c.FrontendDir = v
+	}
+	if v := os.Getenv("WB2A_SESSION_SALT"); v != "" {
+		c.SessionSticky.Salt = v
+	}
+	// 逗号分隔：WB2A_TRUSTED_PROXIES=10.0.0.1,10.0.0.0/8
+	if v := os.Getenv("WB2A_TRUSTED_PROXIES"); v != "" {
+		var proxies []string
+		for _, part := range strings.Split(v, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				proxies = append(proxies, part)
+			}
+		}
+		c.TrustedProxies = proxies
 	}
 	if v := os.Getenv("WB2A_POSTGRES_DSN"); v != "" {
 		c.Postgres.DSN = v

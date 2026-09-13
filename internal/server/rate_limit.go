@@ -20,6 +20,11 @@ var (
 	rateLimitCodePattern  = regexp.MustCompile(`(?i)"code"\s*:\s*"?(\d+)"?`)
 )
 
+// maxRateLimitCooldown 上游 reset_at 能产生的最长冷却。真实的重置窗口是小时级
+// （下一个整点或次日），24 小时已经远超正常值；超过就认为这个 reset 不可信，
+// 回退到短冷却而不是把一个健康账号冻结到远期。
+const maxRateLimitCooldown = 24 * time.Hour
+
 type rateLimitEnvelope struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
@@ -122,6 +127,12 @@ func rateLimitResetAt(body string, now time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	if !reset.After(now) {
+		return time.Time{}, false
+	}
+	// 上限检查：reset 直接就是冷却到期时间（见 handler 对 reset_at 的消费），
+	// 而上游 body 是我们不能信任的输入。没有这一条，"9999-12-31" 这样的
+	// 远期时间会把一个健康账号冻结成实际上的永久不可用。
+	if reset.After(now.Add(maxRateLimitCooldown)) {
 		return time.Time{}, false
 	}
 	return reset, true

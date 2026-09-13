@@ -96,7 +96,7 @@ func TestResponsesPromptCacheKeyKeepsAccountAffinity(t *testing.T) {
 		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
 	)
 	sess := session.New(session.Config{Available: p.AvailableUIDs})
-	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, Session: sess})
 
 	for i := 0; i < 2; i++ {
 		rec := doResponsesRequest(h, `{"model":"glm-5.2","input":"hello","stream":true,"prompt_cache_key":"agent-42"}`)
@@ -135,7 +135,7 @@ func TestResponsesNonStreamPreservesWorkBuddyRequestID(t *testing.T) {
 		return 200, "data: {\"request_id\":\"" + upstreamID + "\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
 			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true
 	})
-	h := NewHandler(Config{
+	h := newTestHandler(t, Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
@@ -164,7 +164,7 @@ func TestResponsesStreamPreservesWorkBuddyRecordID(t *testing.T) {
 		return 200, "data: {\"record_id\":\"" + upstreamID + "\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
 			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true
 	})
-	h := NewHandler(Config{
+	h := newTestHandler(t, Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})

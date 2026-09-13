@@ -571,7 +571,12 @@ func extractCreditUsage(resp map[string]any) (float64, bool) {
 	if resp == nil {
 		return 0, false
 	}
+	// 首位是裸名 "credit"：这是 WorkBuddy 上游**实际**使用的字段
+	// （usage.credit，值已四舍五入到 0.01，流式末帧与非流式都有）。
+	// 它必须排在长名之前，否则长名分支一旦命中就会盖掉真实费用；
+	// 曾经因为整张表都没有裸名，导致所有请求记为 unknown / 0。
 	creditKeys := []string{
+		"credit",
 		"credits_consumed", "credit_consumed", "credits_used", "credit_used", "used_credits", "consumed_credits", "cost_credits", "billable_credits", "credit_cost",
 		"creditsConsumed", "creditConsumed", "creditsUsed", "creditUsed", "usedCredits", "consumedCredits", "costCredits", "billableCredits", "creditCost",
 	}
@@ -648,6 +653,39 @@ func uidPrefix(uid string) string {
 	return uid
 }
 
+// sanitizeLogCell 把客户端可控的字符串净化成安全的日志单元格。
+//
+// 两个真实问题：
+//  1. 旧的 model[:11] 是**按字节**截断。model 直接来自请求体的 "model"
+//     字段，没有任何白名单校验，所以一个含多字节字符的名字会被切成非法
+//     UTF-8（实测 "模模模\xe6\xa8"），既污染日志又让后续解析/检索出错。
+//     这里改成按 rune 截断。
+//  2. 控制字符（\r、\n、ESC、其它 C0/C1）原样进日志。\r 能把光标拉回行首
+//     再覆盖整行，ESC 序列能操纵终端、伪造出"看起来正常"的日志行，从而
+//     掩盖真实攻击痕迹。日志是审计证据，必须净化。
+func sanitizeLogCell(s string, maxRunes int) string {
+	if s == "" {
+		return s
+	}
+	// 先把非法 UTF-8 换成替换字符，避免截断产出坏字节。
+	s = strings.ToValidUTF8(s, "?")
+	var b strings.Builder
+	b.Grow(len(s))
+	count := 0
+	for _, r := range s {
+		// 控制字符（含 DEL）一律丢弃；保留普通可见字符与空格。
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			continue
+		}
+		if maxRunes > 0 && count >= maxRunes {
+			break
+		}
+		b.WriteRune(r)
+		count++
+	}
+	return b.String()
+}
+
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks<0 表示 usage 缺失，显示 "-"。
 type creditLog struct {
@@ -661,9 +699,12 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
-	}
+	// model 来自请求体、未被白名单校验；mode/uid/errorCode 也一并净化，
+	// 因为它们都会进入同一条表格日志。按 rune 截断 + 去掉控制字符，
+	// 细节见 sanitizeLogCell。
+	model = sanitizeLogCell(model, 11)
+	mode = sanitizeLogCell(mode, 16)
+	uid = sanitizeLogCell(uid, 64)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
@@ -683,7 +724,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		creditField = fmt.Sprintf(" | credits=%.4g(%s)", credits[0].value, credits[0].source)
 	}
 	if len(credits) > 0 && credits[0].errorCode != "" {
-		creditField += " | error=" + credits[0].errorCode
+		creditField += " | error=" + sanitizeLogCell(credits[0].errorCode, 64)
 	}
 	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs%s |\n",
 		seq,

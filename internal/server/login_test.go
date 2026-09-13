@@ -10,7 +10,7 @@ import (
 )
 
 func TestLoginRegionSelection(t *testing.T) {
-	h := NewHandler(Config{Region: "cn"})
+	h := newTestHandler(t, Config{Region: "cn"})
 	got, err := h.loginRegion(httptest.NewRequest("POST", "/admin/account/url?region=global", nil))
 	if err != nil || got != "global" {
 		t.Fatalf("global region=%q err=%v", got, err)
@@ -35,7 +35,7 @@ func TestPromoteMixedRegionPersistsConfig(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"region":"cn","schedule":{"checkin_hours":[9]}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(Config{ConfigPath: path, Region: "cn"})
+	h := newTestHandler(t, Config{ConfigPath: path, Region: "cn"})
 	if err := h.promoteMixedRegionIfNeeded("global"); err != nil {
 		t.Fatalf("promote: %v", err)
 	}

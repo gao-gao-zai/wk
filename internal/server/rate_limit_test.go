@@ -77,7 +77,7 @@ func TestChatRateLimitUsesResetAndSkipsAccountUntilReset(t *testing.T) {
 		return http.StatusTooManyRequests, body, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, MaxRotate: 3})
 
 	request := func() *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
@@ -123,7 +123,7 @@ func TestChatRateLimitWithoutResetUsesStrictFallback(t *testing.T) {
 		return http.StatusTooManyRequests, `{"code":6004,"msg":"rate limited"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Hour})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, SoftCooldown: time.Hour})
 	request := func() *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
@@ -174,7 +174,7 @@ func TestChatRateLimitLeavesOtherModelAvailableOnSameAccount(t *testing.T) {
 		}, nil
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, MaxRotate: 3})
 
 	request := func(model string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
@@ -221,7 +221,7 @@ func TestGenericRateLimitUsesModelScopeWhenModelPresent(t *testing.T) {
 		}, nil
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 2, SoftCooldown: time.Hour})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, MaxRotate: 2, SoftCooldown: time.Hour})
 
 	request := func(model string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
@@ -270,7 +270,7 @@ func TestRateLimitUsesCanonicalModelIDForAliases(t *testing.T) {
 		}, nil
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 2})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, MaxRotate: 2})
 	request := func(model string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		payload := fmt.Sprintf(`{"model":%q,"messages":[]}`, model)
@@ -307,7 +307,7 @@ func TestResponsesRateLimitUsesModelScope(t *testing.T) {
 		return http.StatusServiceUnavailable, body, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 2})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, MaxRotate: 2})
 	if rec := doResponsesRequest(h, `{"model":"deepseek-v4.1-flash","input":"hello"}`); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("responses code=%d body=%s", rec.Code, rec.Body)
 	}

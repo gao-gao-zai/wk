@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"log"
 	"net/http"
@@ -151,16 +152,18 @@ func main() {
 	cfg, err := Load(*cfgPath)
 	if err != nil {
 		// 配置文件不存在时给一次机会用纯默认 + env
-		if os.IsNotExist(err) {
-			log.Printf("config %s not found, using defaults+env", *cfgPath)
-			cfg, err = Load("")
-			if err == nil && cfg.APIKey == "" {
-				log.Fatalf("config %s is missing and WB2A_API_KEY is not set; refusing to start without API authentication", *cfgPath)
-			}
+		if !os.IsNotExist(err) {
+			log.Fatalf("load config: %v", err)
 		}
+		log.Printf("config %s not found, using defaults+env", *cfgPath)
+		cfg, err = Load("")
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
+	}
+	// 两条路径都检查：文件存在但仍是示例占位符，与文件缺失一样危险。
+	if err := requireRealCredential(cfg); err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir, cfg.Region)
@@ -222,11 +225,30 @@ func main() {
 		redisMode = "upstash"
 	}
 	if cfg.SessionSticky.Enabled {
+		salt, err := decodeSessionSalt(cfg.SessionSticky.Salt)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		if len(salt) == 0 {
+			// 会话粘性没有盐也能工作，但键可被离线预计算（知道账号列表即可反推
+			// 任意 key 落到哪个 uid）。这里生成一次性随机盐：会话粘性照常，
+			// 重启后全部重新分配。要跨重启保持粘性就把 salt 写进配置。
+			buf := make([]byte, 32)
+			if _, err := rand.Read(buf); err != nil {
+				log.Printf("session sticky: cannot generate salt: %v", err)
+			} else {
+				salt = buf
+				log.Printf("session sticky: session_sticky.salt is unset; generated an ephemeral salt. " +
+					"Sticky bindings will NOT survive restart — set session_sticky.salt to a fixed hex value to keep them.")
+			}
+		}
 		sessRouter = session.New(session.Config{
 			TTL:        cfg.SessionTTL,
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
 			Available:  p.AvailableUIDs,
+			Salt:       salt,
+			MaxEntries: cfg.SessionSticky.MaxEntries,
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -264,6 +286,10 @@ func main() {
 		AuthDir:          cfg.AuthDir,
 		Region:           cfg.Region,
 		LoginBin:         "/app/login",
+		// 静态控制台资源目录与可信代理：前者只放行 index.html + assets 白名单，
+		// 后者决定是否采信 X-Forwarded-For（空 = 谁都不信，用 RemoteAddr）。
+		FrontendDir:      cfg.FrontendDir,
+		TrustedProxies:   cfg.TrustedProxies,
 		CheckinNow:       sch.RunCheckinNow,
 		CreditRefreshNow: sch.RunCreditRefreshNow,
 		CheckinAccount:   sch.CheckinAccount,
@@ -378,7 +404,8 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 	isp := strings.TrimSpace(hz.ISP)
 
 	setup := func(c *haozhuma.Client) *haozhuma.Client {
-		c.Author, c.UID, c.ISP = author, uid, isp
+		c.Author, c.ISP = author, isp
+		c.SetUID(uid)
 		return c
 	}
 

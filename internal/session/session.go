@@ -10,13 +10,25 @@
 package session
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
 	"workbuddy2api/internal/redisstore"
 )
+
+// maxStickyKeyLen 限制入站会话键参与哈希的字节数。键会被归一化成固定长度，
+// 所以这个上限只是省掉无谓的哈希开销，不承担内存保护职责。
+const maxStickyKeyLen = 512
+
+// defaultMaxEntries 绑定表容量上限。TTL 单独并不能把表大小封顶：在一个 TTL 窗口内
+// 灌入大量互不相同的 key，每条都是"未过期"的，表会一直涨。
+const defaultMaxEntries = 10000
 
 // entry 单条会话绑定。
 type entry struct {
@@ -31,6 +43,12 @@ type Config struct {
 	GCInterval time.Duration
 	Store      redisstore.Store
 	Available  func() []string
+	// Salt 给会话键的 HMAC 加盐。没有盐时 hashIndex 是公开可算的，
+	// 知道账号列表的人就能反推任意 key 会落到哪个 uid，从而抢占别人的会话槽位。
+	// 每个部署生成一次并保持不变；换盐会让所有会话重新分配。
+	Salt []byte
+	// MaxEntries 绑定表上限；<=0 取 defaultMaxEntries。
+	MaxEntries int
 }
 
 // Router 会话粘性路由器。
@@ -53,7 +71,56 @@ func New(cfg Config) *Router {
 	if cfg.GCInterval <= 0 {
 		cfg.GCInterval = 5 * time.Minute
 	}
+	if cfg.MaxEntries <= 0 {
+		cfg.MaxEntries = defaultMaxEntries
+	}
+	if len(cfg.Salt) == 0 {
+		// 没有配置盐时退化为不带密钥的 SHA-256：仍然把键归一化成定长，
+		// 内存有界，但不提供抗预计算能力。main 会生成随机盐并告警。
+		log.Printf("[session] sticky salt is empty; session keys are not keyed (set session_sticky.salt)")
+	}
 	return &Router{entries: map[string]entry{}, cfg: cfg}
+}
+
+// normalizeKey 把客户端提供的会话键转成实际用作 map/redis key 的定长标识。
+//
+// 两个作用：
+//  1. 定长——10MB 的 conversation_id 和 10 字节的一样只占 32 字节，客户端的
+//     无界输入无法再直接放大内存；
+//  2. 不可预测——HMAC 加盐后，知道账号列表也无法反推某个 key 会落到哪个 uid。
+func (r *Router) normalizeKey(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if len(raw) > maxStickyKeyLen {
+		raw = raw[:maxStickyKeyLen]
+	}
+	mac := hmac.New(sha256.New, r.cfg.Salt)
+	mac.Write([]byte(raw))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// evictLocked 在写入前保证表不超上限。调用方必须已持有写锁。
+// 淘汰最久未活跃的条目（与 GC 的过期语义一致，只是提前触发）。
+func (r *Router) evictLocked(now time.Time) {
+	if r.cfg.MaxEntries <= 0 || len(r.entries) < r.cfg.MaxEntries {
+		return
+	}
+	// 一次淘汰 1/8，避免每个请求都在这里做 O(n) 扫描。
+	target := len(r.entries) - r.cfg.MaxEntries + r.cfg.MaxEntries/8 + 1
+	type kv struct {
+		key string
+		at  time.Time
+	}
+	all := make([]kv, 0, len(r.entries))
+	for k, e := range r.entries {
+		all = append(all, kv{k, e.lastActive})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	for i := 0; i < target && i < len(all); i++ {
+		delete(r.entries, all[i].key)
+		r.cfg.Store.DelBind(all[i].key)
+	}
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -116,7 +183,16 @@ func (r *Router) LoadFromStore() {
 
 // Resolve 返回会话 key 应绑定的账号 uid，ok=false 表示当前无可用账号。
 // 命中且账号可用 → 滚动 lastActive 并直接返回；否则（lazy 异常情况）走重新分配。
+//
+// 边界归一化：key 在这里一次性转成定长 HMAC。内部（touch / gcOnce /
+// LoadFromStore）拿到的都是已归一化的键，**不要**再归一化一次——对归一化结果
+// 再做一次 HMAC 会得到另一个值，快路径写进去的键下次就查不到了，粘性会话会
+// 在"看起来正常路由"的同时每请求重新分配。
 func (r *Router) Resolve(key string) (string, bool) {
+	key = r.normalizeKey(key)
+	if key == "" {
+		return "", false
+	}
 	now := time.Now()
 	available := r.availableSet()
 
@@ -167,6 +243,9 @@ func (r *Router) Resolve(key string) (string, bool) {
 	}
 	uid := pool2[hashIndex(key, len(pool2))]
 
+	// 写入前先保证表不超上限：TTL 只能在 GC 周期内清理过期项，
+	// 无法阻止"一个 TTL 窗口内灌入大量不同 key"造成的无界增长。
+	r.evictLocked(now)
 	prev, existed := r.entries[key]
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	if existed && prev.uid != uid {
@@ -188,11 +267,13 @@ func (r *Router) touch(key, uid string, now time.Time) {
 // 供"粘性跟随最终成功号"用：请求成功返回前，把会话重绑到实际成功的账号，让多轮对话下一跳稳定
 // 收敛到"对该会话持续成功的号"（对齐 antigravity 语义）。空 key 直接返回（无会话则不绑）。
 func (r *Router) Bind(key, uid string) {
+	key = r.normalizeKey(key)
 	if key == "" || uid == "" {
 		return
 	}
 	now := time.Now()
 	r.mu.Lock()
+	r.evictLocked(now)
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
@@ -200,6 +281,10 @@ func (r *Router) Bind(key, uid string) {
 
 // Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
 func (r *Router) Unbind(key string) bool {
+	key = r.normalizeKey(key)
+	if key == "" {
+		return false
+	}
 	r.mu.Lock()
 	_, found := r.entries[key]
 	if found {

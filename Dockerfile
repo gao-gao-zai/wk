@@ -19,12 +19,16 @@ RUN apk add --no-cache wget ca-certificates tzdata \
  && adduser -D -u 10001 app \
  && mkdir -p /app/auths /app/data \
  && chown -R app:app /app
+# 容器内必须 bind 所有网卡端口映射才生效；默认配置只监听回环。
+ENV WB2A_LISTEN=:7863
 USER app
 WORKDIR /app
 COPY --from=build /out/wb2api /app/wb2api
 COPY --from=build /out/login /app/login
 COPY --from=frontend-build /src/react/dist /app/frontend
-COPY config.example.json /app/config.json
+# 不再预置 config.json。以前这里 COPY config.example.json，等于把一个公开仓库里的
+# 占位符当作线上凭据发布；缺配置时改走 env（WB2A_API_KEY 等），且
+# requireRealCredential 会拒绝占位符或空凭据启动。
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1

@@ -16,7 +16,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,9 +65,17 @@ type Config struct {
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
-	RedisMode       string
-	SoftCooldown    time.Duration // 429 冷却，默认 60s
-	RefreshSkew     time.Duration // token 提前刷新窗口，默认 10m
+	RedisMode    string
+	SoftCooldown time.Duration // 429 冷却，默认 60s
+	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	// FrontendDir 静态控制台资源目录（默认 "frontend"，相对进程工作目录）。
+	// 只放行 index.html 与 assets/index-<hash>.{js,css}，见 staticConsole。
+	FrontendDir string
+	// TrustedProxies 是允许其 X-Forwarded-For / X-Real-IP 生效的反向代理地址，
+	// 支持单地址或 CIDR。空 = 谁都不信（安全默认，直接用 RemoteAddr）。
+	// 只有确定服务一定在代理后面、且直连不可达时才配置，否则攻击者可以伪造
+	// 头来绕开基于 IP 的解锁锁定。
+	TrustedProxies  []string
 	ResponseStore   ResponseStore
 	MetricsStore    MetricsStore
 	RequestLogStore RequestLogStore
@@ -93,6 +103,10 @@ type Handler struct {
 	responseBytes   int
 	unlockRateMu    sync.Mutex
 	unlockAttempts  map[string]unlockAttempt
+	// 全局解锁失败窗口（跨 IP），见 recordGlobalUnlockFailureLocked。
+	unlockGlobalFailures     int
+	unlockGlobalWindowStart  time.Time
+	unlockGlobalBlockedUntil time.Time
 }
 
 type unlockAttempt struct {
@@ -123,6 +137,10 @@ const (
 	unlockFailureLimit      = 5
 	unlockFailureWindow     = time.Minute
 	unlockBlockDuration     = 5 * time.Minute
+	// 全局解锁上限：per-IP 锁定挡不住换 IP 的暴力破解，这一层让整体速率有上界。
+	unlockGlobalFailureLimit  = 50
+	unlockGlobalWindow        = 5 * time.Minute
+	unlockGlobalBlockDuration = 15 * time.Minute
 )
 
 // NewHandler 构建 handler。
@@ -188,18 +206,139 @@ func NewHandler(cfg Config) *Handler {
 			},
 		)
 	}
-	// Static console assets are served from the image's frontend directory.
-	h.mux.Handle("/", http.FileServer(http.Dir("frontend")))
+	// Static console assets are served through an explicit allow-list (see
+	// staticConsoleHandler) instead of http.FileServer(http.Dir("frontend")).
+	// FileServer applied no filtering at all: it served every regular file under
+	// the directory and generated an HTML index for any subdirectory lacking
+	// index.html. Since the directory is resolved relative to the process working
+	// directory, anything that landed in frontend/ — editor backups, a copied
+	// config.json, an auth dumps file — became downloadable, and the whole
+	// console bundle was readable without authenticating.
+	h.mux.Handle("/", h.staticConsole())
 	return h
 }
 
+// Console asset allow-list.
+//
+// Only the Vite build output is reachable: the HTML shell, and hashed
+// JS/CSS bundles under assets/. Everything else under FrontendDir — including
+// any stray file an operator or a backup tool happens to drop there — is 404.
+// Hashed asset names are matched by pattern rather than enumerated, so a rebuild
+// that changes the content hash does not require a code change.
+var (
+	consoleAssetNamePattern = regexp.MustCompile(`^index-[A-Za-z0-9_-]{6,}\.(js|css)$`)
+	consoleAssetTypes       = map[string]string{
+		".js":  "text/javascript; charset=utf-8",
+		".css": "text/css; charset=utf-8",
+	}
+)
+
+// staticConsole serves the console shell and its built assets from an allow-list.
+func (h *Handler) staticConsole() http.Handler {
+	dir := h.cfg.FrontendDir
+	if dir == "" {
+		dir = "frontend"
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			// A catch-all GET-only static route must not double as a sink for
+			// arbitrary methods destined for unknown paths.
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := path.Clean("/" + r.URL.Path)
+		switch {
+		case name == "/" || name == "/index.html":
+			serveConsoleFile(w, r, filepath.Join(dir, "index.html"), "text/html; charset=utf-8")
+		case strings.HasPrefix(name, "/assets/"):
+			// Reject a trailing slash before taking path.Base: Base("/assets/x.js/")
+			// is "x.js", which would let the odd path through the pattern below.
+			if strings.HasSuffix(r.URL.Path, "/") {
+				http.NotFound(w, r)
+				return
+			}
+			asset := path.Base(name)
+			// path.Clean collapsed any "../" already, and the pattern admits no
+			// separator, so this cannot escape the assets/ directory.
+			if !consoleAssetNamePattern.MatchString(asset) {
+				http.NotFound(w, r)
+				return
+			}
+			// The legacy v1 console (app.js/admin.css/styles.css) is deliberately
+			// NOT served: its inline API keys and unauthenticated endpoints are the
+			// subject of separate findings, and the React console replaces it.
+			serveConsoleFile(w, r, filepath.Join(dir, "assets", asset), consoleAssetTypes[path.Ext(asset)])
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
+// serveConsoleFile writes one allow-listed file, or 404 when it is absent.
+func serveConsoleFile(w http.ResponseWriter, r *http.Request, filename, contentType string) {
+	info, err := os.Stat(filename)
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	// The shell is what selects a hashed bundle, so it must not be cached
+	// blindly; hashed assets are immutable by construction.
+	if strings.HasSuffix(filename, "index.html") {
+		w.Header().Set("Cache-Control", "no-cache")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	http.ServeFile(w, r, filename)
+}
+
+// securityHeaders 统一给每个响应补上基础安全头。
+//
+// 这些不是"锦上添花"：控制台是一个能查看账号/改配置的页面，没有
+// nosniff 时浏览器可能把 assets 当 HTML 解析，没有 frame-ancestors 时
+// 任何站点都能把它套进 iframe 做点击劫持，没有 Referrer-Policy 时
+// 控制台 URL 会随着外链把信息带出去。
+func securityHeaders(h http.Header) {
+	h.Set("X-Content-Type-Options", "nosniff")
+	// SAMEORIGIN 而不是 DENY：控制台自身没有需要嵌套的页面，
+	// 但同源内嵌在本地部署（反代同名域）下是常见用法。
+	h.Set("X-Frame-Options", "SAMEORIGIN")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Cross-Origin-Opener-Policy", "same-origin")
+	// API 响应返回 JSON，不应被任何页面当作脚本执行。
+	//
+	// style-src 必须带 'unsafe-inline'：Ant Design 用 cssinjs 在运行时注入
+	// <style>，一律禁止会让控制台布局整个失效。样式注入的利用价值远低于脚本
+	// 注入，这里是有意的取舍；script-src 依然保持 'self'（Vite 产物是外部文件，
+	// 不需要内联脚本），那才是真正要守住的一条。
+	h.Set("Content-Security-Policy",
+		"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; "+
+			"object-src 'none'; base-uri 'none'; form-action 'self'")
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	securityHeaders(w.Header())
 	h.mux.ServeHTTP(w, r)
+}
+
+// authOK reports whether the request carries a valid credential.
+//
+// It is deliberately deny-by-default: if no credential is configured, neither
+// validAPIKey nor frontendSession can validate anything, so every request is
+// refused. An unconfigured service must never be an open service — the previous
+// positive guard (`APIKey != ""`) made "no credential configured" mean "no
+// authentication required", which turned every route public.
+func (h *Handler) authOK(r *http.Request) bool {
+	return h.validAPIKey(r) || h.frontendSession(r)
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.APIKey != "" && !h.validAPIKey(r) && !h.frontendSession(r) {
+		if !h.authOK(r) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
@@ -236,9 +375,8 @@ func (h *Handler) frontendSession(r *http.Request) bool {
 func (h *Handler) withFrontend(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Admin endpoints accept either the configured API key or the frontend
-		// unlock cookie. If either credential is configured, require one of them.
-		if (h.cfg.APIKey != "" || h.cfg.FrontendPassword != "") &&
-			!h.validAPIKey(r) && !h.frontendSession(r) {
+		// unlock cookie. Deny-by-default: see authOK.
+		if !h.authOK(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"code": "frontend_locked", "message": "frontend password or API key required"}})
 			return
 		}
@@ -247,7 +385,10 @@ func (h *Handler) withFrontend(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
-	if retryAfter := h.unlockRetryAfter(unlockClientKey(r)); retryAfter > 0 {
+	// 用 clientHost 而不是裸的 RemoteAddr：只有配置了可信代理时才采信 XFF，
+	// 否则攻击者能靠换头把每次尝试放进新的限流桶，锁定形同虚设。
+	clientKey := h.clientHost(r)
+	if retryAfter := h.unlockRetryAfter(clientKey); retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": "尝试次数过多，请稍后重试"})
 		return
@@ -255,7 +396,6 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Password string `json:"password"`
 	}
-	clientKey := unlockClientKey(r)
 	if json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req) != nil || h.cfg.FrontendPassword == "" || req.Password != h.cfg.FrontendPassword {
 		h.recordUnlockFailure(clientKey)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "密码错误"})
@@ -271,18 +411,87 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 	h.sessionsMu.Lock()
 	h.sessions[token] = time.Now().Add(24 * time.Hour)
 	h.sessionsMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "wb2api_frontend", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 86400})
+	// Secure：仅在请求确实走 HTTPS 时设置。无条件设置会让纯 HTTP 的本地部署
+	// 完全无法登录（浏览器直接丢弃 cookie）。TLS 可能终止在反向代理上，所以
+	// 当且仅当对端是可信代理时才采信 X-Forwarded-Proto，否则攻击者只要加一个
+	// 头就能让我们发出 Secure cookie 从而让控制台登录静默失效。
+	secure := r.TLS != nil || (h.isTrustedProxy(remoteHost(r.RemoteAddr)) &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"))
+	http.SetCookie(w, &http.Cookie{
+		Name: "wb2api_frontend", Value: token, Path: "/",
+		HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode, MaxAge: 86400,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func unlockClientKey(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil && host != "" {
+// clientHost returns the address the request should be attributed to.
+//
+// r.RemoteAddr is the only value an attacker cannot forge, so it is the default.
+// X-Forwarded-For / X-Real-IP are honoured **only** when the immediate peer is a
+// configured trusted proxy: otherwise a client could pick its own rate-limit
+// bucket per request by rotating a header, which defeats the unlock lockout
+// entirely. Trusting XFF unconditionally (the common mistake) is strictly worse
+// than ignoring it.
+func (h *Handler) clientHost(r *http.Request) string {
+	peer := remoteHost(r.RemoteAddr)
+	if !h.isTrustedProxy(peer) {
+		return peer
+	}
+	// Walk XFF right-to-left and return the first untrusted hop: the rightmost
+	// entry is the one appended by our own trusted proxy, so it cannot be spoofed.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := remoteHost(strings.TrimSpace(parts[i]))
+			if candidate == "" {
+				continue
+			}
+			if !h.isTrustedProxy(candidate) {
+				return candidate
+			}
+		}
+	}
+	if realIP := remoteHost(strings.TrimSpace(r.Header.Get("X-Real-IP"))); realIP != "" {
+		return realIP
+	}
+	return peer
+}
+
+// isTrustedProxy reports whether host is one of the configured trusted proxies.
+// An empty TrustedProxies list means "trust nobody" (the safe default).
+func (h *Handler) isTrustedProxy(host string) bool {
+	if host == "" {
+		return false
+	}
+	for _, entry := range h.cfg.TrustedProxies {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if entry == host {
+			return true
+		}
+		// Allow a CIDR entry so an operator can trust a whole subnet.
+		if _, network, err := net.ParseCIDR(entry); err == nil {
+			if ip := net.ParseIP(host); ip != nil && network.Contains(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// remoteHost strips the port from a host:port pair, tolerating a bare host and
+// bracketed IPv6 literals.
+func remoteHost(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
 		return host
 	}
-	if raw := strings.TrimSpace(r.RemoteAddr); raw != "" {
-		return raw
-	}
-	return "unknown"
+	return strings.Trim(addr, "[]")
 }
 
 func (h *Handler) unlockRetryAfter(key string) int {
@@ -293,6 +502,15 @@ func (h *Handler) unlockRetryAfter(key string) int {
 	h.unlockRateMu.Lock()
 	defer h.unlockRateMu.Unlock()
 	h.cleanupUnlockAttemptsLocked(now)
+	// 全局窗口：per-IP 锁定可以被换 IP / 换 XFF 绕过，这里再加一道总量限制，
+	// 让分布式暴力破解也只能以很低的速率推进。
+	if now.Before(h.unlockGlobalBlockedUntil) {
+		seconds := int(time.Until(h.unlockGlobalBlockedUntil).Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+		return seconds
+	}
 	attempt := h.unlockAttempts[key]
 	if now.Before(attempt.blockedUntil) {
 		seconds := int(time.Until(attempt.blockedUntil).Seconds())
@@ -321,6 +539,21 @@ func (h *Handler) recordUnlockFailure(key string) {
 		attempt.blockedUntil = now.Add(unlockBlockDuration)
 	}
 	h.unlockAttempts[key] = attempt
+	h.recordGlobalUnlockFailureLocked(now)
+}
+
+// recordGlobalUnlockFailureLocked 累计跨 IP 的失败数并触发全局封锁。
+func (h *Handler) recordGlobalUnlockFailureLocked(now time.Time) {
+	if h.unlockGlobalWindowStart.IsZero() || now.Sub(h.unlockGlobalWindowStart) >= unlockGlobalWindow {
+		h.unlockGlobalWindowStart = now
+		h.unlockGlobalFailures = 0
+	}
+	h.unlockGlobalFailures++
+	if h.unlockGlobalFailures >= unlockGlobalFailureLimit {
+		h.unlockGlobalBlockedUntil = now.Add(unlockGlobalBlockDuration)
+		h.unlockGlobalFailures = 0
+		h.unlockGlobalWindowStart = now
+	}
 }
 
 func (h *Handler) clearUnlockFailures(key string) {
@@ -1249,10 +1482,16 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) requests(w http.ResponseWriter, r *http.Request) {
-	limit := 50
+	// 在边界处夹紧 limit。存储层各自还有一道防御性夹紧，但依赖后端实现意味着
+	// 换个后端就换一套行为；"limit=100000000" 这种客户端输入不该被放行。
+	const defaultRequestsLimit, maxRequestsLimit = 50, 500
+	limit := defaultRequestsLimit
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if value, err := strconv.Atoi(raw); err == nil {
+		if value, err := strconv.Atoi(raw); err == nil && value > 0 {
 			limit = value
+			if limit > maxRequestsLimit {
+				limit = maxRequestsLimit
+			}
 		}
 	}
 	if h.cfg.RequestLogStore == nil {
@@ -1401,7 +1640,10 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	var requestDoc map[string]any
 	var chatDoc map[string]any
-	if json.Unmarshal(body, &requestDoc) != nil || json.Unmarshal(chatBody, &chatDoc) != nil {
+	// nil 检查与 chat 路径同理：`null` 会解码成功但留下 nil map，
+	// 后续 map 写入会 panic（"assignment to entry in nil map"）。
+	if json.Unmarshal(body, &requestDoc) != nil || requestDoc == nil ||
+		json.Unmarshal(chatBody, &chatDoc) != nil || chatDoc == nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid request body")
 		return
 	}
@@ -2383,6 +2625,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateImageParts(body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_image", err.Error())
+		return
+	}
+	// 请求体必须能解码成 JSON 对象。上游 client 在 prepareBody 里会返回
+	// upstream.ErrUnprocessableBody（fail-closed，避免脱敏被畸形 body 绕过），
+	// 但那个错误发生在选号之后的循环里，会被当成传输层错误逐号重试。
+	// 在这里提前拒掉，既给出正确的 400，也不浪费号池与熔断计数。
+	// 用 map 而不是 json.Valid：后者会放行 [1,2,3] 这类合法但非对象的 JSON，
+	// 而那正是 prepareBody 会拒绝的输入。
+	// 还必须显式检查 nil map：json.Unmarshal([]byte("null"), &doc) 返回
+	// err == nil 且 doc == nil，只看 err 会漏掉 `null` 这个 4 字节的请求体，
+	// 让它一路走到 prepareBody 才失败（并被误判成 503 no_healthy_account）。
+	var bodyDoc map[string]any
+	if err := json.Unmarshal(body, &bodyDoc); err != nil || bodyDoc == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "request body must be a JSON object")
 		return
 	}
 	var peek struct {

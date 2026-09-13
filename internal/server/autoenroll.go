@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -135,8 +136,13 @@ func NewAutoEnroller(sms *smslogin.Manager, hzm *haozhuma.Client, sid string,
 	}
 }
 
+// logf 记录自动加号日志。所有日志都经过 maskPhonesIn，因为豪猪取号返回的
+// **手机号本身就是账号昵称**（见 handler 的 findAccountByMobile 注释），
+// 而这段日志会原样通过 GET /admin/account/sms/auto-enroll 回给控制台并展示。
+// 号码已经付过费，泄露等于把资产清单交出去，所以在唯一的出口统一脱敏，
+// 而不是逐个调用点去改（那样迟早会漏一个）。
 func (a *AutoEnroller) logf(format string, args ...any) {
-	msg := time.Now().Format("15:04:05 ") + fmt.Sprintf(format, args...)
+	msg := time.Now().Format("15:04:05 ") + maskPhonesIn(fmt.Sprintf(format, args...))
 	log.Printf("[auto-enroll] %s", msg)
 	a.mu.Lock()
 	a.logs = append(a.logs, msg)
@@ -450,6 +456,11 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (ok bool, usedPho
 	}
 	// 从这里开始，号码已经被占用，任何退出路径都要计入消耗。
 	usedPhone = true
+	// 配置里钉死的对接码被上游删掉了：已经自动退回平台分配，但要让你知道
+	// 配置里的值已经没用了（否则会以为号段变化是别的原因）。
+	if bad := a.hzm.TakeUnknownUID(); bad != "" {
+		a.logf("配置的对接码 %s 已失效（上游不存在），已自动改用平台分配；建议更新配置", bad)
+	}
 	a.logf("[w%d] 取号 %s", worker, phone)
 
 	// finish 统一收尾：先拉黑再释放（豪猪 SDK 的顺序）。任何退出路径都要走它。
@@ -523,7 +534,11 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (ok bool, usedPho
 }
 
 // pollCode 轮询豪猪 getMessage，直到拿到验证码或短信过期。
-// 腾讯验证码有效期 60s，这里轮 90s 上限（发码之后计数）。
+//
+// 超时用 90s 而不是上游的 60s 有效期：豪猪的短信入库本身有延迟，
+// 偶尔会比 60s 晚一点到，多留 30s 能捞回这部分。代价只是失败时多等 30s，
+// 而失败不扣费。
+//
 // "等待"是正常轮询状态（豪猪返回 code=-1 msg=等待短信）——GetMessage 把它
 // 当成功返回空 sms，这里只记轮次。
 func (a *AutoEnroller) pollCode(ctx context.Context, phone string) (string, error) {
@@ -540,8 +555,12 @@ func (a *AutoEnroller) pollCode(ctx context.Context, phone string) (string, erro
 	for time.Now().Before(deadline) {
 		sms, err := a.hzm.GetMessage(ctx, a.sid, phone)
 		if err != nil {
+			// "等待短信" 是正常轮询状态，不是错误：GetMessage 把豪猪的
+			// code=-1/msg=等待短信 包成 APIError 返回，必须用 errors.As 取出来判断。
+			// 之前这里漏了 errors.As，ae 恒为 nil，于是每次"还在等待"都会直接
+			// 当成失败返回，白白作废一个已经付费的号码并提前结束轮询。
 			var ae *haozhuma.APIError
-			if ae != nil && ae.Waiting() {
+			if errors.As(err, &ae) && ae.Waiting() {
 				// 正常等待，继续轮。
 			} else {
 				return "", err
@@ -565,4 +584,27 @@ func shortUID(uid string) string {
 		return uid[:8]
 	}
 	return uid
+}
+
+// maskPhone 保留前 3 后 4 位：运营商和尾号足够让操作者认出是哪一个号，
+// 但不构成一个可直接拨打的号码。
+func maskPhone(phone string) string {
+	// 去掉 +86 / 86 等前缀后按数字串处理。
+	digits := strings.TrimLeft(phone, "+")
+	if strings.HasPrefix(digits, "86") && len(digits) > 11 {
+		digits = digits[2:]
+	}
+	if len(digits) < 7 {
+		return strings.Repeat("*", len(digits))
+	}
+	return digits[:3] + strings.Repeat("*", len(digits)-7) + digits[len(digits)-4:]
+}
+
+// phoneRe 匹配日志里的手机号。豪猪取号返回的是 11 位中国手机号（1 开头），
+// 这里同时容忍带 +86 的写法。
+var phoneRe = regexp.MustCompile(`(?:\+?86)?1[3-9]\d{9}`)
+
+// maskPhonesIn 把字符串里出现的手机号统一替换成脱敏形式。
+func maskPhonesIn(s string) string {
+	return phoneRe.ReplaceAllStringFunc(s, maskPhone)
 }

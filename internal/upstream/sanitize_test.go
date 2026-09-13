@@ -106,7 +106,7 @@ func TestPrepareBodyOptSanitizesSystem(t *testing.T) {
 	body := []byte(`{"model":"glm-5.2","messages":[` +
 		`{"role":"system","content":"` + ccIdentity + ` ` + ccHeader + `"},` +
 		`{"role":"user","content":"hi"}]}`)
-	out := PrepareBodyOpt(body, true)
+	out := mustPrepareBody(t, body, true)
 	var obj map[string]any
 	if err := json.Unmarshal(out, &obj); err != nil {
 		t.Fatal(err)
@@ -126,7 +126,7 @@ func TestPrepareBodyOptSanitizesSystem(t *testing.T) {
 
 func TestPrepareBodyOptDisabledPreservesFingerprints(t *testing.T) {
 	body := []byte(`{"model":"glm-5.2","messages":[{"role":"system","content":"` + ccIdentity + `"}]}`)
-	out := PrepareBodyOpt(body, false)
+	out := mustPrepareBody(t, body, false)
 	if !strings.Contains(string(out), ccIdentity) {
 		t.Error("sanitize=false should preserve fingerprints")
 	}
@@ -141,7 +141,7 @@ func TestPrepareBodyOptDisabledPreservesFingerprints(t *testing.T) {
 // PrepareBody 默认行为 = 开启脱敏（保持向后兼容）。
 func TestPrepareBodyDefaultSanitizes(t *testing.T) {
 	body := []byte(`{"model":"glm-5.2","messages":[{"role":"system","content":"` + ccIdentity + `"}]}`)
-	out := PrepareBodyOpt(body, true)
+	out := mustPrepareBody(t, body, true)
 	if strings.Contains(string(out), ccIdentity) {
 		t.Error("PrepareBody default should sanitize")
 	}

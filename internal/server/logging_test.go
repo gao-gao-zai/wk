@@ -76,7 +76,7 @@ func (s *captureRequestLogStore) RecentRequests(int) ([]RequestLog, error) {
 func TestRequestLogMapsToWorkBuddyResponseID(t *testing.T) {
 	store := &captureRequestLogStore{}
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
-	h := NewHandler(Config{
+	h := newTestHandler(t, Config{
 		Pool:            testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream:        up,
 		RequestLogStore: store,
@@ -242,7 +242,7 @@ func TestChatLogsStreamRow(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, sseOK, true
 	})
-	h := NewHandler(Config{
+	h := newTestHandler(t, Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
@@ -269,7 +269,7 @@ func TestChatLogsSyncRowTTFBDash(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, sseOK, true
 	})
-	h := NewHandler(Config{
+	h := newTestHandler(t, Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
@@ -294,7 +294,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 		return 402, `{"code":1,"msg":"余额不足"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up})
 	out := captureStdout(t, func() {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
@@ -313,7 +313,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	withChatLog(t) // 日志开启也应无表格行：非 chat 路由根本不走 logChatRow
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
+	h := newTestHandler(t, Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
 		return 200, sseOK, true
 	})})
 	out := captureStdout(t, func() {

@@ -168,7 +168,9 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-func (c *Client) prepareBody(body []byte) []byte {
+// 返回错误表示请求体无法解码——此时必须拒绝请求而不是原样转发，
+// 否则内容脱敏会被一个畸形 body 绕过（见 ErrUnprocessableBody）。
+func (c *Client) prepareBody(body []byte) ([]byte, error) {
 	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot())
 }
 
@@ -275,7 +277,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 // downstream clients without rewriting their values.
 func (c *Client) ChatStreamContextWithHeaders(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
+	outBody, err := c.prepareBody(body)
+	if err != nil {
+		return nil, 0, nil, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(outBody))
 	if err != nil {
 		return nil, 0, nil, nil, err
 	}

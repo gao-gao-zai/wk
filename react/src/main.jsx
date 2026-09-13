@@ -21,8 +21,20 @@ const { Title, Text, Paragraph } = Typography;
 const fmt = value => Number(value || 0).toLocaleString();
 const fmtCredits = value => Number(value || 0).toFixed(4);
 const parseHours = value => String(value || '').split(',').map(item => item.trim()).filter(Boolean).map(Number);
-const initialAPIKey = sessionStorage.getItem('wb2api-api-key') || localStorage.getItem('wb2api-api-key') || '';
-localStorage.removeItem('wb2api-api-key');
+// API Key 只放在内存里，不写 Web Storage。
+//
+// 旧实现把它存进 sessionStorage（并从 localStorage 迁移），而 sessionStorage
+// 并不是 XSS 缓解手段 —— 同源脚本照样读得到，只是窗口缩短到一个标签页的
+// 生命周期。这个 key 对**所有** /admin/* 端点都是有效的 Bearer 凭据，
+// 一旦被打包的第三方依赖或任何未来注入读到，等于整个网关被接管。
+// 同时清掉历史遗留值，避免旧版本写下的 key 继续留在浏览器里。
+['sessionStorage', 'localStorage'].forEach(store => {
+  try {
+    window[store].removeItem('wb2api-api-key');
+  } catch {
+    // 隐私模式等场景下 Web Storage 可能不可用；清理失败不应影响控制台加载。
+  }
+});
 
 // 冷却原因文案：与后端 CoolKind.String() 的取值一一对应。
 const COOL_KIND_LABEL = {
@@ -135,10 +147,13 @@ function Console() {
   // 表现为"点了按钮没有任何反馈"。必须改用 App 上下文提供的实例。
   const { message, modal } = AntApp.useApp();
   const [form] = Form.useForm();
-  const [apiKey, setApiKey] = useState(initialAPIKey);
+  // apiKey 只保存在组件状态里（不落 Web Storage，见文件顶部说明）：
+  // 刷新页面后需要重新输入，这是有意的取舍 —— 换取 key 不被同源脚本读取。
+  const [apiKey, setApiKey] = useState('');
   const [locked, setLocked] = useState(false);
   const [password, setPassword] = useState('');
-  const [activeSection, setActiveSection] = useState(() => sectionFromHash());  const [data, setData] = useState({ accounts: [], metrics: {}, total: 0, healthy: 0, cooling: 0, disabled: 0 });
+  const [activeSection, setActiveSection] = useState(() => sectionFromHash());
+  const [data, setData] = useState({ accounts: [], metrics: {}, total: 0, healthy: 0, cooling: 0, disabled: 0 });
   const [models, setModels] = useState([]);
   const [requestLogs, setRequestLogs] = useState([]);
   const [requestSearch, setRequestSearch] = useState('');
@@ -278,8 +293,8 @@ function Console() {
   }, []);
 
   const unlock = async () => {
+    // 只输入 API Key（不输密码）时直接用 key 解锁：key 留在内存，不写存储。
     if (!password.trim() && apiKey.trim()) {
-      sessionStorage.setItem('wb2api-api-key', apiKey.trim());
       setLocked(false);
       await refresh();
       return;
@@ -1346,10 +1361,10 @@ function Console() {
             <Space>
               <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
               <Button icon={<KeyOutlined />} onClick={() => {
-                const key = window.prompt('API Key', apiKey);
+                // setApiKey 已经足够；不再写 sessionStorage（HIGH-006）。
+                const key = window.prompt('API Key（仅保留在当前页面内存中，刷新后需重新输入）', apiKey);
                 if (key !== null) {
                   setApiKey(key);
-                  sessionStorage.setItem('wb2api-api-key', key);
                 }
               }}>API Key</Button>
             </Space>

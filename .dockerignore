@@ -1,6 +1,12 @@
 auths/
 data/
 *.tmp
+# config.json 里有真实 api_key / frontend_password / postgres DSN，且是 gitignore 的
+# 本机文件。Dockerfile 的 `COPY . .` 会把它带进 builder 阶段，compose 也只在运行时
+# 挂载它 —— 构建上下文里根本不需要它。
+config.json
+# dotenv 里有 POSTGRES_PASSWORD 等真实凭据，不应进入构建上下文。
+.env
 react/node_modules/
 react/dist/
 .git/

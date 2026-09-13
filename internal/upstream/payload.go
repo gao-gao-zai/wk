@@ -7,25 +7,45 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"strings"
 )
 
+// ErrUnprocessableBody 表示请求体无法解码，因而无法做协议改写与内容脱敏。
+//
+// 之所以要有这个错误而不是"原样透传"：脱敏开关是内容过滤控制，遇到解不开的
+// 输入就放行等于 fail-open —— 恰恰是攻击者想要的那一侧。返回错误让调用方
+// 以 400 拒绝，控制才真正闭合。
+var ErrUnprocessableBody = errors.New("upstream: request body is not decodable JSON")
+
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时跳过内容指纹脱敏，但仍执行上游协议兼容转换。
-func PrepareBodyOpt(src []byte, sanitize bool) []byte {
+func PrepareBodyOpt(src []byte, sanitize bool) ([]byte, error) {
 	return PrepareBodyOptWithEfforts(src, sanitize, nil)
 }
 
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
-func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
+//
+// 解码失败或重新编码失败时返回 ErrUnprocessableBody（fail-closed）：
+// 旧实现返回原始 src，于是"能被上游解析、但过不了 encoding/json"的请求体
+// 可以完整绕过脱敏，而且连 stream 都不会被强制。注意空 body 仍然原样返回 ——
+// 空请求体由调用方的参数校验负责，不属于"解码失败"。
+func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) ([]byte, error) {
 	if len(src) == 0 {
-		return src
+		return src, nil
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
-		return src
+		return nil, fmt.Errorf("%w: %v", ErrUnprocessableBody, err)
+	}
+	// json.Unmarshal 对字面量 null 会**成功**并把 obj 留成 nil map，
+	// 随后 obj["stream"] = true 会直接 panic（assignment to entry in nil map）。
+	// 一个 `null` 请求体就足以打挂一个请求，所以必须显式挡掉。
+	if obj == nil {
+		return nil, fmt.Errorf("%w: body is not a JSON object", ErrUnprocessableBody)
 	}
 	obj["stream"] = true
 	if model, ok := obj["model"].(string); ok {
@@ -42,9 +62,9 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	}
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return src
+		return nil, fmt.Errorf("%w: re-encode failed: %v", ErrUnprocessableBody, err)
 	}
-	return out
+	return out, nil
 }
 
 // normalizeMessageRoles maps OpenAI's developer role to the system role

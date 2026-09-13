@@ -13,6 +13,12 @@ data/
 # Config with secrets (use config.example.json)
 config.json
 
+# dotenv：含 POSTGRES_PASSWORD / WB2A_API_KEY 等真实凭据，绝不能提交。
+# .env.example 是模板，必须进版本库，所以用 ! 显式放行。
+.env
+.env.*
+!.env.example
+
 # Build artifacts
 *.tmp
 react/node_modules/
@@ -21,6 +27,10 @@ __pycache__/
 
 # Backups (contains auth tokens)
 backups/
+
+# 账单导出：含 account_uid 与 account_nickname，而自动加号的账号昵称**就是手机号**
+# （见 autoenroll 的 maskPhone 注释），属于真实 PII，绝不能提交。
+billing-export/
 
 # IDE
 .idea/

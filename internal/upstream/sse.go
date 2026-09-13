@@ -14,6 +14,52 @@ import (
 	"time"
 )
 
+// maxSSELineBytes 单帧上限。真实帧远小于此（通常 < 64 KiB），
+// 上限只用来兜住"上游不断开、也永远不发换行"的情况。
+const maxSSELineBytes = 1 << 20
+
+// maxAccumulatedBytes 聚合后正文上限。单帧有界并不够：大量"各自合法"的小帧
+// 累加起来同样可以吃掉内存，所以累加器也要有天花板。
+const maxAccumulatedBytes = 8 << 20
+
+var errSSELineTooLong = errors.New("sse: frame exceeds maximum size")
+
+// errAccumulatedTooLarge 聚合正文超过上限。
+var errAccumulatedTooLarge = errors.New("sse: aggregated content exceeds maximum size")
+
+// readBoundedLine 读一行，但超过 max 字节就报错。
+//
+// ReadString 会把整行读进内存：上游只要一直不发 '\n'，返回的字符串就能无限增长
+// （bufio 的缓冲区是固定的，但返回的 string 不是）。这里改用 ReadSlice，靠
+// bufio.ErrBufferFull 作为"缓冲填满仍未换行"的信号，逐段累加并在超限时放弃。
+func readBoundedLine(br *bufio.Reader, max int) (string, error) {
+	var sb strings.Builder
+	for {
+		chunk, err := br.ReadSlice('\n')
+		sb.Write(chunk)
+		if sb.Len() > max {
+			return "", errSSELineTooLong
+		}
+		switch err {
+		case nil:
+			return sb.String(), nil
+		case bufio.ErrBufferFull:
+			continue
+		default:
+			return sb.String(), err
+		}
+	}
+}
+
+// growBounded 向累加器追加内容，超过 max 返回错误。
+func growBounded(sb *strings.Builder, s string, max int) error {
+	if sb.Len()+len(s) > max {
+		return errAccumulatedTooLarge
+	}
+	sb.WriteString(s)
+	return nil
+}
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
@@ -26,22 +72,34 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 func AggregateWithID(r io.Reader, fallbackID string) (map[string]any, error) {
 	br := bufio.NewReader(r)
 	var (
-		id, model        string
-		created          float64
-		content          strings.Builder
-		reasoning        strings.Builder
-		refusal          strings.Builder
-		role             = "assistant"
-		finishReason     = "stop"
-		usage            map[string]any
-		gotAnyContent    bool
-		validEvents      int
+		id, model     string
+		created       float64
+		content       strings.Builder
+		reasoning     strings.Builder
+		refusal       strings.Builder
+		role          = "assistant"
+		finishReason  = "stop"
+		usage         map[string]any
+		gotAnyContent bool
+		validEvents   int
+		// accumulated 是所有正文累加器的总字节数。单帧有界并不够：上游可以发
+		// 无数条"各自合法"的小帧，累加起来照样耗尽内存。
+		accumulated      int
 		toolCalls        = map[int]map[string]any{}
 		toolOrder        []int
 		identifierFields = map[string]any{}
 	)
+	// addContent 统一累加并守住总上限。
+	addContent := func(sb *strings.Builder, s string) error {
+		if accumulated+len(s) > maxAccumulatedBytes {
+			return errAccumulatedTooLarge
+		}
+		sb.WriteString(s)
+		accumulated += len(s)
+		return nil
+	}
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readBoundedLine(br, maxSSELineBytes)
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
@@ -88,14 +146,20 @@ func AggregateWithID(r io.Reader, fallbackID string) (map[string]any, error) {
 									role = r2
 								}
 								if txt := contentText(delta["content"]); txt != "" {
-									content.WriteString(txt)
+									if err := addContent(&content, txt); err != nil {
+										return nil, err
+									}
 									gotAnyContent = true
 								}
 								if rc := contentText(delta["reasoning_content"]); rc != "" {
-									reasoning.WriteString(rc)
+									if err := addContent(&reasoning, rc); err != nil {
+										return nil, err
+									}
 								}
 								if text := contentText(delta["refusal"]); text != "" {
-									refusal.WriteString(text)
+									if err := addContent(&refusal, text); err != nil {
+										return nil, err
+									}
 								}
 								if tcs, ok := delta["tool_calls"].([]any); ok {
 									for _, tc := range tcs {
@@ -139,14 +203,20 @@ func AggregateWithID(r io.Reader, fallbackID string) (map[string]any, error) {
 							// 有的上游把完整消息放在 message 里（非 delta）
 							if msg, ok := c["message"].(map[string]any); ok {
 								if txt := contentText(msg["content"]); txt != "" && !gotAnyContent {
-									content.WriteString(txt)
+									if err := addContent(&content, txt); err != nil {
+										return nil, err
+									}
 									gotAnyContent = true
 								}
 								if rc := contentText(msg["reasoning_content"]); rc != "" {
-									reasoning.WriteString(rc)
+									if err := addContent(&reasoning, rc); err != nil {
+										return nil, err
+									}
 								}
 								if text := contentText(msg["refusal"]); text != "" {
-									refusal.WriteString(text)
+									if err := addContent(&refusal, text); err != nil {
+										return nil, err
+									}
 								}
 								if calls := normalizedToolCalls(msg); len(calls) > 0 {
 									for _, rawCall := range calls {
@@ -478,6 +548,21 @@ func streamNormalizedWithID(w http.ResponseWriter, r io.Reader, fallbackID strin
 	var readErr error
 	toolArgs := make(map[int]*strings.Builder)
 	toolFinished := false
+	// streamedBytes 是所有流式累加器的总预算。这些累加器只用于收尾判断
+	// （是否已有内容/是否需要 fallback），却会随流长度一起增长，所以必须封顶。
+	streamedBytes := 0
+	// accumulatedOverflow 与 protocolError 分开记：protocolError 走的是
+	// "上游自己发了 error 帧、已经转发给客户端"的路径，而这里是**我们**发现的
+	// 超限，还没有任何 error 帧写出去，必须在收尾时补一帧。
+	accumulatedOverflow := false
+	addStreamed := func(sb *strings.Builder, s string) bool {
+		if streamedBytes+len(s) > maxAccumulatedBytes {
+			return false
+		}
+		sb.WriteString(s)
+		streamedBytes += len(s)
+		return true
+	}
 
 	writePayload := func(payload string) error {
 		if _, err := io.WriteString(w, "data: "+payload+"\n\n"); err != nil {
@@ -557,13 +642,22 @@ func streamNormalizedWithID(w http.ResponseWriter, r io.Reader, fallbackID strin
 					}
 					delta, _ := choice["delta"].(map[string]any)
 					if text := contentText(delta["content"]); text != "" {
-						streamedContent.WriteString(text)
+						if !addStreamed(&streamedContent, text) {
+							accumulatedOverflow = true
+							break
+						}
 					}
 					if text := contentText(delta["reasoning_content"]); text != "" {
-						reasoning.WriteString(text)
+						if !addStreamed(&reasoning, text) {
+							accumulatedOverflow = true
+							break
+						}
 					}
 					if text := contentText(delta["refusal"]); text != "" {
-						refusal.WriteString(text)
+						if !addStreamed(&refusal, text) {
+							accumulatedOverflow = true
+							break
+						}
 					}
 					if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
 						toolCallSeen = true
@@ -581,7 +675,12 @@ func streamNormalizedWithID(w http.ResponseWriter, r io.Reader, fallbackID strin
 							if toolArgs[idx] == nil {
 								toolArgs[idx] = &strings.Builder{}
 							}
-							toolArgs[idx].WriteString(arg)
+							// 工具参数同样计入总预算：它是客户端可控的，
+							// 且会在流结束后被整体解析。
+							if !addStreamed(toolArgs[idx], arg) {
+								accumulatedOverflow = true
+								break
+							}
 						}
 					}
 				}
@@ -618,7 +717,13 @@ func streamNormalizedWithID(w http.ResponseWriter, r io.Reader, fallbackID strin
 	validFrames := 0
 readLoop:
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readBoundedLine(br, maxSSELineBytes)
+		// 只有"超长帧"才立刻返回。其它读取错误（超时/连接重置）必须走完下面的
+		// 分支：ReadString 在出错时会连同已读到的部分一起返回，之前那段数据是
+		// 要照常转发给客户端的，然后由循环末尾记 readErr 并补 error 帧。
+		if errors.Is(err, errSSELineTooLong) {
+			return err
+		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		switch {
 		case strings.HasPrefix(trimmed, "data:") && strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")) == "[DONE]":
@@ -631,7 +736,8 @@ readLoop:
 			if werr != nil {
 				return werr
 			}
-			if protocolError != "" {
+			// 超限后必须停止读取：继续读只会继续消耗内存。
+			if protocolError != "" || accumulatedOverflow {
 				break readLoop
 			}
 		case trimmed != "":
@@ -668,6 +774,16 @@ readLoop:
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error"}}`)
 	} else if protocolError != "" {
 		// The original error frame has already been forwarded. Only DONE remains.
+	} else if accumulatedOverflow {
+		// 我们自己发现超限，上游并没有发 error 帧，所以这里必须补一帧，
+		// 否则客户端只会看到内容戛然而止再收到 [DONE]，误以为响应完整。
+		raw, _ := json.Marshal(map[string]any{"error": map[string]any{
+			"type": "upstream_error", "code": "response_too_large", "message": errAccumulatedTooLarge.Error(),
+		}})
+		if err := writeRaw(string(raw)); err != nil {
+			return err
+		}
+		emptyCompletion = true
 	} else if err := emitFallback(); err != nil {
 		return err
 	} else if toolCallSeen && (!toolFinished || !toolArgumentsValid(toolArgs)) {
@@ -691,6 +807,11 @@ readLoop:
 		return fmt.Errorf("upstream stream contained no valid data events")
 	}
 	if emptyCompletion {
+		if accumulatedOverflow {
+			// 超限时 emptyCompletion 只是为了走到这里；返回真正的原因，
+			// 别让调用方把"响应过大"记成"响应没有内容"。
+			return fmt.Errorf("upstream response exceeded the maximum size")
+		}
 		return fmt.Errorf("upstream completed response contained no content")
 	}
 	if protocolError != "" {

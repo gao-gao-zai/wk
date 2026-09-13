@@ -223,6 +223,11 @@ type session struct {
 	consoleNoJump *http.Client // 不跟随跳转（读 Location 判断写票结果）
 	oneIDHTTP     *http.Client
 	cliHTTP       *http.Client
+
+	// navigationOrigins 是 followNavigation 允许跳转的主机+端口（由 Endpoints
+	// 推导，见 initNavigationHosts）。没有它，一个跨域 302 就能把带 cookie jar
+	// 的会话 cookie 送到攻击者主机。
+	navigationOrigins []navigationOrigin
 }
 
 func randomHex(n int) (string, error) {
@@ -584,6 +589,8 @@ func (m *Manager) newSession(mobile string) (*session, error) {
 		},
 		cliHTTP: &http.Client{Timeout: 30 * time.Second, CheckRedirect: noRedirectLimit},
 	}
+	// 从本次流程实际使用的端点推导跳转白名单。
+	s.initNavigationHosts(m.ep)
 	// 代理失败不该让登录直接挂掉：退回直连并记录原因，用户至少还能注册
 	// （只是会占用本机 IP 的半小时额度）。
 	if _, err := m.applyProxy(s); err != nil {
@@ -987,6 +994,11 @@ func (s *session) followNavigation(ctx context.Context, start, referer string) (
 		if err != nil {
 			return nil, fmt.Errorf("无效 Location %q: %w", loc, err)
 		}
+		// 跳转前做主机白名单校验：这一步必须在发起下一跳之前，
+		// 因为下一跳会带着 cookie jar 出去（见 navigationHostAllowed 注释）。
+		if !s.navigationHostAllowed(next.String()) {
+			return nil, fmt.Errorf("拒绝跳转到未授权主机 %q（来自 %s）", next.Host, resp.Request.URL.Host)
+		}
 		forceHTTPSConsole(next)
 		referer = navigationReferer(current)
 		current = next.String()
@@ -1201,6 +1213,82 @@ func (s *session) fetchTicketOnce(ctx context.Context, base string) (ticket, err
 		return ticket{}, fmt.Errorf("code=11217 msg=11217:login ing...")
 	}
 	return t, nil
+}
+
+// navigationHostAllowed 判断 followNavigation 是否允许跳到 host。
+//
+// 背景：followNavigation 是手写的重定向跟随，Location 用
+// resp.Request.URL.Parse 解析，因此**接受任意绝对跨域 URL**；而它用的
+// consoleNoJump 客户端带着 cookie jar，Go 的 cookiejar 会把域/路径匹配的
+// cookie 发给新主机。也就是说，只要链路上出现一个指向攻击者主机的 302，
+// Keycloak 的 AUTH_SESSION_ID / KEYCLOAK_IDENTITY / APISIX session 就会被
+// 直接送到那台主机 —— 一次性的完整会话窃取。
+//
+// 允许清单的来源是**已配置的端点本身**（见 initNavigationHosts），而不是
+// 硬编码域名：生产环境不会因为上游换域名而突然登不上，测试把 Endpoints
+// 指向 httptest 时也依然工作。
+//
+// 主机名 + **端口** 一起比较：cookie 的域匹配不看端口，但"同一台主机上的
+// 另一个端口"是完全不同的服务，允许它等于把 cookie 交给同 IP 上的任意
+// 监听者（在共享/容器化部署里很现实）。
+func (s *session) navigationHostAllowed(raw string) bool {
+	next, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	// 只允许 http/https：file:、gopher: 之类在这个上下文里没有任何正当用途。
+	if next.Scheme != "http" && next.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(next.Hostname())
+	if host == "" {
+		return false
+	}
+	port := next.Port()
+	if port == "" {
+		port = defaultPortFor(next.Scheme)
+	}
+	// 同主机同端口：最常见的相对跳转。
+	for _, origin := range s.navigationOrigins {
+		if host == origin.host && port == origin.port {
+			return true
+		}
+	}
+	// codebuddy.cn 及其子域：Keycloak、APISIX 网关、登录页都在这个域下，
+	// 合法链路确实会跨子域跳。这里仍然要求标准端口，避免同域名的任意端口。
+	if (host == "codebuddy.cn" || strings.HasSuffix(host, ".codebuddy.cn")) && port == defaultPortFor(next.Scheme) {
+		return true
+	}
+	return false
+}
+
+func defaultPortFor(scheme string) string {
+	if scheme == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+// navigationOrigin 是一台被允许跳转的主机 + 端口。
+type navigationOrigin struct{ host, port string }
+
+// initNavigationHosts 从已配置端点推导允许跳转的来源集合。
+func (s *session) initNavigationHosts(ep Endpoints) {
+	s.navigationOrigins = nil
+	for _, raw := range []string{ep.Console, ep.CLI, ep.OneID} {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		port := u.Port()
+		if port == "" {
+			port = defaultPortFor(u.Scheme)
+		}
+		s.navigationOrigins = append(s.navigationOrigins, navigationOrigin{
+			host: strings.ToLower(u.Hostname()),
+			port: port,
+		})
+	}
 }
 
 func looksLikeConsoleBase(base string) bool {

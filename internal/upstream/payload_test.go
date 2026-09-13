@@ -5,6 +5,27 @@ import (
 	"testing"
 )
 
+// mustPrepareBody / mustPrepareBodyWithEfforts 是测试侧的薄包装。
+// PrepareBodyOpt 现在返回 error（fail-closed），但测试关心的是成功路径的
+// 输出内容，所以在这里把错误检查收敛掉，保持各用例可读。
+func mustPrepareBody(t *testing.T, src []byte, sanitize bool) []byte {
+	t.Helper()
+	out, err := PrepareBodyOpt(src, sanitize)
+	if err != nil {
+		t.Fatalf("PrepareBodyOpt: %v", err)
+	}
+	return out
+}
+
+func mustPrepareBodyWithEfforts(t *testing.T, src []byte, sanitize bool, efforts map[string][]string) []byte {
+	t.Helper()
+	out, err := PrepareBodyOptWithEfforts(src, sanitize, efforts)
+	if err != nil {
+		t.Fatalf("PrepareBodyOptWithEfforts: %v", err)
+	}
+	return out
+}
+
 func TestNormalizeModelID(t *testing.T) {
 	cases := map[string]string{
 		"kimi-k3-1": "kimi-k3",
@@ -19,7 +40,10 @@ func TestNormalizeModelID(t *testing.T) {
 }
 
 func TestPrepareBodyNormalizesModelID(t *testing.T) {
-	out := PrepareBodyOpt([]byte(`{"model":"kimi-k2.7","messages":[]}`), true)
+	out, err := PrepareBodyOpt([]byte(`{"model":"kimi-k2.7","messages":[]}`), true)
+	if err != nil {
+		t.Fatalf("PrepareBodyOpt: %v", err)
+	}
 	var body map[string]any
 	if err := json.Unmarshal(out, &body); err != nil {
 		t.Fatal(err)
@@ -30,7 +54,7 @@ func TestPrepareBodyNormalizesModelID(t *testing.T) {
 }
 
 func TestPrepareBodyMapsDeveloperRoleToSystem(t *testing.T) {
-	out := PrepareBodyOpt([]byte(`{
+	out := mustPrepareBody(t, []byte(`{
 		"model":"glm-5.2",
 		"messages":[
 			{"role":"developer","content":"follow these rules"},
@@ -64,7 +88,7 @@ func TestPrepareBodyMapsDeveloperRoleToSystem(t *testing.T) {
 }
 
 func TestPrepareBodyAddsSystemPromptBeforeUserMessage(t *testing.T) {
-	out := PrepareBodyOpt([]byte(`{
+	out := mustPrepareBody(t, []byte(`{
 		"model":"deepseek-v4.1-flash",
 		"messages":[{"role":"user","content":"hello"}]
 	}`), false)
@@ -94,7 +118,7 @@ func TestPrepareBodyAddsSystemPromptBeforeUserMessage(t *testing.T) {
 }
 
 func TestPrepareBodyKeepsExistingSystemPromptFirst(t *testing.T) {
-	out := PrepareBodyOpt([]byte(`{
+	out := mustPrepareBody(t, []byte(`{
 		"messages":[
 			{"role":"system","content":"follow project rules"},
 			{"role":"user","content":"hello"}
@@ -149,7 +173,10 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			out := PrepareBodyOptWithEfforts([]byte(c.body), false, c.efforts)
+			out, err := PrepareBodyOptWithEfforts([]byte(c.body), false, c.efforts)
+			if err != nil {
+				t.Fatalf("PrepareBodyOpt: %v", err)
+			}
 			var m map[string]any
 			if err := json.Unmarshal(out, &m); err != nil {
 				t.Fatalf("unmarshal: %v (body=%s)", err, out)

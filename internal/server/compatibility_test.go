@@ -49,7 +49,7 @@ func TestResponsesTimeoutDoesNotCompleteOrStoreHistory(t *testing.T) {
 			Body:       io.NopCloser(io.MultiReader(strings.NewReader("data: {\"model\":\"glm-5.3\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"), timeoutStreamReader{})),
 		}, nil
 	})
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", ExpiresAt: 9999999999}), Upstream: up})
+	h := newTestHandler(t, Config{Pool: testPoolWith(&auth.Auth{UID: "u1", ExpiresAt: 9999999999}), Upstream: up})
 	rec := doResponsesRequest(h, `{"model":"glm-5.3","input":"hello","stream":true}`)
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.failed") || !strings.Contains(body, "upstream_timeout") || strings.Contains(body, "response.completed") {

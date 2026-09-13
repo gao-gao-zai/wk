@@ -5,7 +5,8 @@ services:
     environment:
       POSTGRES_DB: workbuddy
       POSTGRES_USER: workbuddy
-      POSTGRES_PASSWORD: change-this-password
+      # 必须由 .env / 环境提供；缺失时 compose 直接报错而不是用公开占位符。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
@@ -16,7 +17,7 @@ services:
 
   wb2api:
     environment:
-      - WB2A_POSTGRES_DSN=postgres://workbuddy:change-this-password@postgres:5432/workbuddy?sslmode=disable
+      - WB2A_POSTGRES_DSN=postgres://workbuddy:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/workbuddy?sslmode=prefer
       - WB2A_POSTGRES_MAX_OPEN_CONNS=32
       - WB2A_POSTGRES_MAX_IDLE_CONNS=16
     depends_on:

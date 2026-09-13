@@ -17,7 +17,8 @@ import (
 )
 
 // smsTestEndpoints 指向一个假上游，让 handler 层的短信登录可以端到端跑通。
-func smsTestHandler(t *testing.T, withManager bool) (*Handler, *pool.Pool, string) {
+// 返回的 handler 会自动带上测试凭据（见 auth_test.go 的 newTestHandler）。
+func smsTestHandler(t *testing.T, withManager bool) (authedHandler, *pool.Pool, string) {
 	t.Helper()
 	up := newFakeSMSUpstream(t)
 	t.Cleanup(up.Close)
@@ -28,7 +29,7 @@ func smsTestHandler(t *testing.T, withManager bool) (*Handler, *pool.Pool, strin
 	if withManager {
 		cfg.SMSLogin = smslogin.NewManager(up.Endpoints(), 0)
 	}
-	return NewHandler(cfg), p, authDir
+	return newTestHandler(t, cfg), p, authDir
 }
 
 func TestAdminSMSSendRequiresManager(t *testing.T) {
@@ -159,7 +160,7 @@ func TestAdminSMSSubmitCaptchaEndToEnd(t *testing.T) {
 
 	authDir := t.TempDir()
 	p := testPoolWith()
-	h := NewHandler(Config{Pool: p, AuthDir: authDir, Region: "cn", SMSLogin: m})
+	h := newTestHandler(t, Config{Pool: p, AuthDir: authDir, Region: "cn", SMSLogin: m})
 
 	// 先拿挑战。
 	rec := httptest.NewRecorder()
@@ -213,7 +214,7 @@ func TestAdminSMSSubmitCaptchaEndToEnd(t *testing.T) {
 // 让前端把用户导回验证码步骤，而不是显示一句看不懂的上游错误。
 func TestAdminSMSVerifyBeforeCaptcha(t *testing.T) {
 	up := captchaUpstream(t)
-	h := NewHandler(Config{Pool: testPoolWith(), AuthDir: t.TempDir(), Region: "cn",
+	h := newTestHandler(t, Config{Pool: testPoolWith(), AuthDir: t.TempDir(), Region: "cn",
 		SMSLogin: smslogin.NewManager(up.Endpoints(), 0)})
 
 	rec := httptest.NewRecorder()
@@ -259,7 +260,7 @@ func TestAdminSMSCaptchaSolvedEndToEnd(t *testing.T) {
 
 	authDir := t.TempDir()
 	p := testPoolWith()
-	h := NewHandler(Config{Pool: p, AuthDir: authDir, Region: "cn", SMSLogin: m})
+	h := newTestHandler(t, Config{Pool: p, AuthDir: authDir, Region: "cn", SMSLogin: m})
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/sms/send",
@@ -621,7 +622,7 @@ func TestPersistAccountPromotesMixedRegion(t *testing.T) {
 	}
 	authDir := t.TempDir()
 	p := testPoolWith(&auth.Auth{UID: "global-1", Domain: "www.workbuddy.ai"})
-	h := NewHandler(Config{Pool: p, AuthDir: authDir, Region: "global", ConfigPath: cfgPath})
+	h := newTestHandler(t, Config{Pool: p, AuthDir: authDir, Region: "global", ConfigPath: cfgPath})
 
 	res, status, err := h.persistAccount(accountCredential{
 		UID: "cn-1", Domain: "www.codebuddy.cn", AccessToken: "at", RefreshToken: "rt", ExpiresIn: 60,

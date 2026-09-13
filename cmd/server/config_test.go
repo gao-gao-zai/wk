@@ -8,7 +8,9 @@ import (
 
 func TestDefault(t *testing.T) {
 	c := Default()
-	if c.Listen != ":7863" {
+	// 默认只监听回环：":7863" 会 bind 所有网卡，任何鉴权缺陷都会被放大成远程可达。
+	// 需要对外暴露（含容器，见 Dockerfile 的 WB2A_LISTEN）时必须显式覆盖。
+	if c.Listen != "127.0.0.1:7863" {
 		t.Errorf("listen=%s", c.Listen)
 	}
 	if err := c.normalize(); err != nil {
@@ -67,6 +69,46 @@ func TestEnvOverride(t *testing.T) {
 	}
 	if c.Listen != ":7777" || c.APIKey != "envkey" {
 		t.Errorf("c=%+v", c)
+	}
+}
+
+// TestEnvWiringForSecurityFields covers the newer env vars. They are documented
+// in .env.example and README, so an unwired variable would silently leave the
+// documented setting without effect.
+func TestEnvWiringForSecurityFields(t *testing.T) {
+	t.Setenv("WB2A_FRONTEND_DIR", "/srv/console")
+	t.Setenv("WB2A_SESSION_SALT", "aabbccddeeff00112233445566778899")
+	t.Setenv("WB2A_TRUSTED_PROXIES", "10.0.0.1, 172.17.0.0/16 ,")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.FrontendDir != "/srv/console" {
+		t.Errorf("FrontendDir=%q, want /srv/console", c.FrontendDir)
+	}
+	if c.SessionSticky.Salt != "aabbccddeeff00112233445566778899" {
+		t.Errorf("SessionSticky.Salt=%q", c.SessionSticky.Salt)
+	}
+	want := []string{"10.0.0.1", "172.17.0.0/16"}
+	if len(c.TrustedProxies) != len(want) {
+		t.Fatalf("TrustedProxies=%#v, want %#v (blank entries must be dropped)", c.TrustedProxies, want)
+	}
+	for i := range want {
+		if c.TrustedProxies[i] != want[i] {
+			t.Errorf("TrustedProxies[%d]=%q, want %q", i, c.TrustedProxies[i], want[i])
+		}
+	}
+}
+
+// TestDefaultTrustedProxiesIsEmpty: trusting nobody must be the default, or a
+// spoofed X-Forwarded-For would defeat the console rate limiter out of the box.
+func TestDefaultTrustedProxiesIsEmpty(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.TrustedProxies) != 0 {
+		t.Errorf("default TrustedProxies=%#v, want empty", c.TrustedProxies)
 	}
 }
 

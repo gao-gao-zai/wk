@@ -115,8 +115,8 @@ func TestGetPhoneSendsAuthorAndISP(t *testing.T) {
 		t.Errorf("isp=%q want 1", got.Get("isp"))
 	}
 	// uid 从取号响应里学到，供后续收码用。
-	if c.UID != "52283-ABC" {
-		t.Errorf("uid=%q want 52283-ABC", c.UID)
+	if c.UID() != "52283-ABC" {
+		t.Errorf("uid=%q want 52283-ABC", c.UID())
 	}
 }
 
@@ -245,6 +245,89 @@ func TestNetworkErrorDoesNotLeakToken(t *testing.T) {
 	// 也不该泄露其它 query 参数拼成的完整 URL。
 	if strings.Contains(err.Error(), "token=") {
 		t.Fatalf("query leaked into error: %v", err)
+	}
+}
+
+// TestGetPhoneDropsStaleUID 钉死的对接码失效时必须自动退回平台自动分配。
+//
+// 真实场景：配置里写死 uid=52283-XXXX，上游把该对接码删了，之后每次取号都
+// 报「没有这个[52283-XXXX]专属码」。修好之前整个任务会立刻失败退出。
+func TestGetPhoneDropsStaleUID(t *testing.T) {
+	var uidAttempts, autoAttempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("uid") != "" {
+			uidAttempts++
+			_, _ = w.Write([]byte(`{"code":"-1","msg":"没有这个[52283-STALE]专属码"}`))
+			return
+		}
+		autoAttempts++
+		_, _ = w.Write([]byte(`{"code":"0","msg":"成功","phone":"16725646683","uid":"52283-NEW"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	c := New("tok")
+	c.Base = u.String() + "/"
+	c.SetUID("52283-STALE")
+
+	phone, err := c.GetPhone(context.Background(), "52283")
+	if err != nil {
+		t.Fatalf("stale uid must fall back to auto-assign, got %v", err)
+	}
+	if phone != "16725646683" {
+		t.Fatalf("phone=%q", phone)
+	}
+	if uidAttempts != 1 {
+		t.Errorf("should try the pinned uid exactly once, got %d", uidAttempts)
+	}
+	if autoAttempts != 1 {
+		t.Errorf("should retry without uid once, got %d", autoAttempts)
+	}
+	// 失效的对接码要从客户端里清掉，后面不再带着它取号。
+	if got := c.UID(); got == "52283-STALE" {
+		t.Errorf("stale uid must be cleared, still %q", got)
+	}
+}
+
+// TestGetPhoneUnknownUIDIsNotFatal 「专属码不存在」不能算致命错误——
+// 否则 AutoEnroller 会停掉整个任务而不是换一个对接码。
+func TestGetPhoneUnknownUIDIsNotFatal(t *testing.T) {
+	e := &APIError{API: "getPhone", Code: "-1", Msg: "没有这个[52283-X]专属码"}
+	if !e.UnknownUID() {
+		t.Fatal("should be detected as unknown uid")
+	}
+	if e.Fatal() {
+		t.Fatal("unknown uid must not be fatal")
+	}
+	if e.TokenInvalid() {
+		t.Fatal("unknown uid must not look like a token problem")
+	}
+}
+
+// TestGetPhoneStaleUIDThenNoNumbers 退回自动分配后仍然没号时，
+// 要如实报"没号"，不能把过期的对接码错误一直冒泡上去。
+func TestGetPhoneStaleUIDThenNoNumbers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("uid") != "" {
+			_, _ = w.Write([]byte(`{"code":"-1","msg":"没有这个[52283-STALE]专属码"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":"-1","msg":"没有取到号码，请重新尝试"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	c := New("tok")
+	c.Base = u.String() + "/"
+	c.SetUID("52283-STALE")
+
+	_, err := c.GetPhone(context.Background(), "52283")
+	if err == nil {
+		t.Fatal("want an error when no numbers are available")
+	}
+	if strings.Contains(err.Error(), "专属码") {
+		t.Fatalf("error should reflect the real cause (no numbers), got %v", err)
+	}
+	if c.UID() != "" {
+		t.Fatalf("stale uid should stay cleared, got %q", c.UID())
 	}
 }
 

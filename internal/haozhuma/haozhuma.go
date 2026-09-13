@@ -30,16 +30,24 @@ type Client struct {
 	user string
 	pass string
 
-	// Author / UID 「[限对接]」项目的对接标识，官方 SDK 默认带 author=adminzfz。
-	// 空字符串表示不下发（普通项目）。
+	// Author 「[限对接]」项目的对接方标识。空字符串表示不下发。
 	Author string
-	UID    string
 
-	// ISP 运营商过滤（取号参数 isp）。实测取值：1=移动 2=联通 3=电信。
-	// 空字符串表示不限。腾讯短信通道对广电号支持极差，用 1 过滤掉。
+	// uid 是**可选钉死**的对接码（豪猪后台的"专属码"）。
+	// 上游会增删对接码，钉死的那个可能整批失效；GetPhone 遇到该情况会
+	// 自动丢弃它并退回平台自动分配，见 GetPhone 的注释。
+	// 并发下由 mu 保护（多个 worker 可能同时取号）。
+	uid string
+	// lastUnknownUID 记录最近一次因失效被丢弃的对接码，供上层提示用户。
+	lastUnknownUID string
+
+	// ISP 运营商优先级列表（取号参数 isp）。实测取值：1=移动 2=联通 3=电信，
+	// 逗号分隔表示依次降级，最后自动退回"不限"。
+	// 空字符串表示直接不限。腾讯短信通道对广电号支持不稳定。
 	ISP string
 }
 
+// New(token) 建客户端。
 func New(token string) *Client {
 	return &Client{
 		Base:    "https://api.haozhuma.com/sms/",
@@ -47,6 +55,30 @@ func New(token string) *Client {
 		Timeout: 15 * time.Second,
 		HTTP:    &http.Client{},
 	}
+}
+
+// SetUID 钉死一个对接码（专属码）。空字符串 = 不钉死，由平台自动分配。
+func (c *Client) SetUID(uid string) {
+	c.mu.Lock()
+	c.uid = strings.TrimSpace(uid)
+	c.mu.Unlock()
+}
+
+// UID 返回当前钉死的对接码（可能因为失效被自动清空）。
+func (c *Client) UID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.uid
+}
+
+// TakeUnknownUID 返回并清空"最近一次因失效被丢弃的对接码"。
+// 上层用它提示用户去改配置（配置里的旧值已经没用了）。
+func (c *Client) TakeUnknownUID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v := c.lastUnknownUID
+	c.lastUnknownUID = ""
+	return v
 }
 
 // NewWithCredentials 用已有 token 建客户端，同时记住账号密码，
@@ -262,6 +294,20 @@ func (e *APIError) QuotaExhausted() bool {
 		(strings.Contains(e.Msg, "余额不足") || strings.Contains(e.Msg, "再取号"))
 }
 
+// UnknownUID 报告是否为"钉死的对接码不存在"。
+//
+// 实测文案：「没有这个[52283-XXXX]专属码」。上游增删对接码是常态，
+// 配置里钉死的那个随时可能整批消失——调用方应丢掉它并退回自动分配，
+// 而不是把这个错误当成致命错误终止任务。
+func (e *APIError) UnknownUID() bool {
+	if e == nil {
+		return false
+	}
+	return strings.Contains(e.Msg, "专属码") ||
+		strings.Contains(e.Msg, "没有这个") ||
+		strings.Contains(e.Msg, "对接码不存在")
+}
+
 // TokenInvalid 报告 token 是否失效（需要重新 login）。
 // 实测 token 失效时豪猪返回 HTTP 403（无 JSON body），此处对应 Code=403。
 func (e *APIError) TokenInvalid() bool {
@@ -305,19 +351,44 @@ func truncate(s string, n int) string {
 
 // GetPhone 在项目 sid 下取一个号。
 //
-// 「[限对接]」类项目按对接方放号，官方 SDK 会带 author（默认 adminzfz）
-// 和 uid 参数；缺了会拿不到号（豪猪明确提示"建议学会加对接码后再取号"）。
+// 「[限对接]」类项目按对接方放号，官方 SDK 会带 author（默认 adminzfz）；
+// 缺了会拿不到号（豪猪提示"建议学会加对接码后再取号"）。
 //
-// ISP 是运营商**优先级列表**（逗号分隔，1=移动 2=联通 3=电信）：依次尝试，
-// 前一档没号就退到下一档；全部没号时才返回错误。实测同一项目往往只放
-// 广电号（腾讯短信收不到），能挑到移动号时优先要移动。
+// ISP 是运营商**优先级列表**（1=移动 2=联通 3=电信）：逐档尝试，前一档
+// 没号就退到下一档，最后自动退回"不限"。实测同一项目不同对接码放的号段
+// 不一样（广电/联通/虚拟运营商），挑到能收码的运营商比死等一档更快。
+//
+// uid 钉死是可选的：对接码会被上游增删，钉死的那个可能整批失效。一旦
+// 报"专属码不存在"，就丢掉它退回平台自动分配，而不是让整个任务卡死。
 func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
+	phone, err := c.getPhoneRound(ctx, sid)
+
+	// 钉死的对接码失效：丢掉它，退回平台自动分配再试一轮。
+	var ae *APIError
+	if err != nil && errors.As(err, &ae) && ae.UnknownUID() && c.UID() != "" {
+		bad := c.UID()
+		c.SetUID("")
+		c.mu.Lock()
+		c.lastUnknownUID = bad
+		c.mu.Unlock()
+		if phone, retryErr := c.getPhoneRound(ctx, sid); retryErr == nil {
+			return phone, nil
+		} else {
+			return "", retryErr
+		}
+	}
+	return phone, err
+}
+
+// getPhoneRound 跑一轮取号（按 ISP 优先级逐档降级）。
+func (c *Client) getPhoneRound(ctx context.Context, sid string) (string, error) {
+	uid := c.UID()
 	base := url.Values{"token": {c.Token}, "sid": {sid}}
 	if c.Author != "" {
 		base.Set("author", c.Author)
 	}
-	if c.UID != "" {
-		base.Set("uid", c.UID)
+	if uid != "" {
+		base.Set("uid", uid)
 	}
 
 	var lastErr error
@@ -329,7 +400,7 @@ func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
 		raw, err := c.call(ctx, "getPhone", params)
 		if err != nil {
 			lastErr = err
-			// 无号是"这一档没货"，继续试下一档；其它错误（余额/项目）直接抛。
+			// 无号 = 这一档没货，继续试下一档；其余（余额/项目）直接抛。
 			var ae *APIError
 			if errors.As(err, &ae) && !ae.Fatal() {
 				continue
@@ -342,8 +413,9 @@ func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
 			lastErr = fmt.Errorf("取号成功但未返回手机号: %v", c.lastMsg(raw))
 			continue
 		}
-		if u, _ := raw["uid"].(string); strings.TrimSpace(u) != "" && c.UID == "" {
-			c.UID = strings.TrimSpace(u)
+		// 平台自动分配时记下实际用的对接码，便于日志/诊断。
+		if u, _ := raw["uid"].(string); strings.TrimSpace(u) != "" && c.UID() == "" {
+			c.SetUID(strings.TrimSpace(u))
 		}
 		return phone, nil
 	}

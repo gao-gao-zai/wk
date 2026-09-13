@@ -164,9 +164,10 @@ func TestConcurrentSameKeyAssignsOnce(t *testing.T) {
 }
 
 // boundUID 直接读绑定 uid（不触发 Resolve 的重分配），供 Bind 系列测试断言用（包内私有 helper）。
+// 表里存的是归一化后的键，所以这里也要走一次 normalizeKey。
 func (r *Router) boundUID(key string) (string, bool) {
 	r.mu.RLock()
-	e, ok := r.entries[key]
+	e, ok := r.entries[r.normalizeKey(key)]
 	r.mu.RUnlock()
 	return e.uid, ok
 }
@@ -197,8 +198,9 @@ func TestBindOverridesAndMirrors(t *testing.T) {
 	if n != 2 {
 		t.Errorf("SetBind mirror count=%d want 2", n)
 	}
-	if binds["c1"] != "a2" {
-		t.Errorf("mirrored bind should be a2, got %s", binds["c1"])
+	// 镜像到 store 的键是归一化后的，断言时同样归一化。
+	if binds[r.normalizeKey("c1")] != "a2" {
+		t.Errorf("mirrored bind should be a2, got %s", binds[r.normalizeKey("c1")])
 	}
 }
 
@@ -267,9 +269,11 @@ func TestGCCleansExpired(t *testing.T) {
 
 func TestLoadFromStoreRestores(t *testing.T) {
 	st := newCountingStore()
-	st.binds["c1"] = "a1"
-	st.binds["c2"] = "a2"
 	r := routerWith(st, []string{"a1", "a2"}, time.Minute)
+	// Redis 里镜像的键是归一化后的（SetBind 写入时就已归一化），
+	// 恢复时不能再归一化一次，否则恢复出来的键永远查不到。
+	st.binds[r.normalizeKey("c1")] = "a1"
+	st.binds[r.normalizeKey("c2")] = "a2"
 	r.LoadFromStore()
 	if r.Count() != 2 {
 		t.Fatalf("restored count=%d want 2", r.Count())

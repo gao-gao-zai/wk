@@ -8,8 +8,12 @@
 git clone https://github.com/Sliverkiss/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
-# 编辑 config.json，设置 api_key
+# 编辑 config.json，把 api_key 改成一个你自己生成的强随机值
+# 例：openssl rand -hex 32
 ```
+
+> `config.example.json` 里是**占位符**，服务会拒绝用它们启动。请务必替换成真实值。
+> 也可以完全不写配置文件，直接用环境变量：`WB2A_API_KEY=... docker compose up -d --build`。
 
 ### 2. 添加账号
 
@@ -26,7 +30,7 @@ cp config.example.json config.json
 ```bash
 docker compose up -d --build
 
-# 使用 PostgreSQL（首次使用前请修改 docker-compose.postgres.yml 中的密码）
+# 使用 PostgreSQL（首次使用前请在 .env 里设置 POSTGRES_PASSWORD）
 docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
 ```
 
@@ -34,26 +38,28 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --buil
 
 ```bash
 # 模型列表
-curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
+curl -s http://localhost:7863/v1/models -H "Authorization: Bearer $WB2A_API_KEY"
 
 # 账号状态（汇总 + 每账号详情）
-curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
+curl -s http://localhost:7863/status -H "Authorization: Bearer $WB2A_API_KEY"
 
-# 健康检查（无健康账号时 503）
+# 健康检查（公开路由，无需凭据；无健康账号时 503）
 curl -s http://localhost:7863/healthz
 
 # 聊天补全（流式）
 curl -sN http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
+  -H "Authorization: Bearer $WB2A_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
 
 # 聊天补全（非流式，本地聚合）
 curl -s http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
+  -H "Authorization: Bearer $WB2A_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
+
+除 `GET /healthz` 与 `POST /admin/unlock` 外，**所有**路由都需要凭据（`Authorization: Bearer <api_key>` 或控制台解锁 Cookie）；未携带凭据时返回 401。请求体必须是合法 JSON 对象，否则返回 `400 invalid_request`。
 
 ### 图片请求
 
@@ -61,7 +67,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ```bash
 curl -sN http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
+  -H "Authorization: Bearer $WB2A_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"glm-5v-turbo","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"请描述图片"},{"type":"image_url","image_url":{"url":"data:image/png;base64,<BASE64>"}}]}]}'
 ```
@@ -72,15 +78,50 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 > **权威字段定义见 [`config.example.json`](config.example.json)**：它是当前 schema 的唯一权威，下方样例与之保持一致。`cp config.example.json config.json` 即可得到完整默认配置。
 
-生产部署必须设置非空 `api_key`（也可使用 `WB2A_API_KEY` 环境变量）。配置文件缺失且没有 API key 时，服务会拒绝启动，避免意外以无鉴权模式暴露接口。
+生产部署必须设置非空 `api_key`（也可使用 `WB2A_API_KEY` 环境变量）。服务启动时会校验凭据，并拒绝以下三种情况，避免意外以无鉴权模式暴露接口：
+
+- 配置文件不存在且未提供 `WB2A_API_KEY` / `WB2A_FRONTEND_PASSWORD`；
+- `api_key` 与 `frontend_password` **同时为空**（此时没有任何东西可以校验，所有路由一律 401）；
+- 使用了公开仓库里的占位符（`your-api-key-here`、`change-this-password`、`changeme` 等）。
+
+`api_key` 与 `frontend_password` 只需设置其中一个：只设前者时控制台用 API Key 解锁，只设后者时控制台用密码解锁。
+
+### 监听地址
+
+默认只监听回环 `127.0.0.1:7863`，供本机编辑器/脚本使用。需要对外暴露时显式设置 `listen`：
+
+```json
+{ "listen": ":7863" }
+```
+
+容器镜像里已预置 `WB2A_LISTEN=:7863`（否则端口映射不生效）。
+
+### 反向代理
+
+服务默认**不采信** `X-Forwarded-For` / `X-Real-IP`，直接用 TCP 层的 `RemoteAddr` 作为客户端地址（用于控制台密码的错误次数限流）。这可以防止攻击者靠伪造这些头把每次尝试放进新的限流桶。
+
+如果服务确实只在反向代理后面可达，可以显式声明代理地址（支持单地址或 CIDR）：
+
+```json
+{ "trusted_proxies": ["10.0.0.1", "172.17.0.0/16"] }
+```
+
+或 `WB2A_TRUSTED_PROXIES=10.0.0.1,172.17.0.0/16`。声明之后才会按 XFF 还原真实客户端 IP，并允许代理通过 `X-Forwarded-Proto: https` 让会话 Cookie 带上 `Secure`。
+
+### 静态控制台
+
+控制台只放行 `index.html` 与 `assets/index-<hash>.{js,css}`；目录下其它任何文件（包括误放的 `config.json`、备份、编辑器临时文件）一律 404，不再提供目录列表。资源目录可用 `frontend_dir` 或 `WB2A_FRONTEND_DIR` 指定（默认 `frontend`）。
 
 ```json
 {
-  "listen": ":7863",
+  "listen": "127.0.0.1:7863",
   "api_key": "your-api-key-here",
+  "frontend_password": "change-this-password",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "region": "cn",
+  "frontend_dir": "frontend",
+  "trusted_proxies": [],
   "cooldown": {
     "soft_rate": "60s"
   },
@@ -123,10 +164,16 @@ curl -sN http://localhost:7863/v1/chat/completions \
   "session_sticky": {
     "enabled": true,
     "ttl": "30m",
-    "gc_interval": "5m"
+    "gc_interval": "5m",
+    "salt": "",
+    "max_entries": 10000
   }
 }
 ```
+
+`session_sticky.salt` 是给会话键做 HMAC 的密钥（hex，至少 16 字节）。**生产环境建议显式设置**：留空时启动会生成一个随机盐并打印告警，此时粘性绑定在重启后全部重新分配，且会话键在缺少密钥的情况下可被离线预计算。生成方式：`openssl rand -hex 32`。
+
+`session_sticky.max_entries` 是绑定表上限（默认 10000）。TTL 只能回收"已经过期"的条目，无法限制单个 TTL 窗口内涌入的大量新键，因此需要这个显式上限；到达上限时会淘汰最旧的一批绑定。
 
 `region` 支持 `cn`、`global` 和 `all`。`cn`/`global` 只加载对应区域的授权文件，`all` 会同时加载中国区与海外版账号。控制台“账号授权”中选择“海外版”完成登录后，如果当前配置是单区域，服务会自动将配置切换为 `all`，保证新账号在重启后仍然可用；使用脚本时可执行 `./login.sh global`。
 
@@ -267,7 +314,7 @@ stdout 同时保留一行便于排查的表格日志：
 | `POST /v1/responses` | Bearer | Responses API 适配（流式/非流式、工具调用、`previous_response_id`） |
 | `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
 | `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情；详情含模型级 `model_cooldowns`） |
-| `GET /requests?limit=50` | Bearer | 最近请求日志（最多 200 条，不含提示词和响应正文） |
+| `GET /requests?limit=50` | Bearer | 最近请求日志（`limit` 默认 50、上限 500；不含提示词和响应正文） |
 | `POST /admin/credits/refresh` | 前端会话/Bearer | 异步刷新所有账号的上游积分明细，不执行签到 |
 | `POST /admin/account/{uid}/enable` | 前端会话/Bearer | 手动启用账号并清除禁用/冷却状态 |
 | `POST /admin/account/{uid}/disable` | 前端会话/Bearer | 手动禁用账号，停止新请求使用 |
@@ -290,6 +337,19 @@ ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
 和请求日志使用同一个上游 ID，不添加前缀，也不重新生成；只有上游完全未返回 ID 时才使用本地兜底 ID。
 
 重复调用 `/v1/responses` 时应复用稳定的 `prompt_cache_key` 或 `conversation`；使用上一轮返回的 `previous_response_id` 时，服务会恢复该轮上下文并继续使用同一账号。响应历史默认保留 1 小时；配置 Upstash 后会同步到 Redis，可跨进程重启和多实例继续会话，未配置时使用进程内存。
+
+## 安全说明
+
+- **默认拒绝**：除 `GET /healthz` 与 `POST /admin/unlock`，所有路由都必须携带 `Authorization: Bearer <api_key>` 或控制台解锁 Cookie。凭据未配置时不是"放行"，而是**全部 401**。
+- **凭据校验**：启动时拒绝空凭据与公开占位符，见上文「配置说明」。
+- **静态资源白名单**：控制台只放行 `index.html` 与 `assets/index-<hash>.{js,css}`，不提供目录列表，其它文件一律 404。
+- **安全响应头**：所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、`Referrer-Policy: no-referrer` 与 CSP（`script-src 'self'`）。
+- **控制台不持久化 API Key**：Key 只保留在当前页面内存中，刷新后需重新输入；历史版本写入 `sessionStorage`/`localStorage` 的值会在加载时清除。
+- **请求体上限**：聊天/Responses 请求体上限 8 MiB，且必须是合法 JSON 对象。
+- **上游响应上限**：单帧 SSE 1 MiB、聚合正文 8 MiB，超限返回 `response_too_large` 并正常补 `[DONE]`。
+- **日志净化**：客户端可控字段进入日志前会按 rune 截断并剔除控制字符，防止 `\r` 与 ANSI 转义伪造日志行。
+- **手机号脱敏**：自动加号日志中的号码以 `138****8000` 形式记录（号池账号昵称即手机号）。
+- **上游跳转白名单**：短信直登的重定向跟随只允许跳到已配置端点的主机与端口，以及 `codebuddy.cn` 子域，防止会话 Cookie 被跨域 302 带走。
 
 ## 稳定性设计
 
