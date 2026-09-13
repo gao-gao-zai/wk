@@ -240,3 +240,22 @@ func TestBadSessionTTL(t *testing.T) {
 		t.Fatal("want error for bad session_sticky.ttl")
 	}
 }
+
+// TestAutoEnrollLedgerPath 号码账本必须与 state.json 同目录：部署时那个目录
+// 已挂载为卷，所以容器重建后账本还在，才能补释放遗留的号码。
+func TestAutoEnrollLedgerPath(t *testing.T) {
+	got := autoEnrollLedgerPath(&Config{StateFile: "./data/state.json"})
+	want := filepath.Join("data", "autoenroll-held.json")
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	// 绝对路径同样只取目录。
+	got = autoEnrollLedgerPath(&Config{StateFile: "/app/data/state.json"})
+	if want := filepath.Join("/app/data", "autoenroll-held.json"); got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	// 没配 state_file = 关闭持久化，而不是写到进程工作目录（那里没有卷）。
+	if got := autoEnrollLedgerPath(&Config{}); got != "" {
+		t.Fatalf("got %q want empty when state_file is unset", got)
+	}
+}

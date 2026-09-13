@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -51,9 +52,16 @@ type AutoEnroller struct {
 	// retryDelay 两次尝试之间的间隔（测试里调短）。0 时用默认 5s。
 	retryDelay time.Duration
 	// pollTimeout 单个号等验证码的时长（测试里调短）。0 时用默认 90s。
+	// pollCount > 0 时以次数为准，本字段只作为推导次数的后备。
 	pollTimeout time.Duration
 	// pollInterval 轮询间隔（测试里调短）。0 时用默认 5s。
 	pollInterval time.Duration
+	// pollCount 单个号轮询收码的**次数**上限。0 时由 pollTimeout 推导
+	// （默认 90s / 5s = 18 次）。
+	//
+	// 次数比时长更贴近实际操作：对接商质量差、短信到得晚时，用户想调的是
+	// "再等多轮几次"，而不是去换算秒数。运行中要临时多轮几次也走这里。
+	pollCount int
 
 	// reloginMu 保证并发的 token 失效只触发一次重登。
 	reloginMu   sync.Mutex
@@ -62,6 +70,29 @@ type AutoEnroller struct {
 	// cancel 停止当前运行中的任务（由 run 注册，任务结束后清空）。
 	// 没有它就只能重启容器才能停下一个跑偏的任务。
 	cancel context.CancelFunc
+
+	// runPollCount / runMaxAttempts 记录**本次运行**生效的参数，
+	// 让 /status 能回显"这次到底按几次轮询在跑"，而不只是用户填了什么。
+	runPollCount   int
+	runMaxAttempts int
+
+	// held 本次运行中"已从豪猪取走、但还没确认释放"的号码。
+	//
+	// 为什么要单独记账：取号成功后就占用了豪猪的并发额度，而额度满了会返回
+	// 「您的余额不足,请释放拉黑后再取号」——后续所有取号都会失败，看起来像
+	// 账户没钱（其实是没释放）。tryOne 的正常路径都会调 finish 释放，但如果
+	// 进程被 kill、或某次 finish 的 HTTP 请求本身失败，号就一直挂在豪猪那边
+	// （实测：一次任务结束后额度仍被占着，下一轮 14 次尝试全部失败）。
+	// 任务收尾时按这份账本兜底释放，保证"任务结束 = 号全部还回去"。
+	held map[string]bool
+	// released 已确认释放的号（从 held 移出后记在这里，用于统计与日志）。
+	released int
+	// ledgerPath 账本落盘路径（空 = 不落盘）。
+	//
+	// 落盘是为了跨**进程重启**兜底：容器重启是 SIGKILL，defer 不执行，
+	// 内存里的账本直接消失，号就永远留在豪猪那边占额度。启动时读回来
+	// 补释放一次（见 ReclaimOrphans）。
+	ledgerPath string
 }
 
 // 并发默认值与上限。并发加号靠代理池撑：每个号一个独立出口 IP
@@ -70,6 +101,17 @@ type AutoEnroller struct {
 const (
 	defaultWorkers = 3
 	maxWorkers     = 8
+	// maxPollCount 单个号收码轮询次数上限。默认 18 次 × 5s = 90s；调到 36
+	// 次已经是 3 分钟，远超验证码 60s 有效期，再往后只是白占着豪猪的号。
+	maxPollCount = 36
+	// defaultPollCount 默认轮询次数（90s / 5s），与历史行为一致。
+	defaultPollCount = 18
+	// maxAttemptsLimit 总尝试次数上限，防"目标 1 个但想试 5000 次"把号池抽干。
+	maxAttemptsLimit = 2000
+	// maxPerSuccess 每个成功号默认允许的尝试次数（自动推导上限时用）。
+	maxPerSuccess = 12
+	// minAttempts 总尝试次数下限，保证目标很小时也有足够重试。
+	minAttempts = 20
 )
 
 // consecutiveFails 连续失败熔断阈值。单号收不到码很正常（接收率就是有概率），
@@ -112,6 +154,15 @@ type AutoEnrollStatus struct {
 	// Consumed 本次已取到的号码数（含中途停止时在途的）。
 	// 与 Attempts 分开：Attempts 是跑完的尝试数，Consumed 是真实号码消耗。
 	Consumed int `json:"consumed"`
+	// PollCount / MaxAttempts 本次运行**实际生效**的参数（已夹到上限内）。
+	// 回显生效值而不是用户输入值：用户填 999 时看到 36 才知道被夹住了。
+	PollCount   int `json:"poll_count,omitempty"`
+	MaxAttempts int `json:"max_attempts,omitempty"`
+	// Held 仍占着豪猪额度的号码数（正常任务结束时必须为 0；
+	// 大于 0 说明有号没还回去，会拖累后续取号）。
+	Held int `json:"held"`
+	// Released 本次已确认归还的号码数。
+	Released int `json:"released"`
 }
 
 // NewAutoEnroller 组装自动加号器。persist 落盘回调必填（nil 时 tryOne 会
@@ -133,6 +184,9 @@ func NewAutoEnroller(sms *smslogin.Manager, hzm *haozhuma.Client, sid string,
 		sid:     sid,
 		persist: persist,
 		find:    findAccountByMobile,
+		// 默认轮询次数可用 AUTO_ENROLL_POLL_COUNT 覆盖（部署级调参），
+		// 单次任务还能再用 poll_count 覆盖它。
+		pollCount: envInt("AUTO_ENROLL_POLL_COUNT", defaultPollCount),
 	}
 }
 
@@ -156,14 +210,18 @@ func (a *AutoEnroller) Status() AutoEnrollStatus {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return AutoEnrollStatus{
-		Running:    a.running,
-		Attempts:   a.attempts,
-		OK:         a.ok,
-		Fail:       a.fail,
-		Consumed:   a.consumed,
-		Workers:    a.workers,
-		StopReason: a.stopReason,
-		Logs:       append([]string(nil), a.logs...),
+		Running:     a.running,
+		Attempts:    a.attempts,
+		OK:          a.ok,
+		Fail:        a.fail,
+		Consumed:    a.consumed,
+		Workers:     a.workers,
+		StopReason:  a.stopReason,
+		Logs:        append([]string(nil), a.logs...),
+		PollCount:   a.runPollCount,
+		MaxAttempts: a.runMaxAttempts,
+		Held:        len(a.held),
+		Released:    a.released,
 	}
 }
 
@@ -172,13 +230,57 @@ func (a *AutoEnroller) Balance(ctx context.Context) (float64, error) {
 	return a.hzm.Balance(ctx)
 }
 
-// AutoRun 对外入口。已在跑时返回错误。workers 为并发数（<=0 用默认值）。
+// AutoRunOptions 一次自动加号任务的参数。
+//
+// 零值成员一律取默认值，所以调用方只填用户显式给的部分即可——这样新增参数
+// 不会打破既有调用点。
+type AutoRunOptions struct {
+	// Want 目标成功数（必填，>0）。
+	Want int
+	// Workers 并发数。<=0 用 defaultWorkers，>maxWorkers 夹住。
+	Workers int
+	// PollCount 单个号收码轮询次数。<=0 用 a.pollCount（默认 18 次 = 90s）。
+	PollCount int
+	// MaxAttempts 总尝试次数上限。<=0 用 want*12（下限 20）。
+	// 对接商质量差时可能试很多次才成一个，用户需要能放宽。
+	MaxAttempts int
+}
+
+// AutoRun 对外入口（保持旧签名）。已在跑时返回错误。
+// workers 为并发数（<=0 用默认值）。
 func (a *AutoEnroller) AutoRun(n, workers int) error {
+	return a.AutoRunWith(AutoRunOptions{Want: n, Workers: workers})
+}
+
+// AutoRunWith 带完整参数启动。已在跑时返回错误。
+func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
+	n := opts.Want
+	workers := opts.Workers
 	if workers <= 0 {
 		workers = defaultWorkers
 	}
 	if workers > maxWorkers {
 		workers = maxWorkers
+	}
+	pollCount := opts.PollCount
+	if pollCount <= 0 {
+		pollCount = a.pollCount
+	}
+	if pollCount <= 0 {
+		pollCount = defaultPollCount
+	}
+	if pollCount > maxPollCount {
+		pollCount = maxPollCount
+	}
+	limit := opts.MaxAttempts
+	if limit <= 0 {
+		limit = n * maxPerSuccess
+		if limit < minAttempts {
+			limit = minAttempts
+		}
+	}
+	if limit > maxAttemptsLimit {
+		limit = maxAttemptsLimit
 	}
 	a.mu.Lock()
 	if a.running {
@@ -194,9 +296,23 @@ func (a *AutoEnroller) AutoRun(n, workers int) error {
 	a.attempts = 0
 	a.ok = 0
 	a.fail = 0
+	// consumed 必须一起清零：它是"本次运行取了多少号"，漏掉它会残留上一次
+	// 任务的计数——界面显示 1 而实际已取走 5 个号。号码是花钱的资产，
+	// 这个数错得让人以为没消耗。
+	a.consumed = 0
+	// released 是"本次运行归还了多少号"的计数，每次重置。
+	a.released = 0
+	// 注意：账本 a.held **不在这里清空**。
+	//
+	// 它是"我们仍认为占着豪猪额度"的持久集合，正确性要求它跨任务存活：
+	// 上一轮收尾时释放失败（或进程被杀）的号必须留着，下次启动/下次任务
+	// 才能继续重试。清空等于把"这个号还没还"忘掉，而它正占着取号额度。
+	// 条目只在**确认释放成功**（markReleased）时移除。
 	a.logs = nil
 	a.stopReason = ""
 	a.workers = workers
+	a.runPollCount = pollCount
+	a.runMaxAttempts = limit
 	// ctx/cancel 必须在置 running 之前就绪：否则"启动后立刻点停止"会
 	// 撞上 a.cancel 还是 nil，Stop 静默失效（用户以为停了其实还在跑）。
 	ctx, cancel := context.WithCancel(context.Background())
@@ -205,21 +321,29 @@ func (a *AutoEnroller) AutoRun(n, workers int) error {
 	go func() {
 		defer func() {
 			cancel()
+			// 收尾兜底释放：必须在 running 仍为 true 时做完。新的任务此时还
+			// 起不来（AutoRun 会返回"已在进行中"），所以不会出现"我们在释放、
+			// 它同时在取号"的额度竞争。
+			a.releaseAllHeld()
 			a.mu.Lock()
 			a.running = false
 			a.cancel = nil
 			a.mu.Unlock()
 		}()
-		reason := a.run(ctx, n, workers)
+		// 开跑前先清掉历史遗留：上一轮释放失败（或进程被杀）的号还占着豪猪
+		// 的取号额度，不清掉的话本轮每次取号都会失败并报
+		// 「余额不足,请释放拉黑后再取号」——看着像没钱，实际是旧号没还。
+		if n := a.reclaimStuck(); n > 0 {
+			a.logf("先归还了 %d 个历史遗留号码，取号额度已恢复", n)
+		}
+		reason := a.run(ctx, n, workers, pollCount, limit)
 		reason = a.outcome(reason)
-		a.mu.Lock()
-		a.stopReason = reason
-		a.mu.Unlock()
 		ok, attempts := a.ok, a.attempts
 		if reason != "" {
 			a.logf("任务终止：%s", reason)
 		} else {
-			a.logf("完成：成功 %d / 尝试 %d（目标 %d，并发 %d）", ok, attempts, n, workers)
+			a.logf("完成：成功 %d / 尝试 %d（目标 %d，并发 %d，每号轮询 %d 次）",
+				ok, attempts, n, workers, pollCount)
 		}
 	}()
 	return nil
@@ -261,12 +385,10 @@ func (a *AutoEnroller) Stop(reason string) bool {
 //   - token 失效：重登一次（用 mutex 保证只登一次），再失败才停
 //
 // ctx 由 AutoRun 创建并注册到 a.cancel，让 Stop() 能中断（含"启动后立刻停止"）。
-func (a *AutoEnroller) run(ctx context.Context, want, workers int) string {
-	const maxPerSuccess = 12
-	limit := want * maxPerSuccess
-	if limit < 20 {
-		limit = 20
-	}
+//
+// pollCount 是每个号收码的轮询次数，limit 是总尝试次数——由 AutoRunWith 解析
+// （含默认值与上限夹取）后传入，run 本身不再做参数决策。
+func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit int) string {
 	var (
 		got         atomic.Int64 // 成功数
 		used        atomic.Int64 // 已用尝试数
@@ -317,7 +439,7 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers int) string {
 					}
 				}
 				tctx, tcancel := context.WithTimeout(ctx, 6*time.Minute)
-				ok, usedPhone, err := a.tryOne(tctx, worker)
+				ok, usedPhone, err := a.tryOne(tctx, worker, pollCount)
 				tcancel()
 
 				// 只要真的取到了号就计入消耗：中途被取消的尝试也要算，
@@ -422,6 +544,238 @@ func (a *AutoEnroller) outcome(internal string) string {
 	return a.stopReason
 }
 
+// trackHeld 记下"这个号目前被我们占着"，并立刻落盘。
+//
+// 落盘不能攒着批量写：进程随时可能被 SIGKILL（容器重启就是），
+// 那一刻内存里的账本会直接消失，而号还占着豪猪的额度。
+func (a *AutoEnroller) trackHeld(phone string) {
+	a.mu.Lock()
+	if a.held == nil {
+		a.held = make(map[string]bool)
+	}
+	a.held[phone] = true
+	a.persistLedgerLocked()
+	a.mu.Unlock()
+}
+
+// markReleased 标记该号已释放（从 held 移出），并同步落盘。
+func (a *AutoEnroller) markReleased(phone string) {
+	a.mu.Lock()
+	if _, ok := a.held[phone]; ok {
+		delete(a.held, phone)
+		a.released++
+		a.persistLedgerLocked()
+	}
+	a.mu.Unlock()
+}
+
+// heldPhones 返回当前仍占着的号码快照。
+func (a *AutoEnroller) heldPhones() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, 0, len(a.held))
+	for p := range a.held {
+		out = append(out, p)
+	}
+	return out
+}
+
+// persistLedgerLocked 把账本写盘（调用方必须持锁）。
+//
+// 写的只有号码本身，不含 token/凭据；号码是已付费资产，所以文件权限收紧到
+// 0600。失败只记日志：账本写不下去不该中断加号主流程。
+func (a *AutoEnroller) persistLedgerLocked() {
+	if a.ledgerPath == "" {
+		return
+	}
+	phones := make([]string, 0, len(a.held))
+	for p := range a.held {
+		phones = append(phones, p)
+	}
+	raw, err := json.Marshal(phones)
+	if err != nil {
+		log.Printf("[auto-enroll] 账本序列化失败: %v", err)
+		return
+	}
+	// 先写临时文件再 rename：SIGKILL 可能发生在写到一半时，留下半个 JSON
+	// 会让下次启动读不出来，反而丢掉本该释放的号。
+	tmp := a.ledgerPath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		log.Printf("[auto-enroll] 账本写入失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, a.ledgerPath); err != nil {
+		log.Printf("[auto-enroll] 账本替换失败: %v", err)
+	}
+}
+
+// reclaim 释放给定的号码，把"仍然卡住"的号写回账本。
+//
+// 不能一律清空账本：清空等于把释放失败的号永久遗忘，而它正占着豪猪的
+// 取号额度——那正是我们要修的问题。只有确认"号已不在豪猪手里"才算归还。
+//
+// report 为 true 时用 a.logf（会进控制台日志），否则用标准 log（启动阶段）。
+func (a *AutoEnroller) reclaim(phones []string, report bool) int {
+	say := func(format string, args ...any) {
+		if report {
+			a.logf(format, args...)
+			return
+		}
+		log.Printf("[auto-enroll] "+format, args...)
+	}
+	bg := context.Background()
+	var done int
+	var stuck []string
+	for _, phone := range phones {
+		// 先拉黑再释放（豪猪要求的顺序）。已成功的号也要拉黑：它已有账号。
+		berr := a.hzm.Blacklist(bg, a.sid, phone)
+		rerr := a.hzm.Release(bg, a.sid, phone)
+		switch {
+		case rerr == nil:
+			done++
+		case goneUpstream(berr) || goneUpstream(rerr):
+			// 豪猪说这个号根本不在它那儿（"手机号不存在"）——等于已经不占了，
+			// 再重试也没有意义，算归还。
+			say("遗留号 %s 已不在豪猪（%v），视为已归还", maskPhone(phone), firstErr(berr, rerr))
+			done++
+		default:
+			say("遗留号释放失败 %s: %v（保留在账本，稍后重试）", maskPhone(phone), rerr)
+			stuck = append(stuck, phone)
+		}
+	}
+	next := make(map[string]bool, len(stuck))
+	for _, p := range stuck {
+		next[p] = true
+	}
+	a.mu.Lock()
+	// 以"仍卡住"的集合为准，而不是简单清空。
+	a.held = next
+	a.persistLedgerLocked()
+	a.mu.Unlock()
+	say("遗留号码补释放完成：%d/%d 个已归还", done, len(phones))
+	if len(stuck) > 0 && a.ledgerPath != "" {
+		say("%d 个号仍占用取号额度（已记入账本，稍后重试；若持续失败可在豪猪后台手动释放）", len(stuck))
+	}
+	return done
+}
+
+// reclaimStuck 在任务开始前重试历史遗留的号码。
+//
+// 为什么开跑前要清：上一轮释放失败（或进程被杀）的号仍占着豪猪的取号额度，
+// 不清掉的话本轮每次取号都会失败并报「余额不足,请释放拉黑后再取号」——
+// 看着像账户没钱，实际是旧号没还。
+func (a *AutoEnroller) reclaimStuck() int {
+	left := a.heldPhones()
+	if len(left) == 0 {
+		return 0
+	}
+	return a.reclaim(left, true)
+}
+
+// ReclaimOrphans 从账本读回"上次进程没来得及释放"的号码并补释放一次。
+//
+// 场景：容器重启是 SIGKILL，defer 不执行，内存账本直接消失，号就永远留在
+// 豪猪那边占额度——后续每次取号都会返回「您的余额不足,请释放拉黑后再取号」，
+// 看起来像账户没钱。启动时补一次就恢复干净。
+//
+// 必须在服务开始接单前调用（main 里）。返回补释放的号码数。
+func (a *AutoEnroller) ReclaimOrphans() int {
+	if a.ledgerPath == "" {
+		return 0
+	}
+	raw, err := os.ReadFile(a.ledgerPath)
+	if err != nil {
+		// 文件不存在是正常情况（从没跑过加号）。
+		if !os.IsNotExist(err) {
+			log.Printf("[auto-enroll] 读取遗留账本失败: %v", err)
+		}
+		return 0
+	}
+	var phones []string
+	if err := json.Unmarshal(raw, &phones); err != nil {
+		log.Printf("[auto-enroll] 遗留账本损坏（跳过）: %v", err)
+		return 0
+	}
+	if len(phones) == 0 {
+		return 0
+	}
+	log.Printf("[auto-enroll] 发现 %d 个上次未释放的号码（进程曾非正常结束），正在补释放", len(phones))
+	return a.reclaim(phones, false)
+}
+
+// goneUpstream 判断豪猪是否在说"这个号不在我这儿"（已经释放/过期）。
+// 这类错误重试无意义，应当视为已归还，否则账本会永远留着它。
+func goneUpstream(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ae *haozhuma.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	return strings.Contains(ae.Msg, "不存在") || strings.Contains(ae.Msg, "没有这个")
+}
+
+func firstErr(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetLedgerPath 设置账本落盘路径（空 = 关闭持久化）。
+func (a *AutoEnroller) SetLedgerPath(path string) {
+	a.mu.Lock()
+	a.ledgerPath = path
+	a.mu.Unlock()
+}
+
+// releaseAllHeld 任务收尾兜底：把账本里仍未确认释放的号全部拉黑 + 释放。
+//
+// 必须兜底的原因：取号后就占用了豪猪的并发额度，额度满了会返回
+// 「您的余额不足,请释放拉黑后再取号」，导致**后续所有取号都失败**——
+// 看起来像账户没钱，实际是号没还。正常路径都会释放，但进程被 kill、
+// 或单次释放请求失败时就会漏（实测：一轮任务结束后额度仍被占着，
+// 下一轮 14 次尝试全部失败）。
+//
+// 已成功的号同样要拉黑：它已经有账号了，不该再发给我。所有号都是
+// 一次性的。释放失败只记日志、不报错——收尾阶段没有更合适的处理方式，
+// 而且这条路径本就是"正常释放没成功"时的补救。
+//
+// 释放失败的号会**留在账本里**（markReleased 只在成功时调用）：账本不随
+// 任务结束清空，下次任务开跑前（reclaimStuck）或进程下次启动时
+// （ReclaimOrphans）会再试。删掉它们等于把"这个号还占着额度"忘了，
+// 而那正是本函数要解决的问题。
+func (a *AutoEnroller) releaseAllHeld() {
+	left := a.heldPhones()
+	if len(left) == 0 {
+		return
+	}
+	a.logf("任务结束，兜底释放 %d 个仍占用的号码", len(left))
+	bg := context.Background()
+	var failed int
+	for _, phone := range left {
+		// 先拉黑再释放（豪猪要求的顺序）。
+		if err := a.hzm.Blacklist(bg, a.sid, phone); err != nil {
+			a.logf("兜底拉黑 %s 失败: %v", phone, err)
+		}
+		if err := a.hzm.Release(bg, a.sid, phone); err != nil {
+			a.logf("兜底释放 %s 失败（号仍占着豪猪额度）: %v", phone, err)
+			failed++
+			continue
+		}
+		a.markReleased(phone)
+	}
+	if failed == 0 {
+		a.logf("兜底释放完成：%d 个号码已全部归还", len(left))
+	} else {
+		a.logf("兜底释放结束：%d 个成功，%d 个失败（失败的号已留在账本，下次启动会重试）",
+			len(left)-failed, failed)
+	}
+}
+
 // reloginOnce 保证并发的 token 失效只触发一次重登。
 func (a *AutoEnroller) reloginOnce() {
 	a.reloginMu.Lock()
@@ -447,7 +801,7 @@ func (a *AutoEnroller) reloginOnce() {
 // 号码处置：**所有**通过本流程取到的号最后都进黑名单——成功的号已经有账号了，
 // 不该再发给我；失败/超时的号收不到腾讯短信，留着只会下次又被取到。
 // 黑名单在 release 之前调用（豪猪要求先拉黑再释放）。
-func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (ok bool, usedPhone bool, err error) {
+func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bool, usedPhone bool, err error) {
 	// 1) 豪猪取号。
 	phone, err := a.hzm.GetPhone(ctx, a.sid)
 	if err != nil {
@@ -456,6 +810,8 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (ok bool, usedPho
 	}
 	// 从这里开始，号码已经被占用，任何退出路径都要计入消耗。
 	usedPhone = true
+	// 记进账本：任务收尾时会按它兜底释放，保证不会把号留在豪猪那边占额度。
+	a.trackHeld(phone)
 	// 配置里钉死的对接码被上游删掉了：已经自动退回平台分配，但要让你知道
 	// 配置里的值已经没用了（否则会以为号段变化是别的原因）。
 	if bad := a.hzm.TakeUnknownUID(); bad != "" {
@@ -464,10 +820,18 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (ok bool, usedPho
 	a.logf("[w%d] 取号 %s", worker, phone)
 
 	// finish 统一收尾：先拉黑再释放（豪猪 SDK 的顺序）。任何退出路径都要走它。
+	// 释放成功才把号从账本里销掉；失败则留在账本上，由任务收尾的
+	// releaseAllHeld 再兜一次（额度被占着会让后续取号全部失败）。
 	finish := func() {
 		bg := context.Background()
-		_ = a.hzm.Blacklist(bg, a.sid, phone)
-		_ = a.hzm.Release(bg, a.sid, phone)
+		if err := a.hzm.Blacklist(bg, a.sid, phone); err != nil {
+			a.logf("拉黑 %s 失败: %v", phone, err)
+		}
+		if err := a.hzm.Release(bg, a.sid, phone); err != nil {
+			a.logf("释放 %s 失败: %v（留待任务收尾重试）", phone, err)
+			return
+		}
+		a.markReleased(phone)
 	}
 
 	// 2) 已在号池里的号：拉黑（避免反复取到同一个）+ 换下一个。
@@ -495,8 +859,8 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (ok bool, usedPho
 	}
 	a.logf("已发码 session=%s… 等短信", sid)
 
-	// 4) 轮询豪猪收码（短信直登的验证码在 60s 内有效，轮询别超过）。
-	code, waitErr := a.pollCode(ctx, phone)
+	// 4) 轮询豪猪收码。轮询次数由调用方传入（用户可调），默认 18 次 × 5s。
+	code, waitErr := a.pollCode(ctx, phone, pollCount)
 
 	// 5) 验码（Verify 内部走完整 12 步并落凭据）。
 	if waitErr == nil && code != "" {
@@ -533,26 +897,43 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (ok bool, usedPho
 	return false, true, waitErr
 }
 
-// pollCode 轮询豪猪 getMessage，直到拿到验证码或短信过期。
+// pollCode 轮询豪猪 getMessage，直到拿到验证码或轮询次数用尽。
 //
-// 超时用 90s 而不是上游的 60s 有效期：豪猪的短信入库本身有延迟，
+// 次数优先：count > 0 时精确轮 count 次；count <= 0 时退回按 pollTimeout 推导
+// （默认 90s / 5s = 18 次）。
+//
+// 默认超时用 90s 而不是上游的 60s 有效期：豪猪的短信入库本身有延迟，
 // 偶尔会比 60s 晚一点到，多留 30s 能捞回这部分。代价只是失败时多等 30s，
 // 而失败不扣费。
 //
 // "等待"是正常轮询状态（豪猪返回 code=-1 msg=等待短信）——GetMessage 把它
 // 当成功返回空 sms，这里只记轮次。
-func (a *AutoEnroller) pollCode(ctx context.Context, phone string) (string, error) {
-	wait := a.pollTimeout
-	if wait <= 0 {
-		wait = 90 * time.Second
-	}
-	deadline := time.Now().Add(wait)
+func (a *AutoEnroller) pollCode(ctx context.Context, phone string, count int) (string, error) {
 	pollInterval := a.pollInterval
 	if pollInterval <= 0 {
 		pollInterval = 5 * time.Second
 	}
+	// 次数优先；没给次数才回到"时长 ÷ 间隔"的老算法。
+	if count <= 0 {
+		wait := a.pollTimeout
+		if wait <= 0 {
+			wait = 90 * time.Second
+		}
+		count = int(wait / pollInterval)
+		if count < 1 {
+			count = 1
+		}
+	}
+	// 兜底上限：次数由外部传入，给个荒唐的值（比如 100000）会把任务挂死，
+	// 而每个号都被豪猪占着不放。这里夹住，超出的部分忽略。
+	if count > maxPollCount {
+		count = maxPollCount
+	}
 	var polls int
-	for time.Now().Before(deadline) {
+	for polls < count {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		sms, err := a.hzm.GetMessage(ctx, a.sid, phone)
 		if err != nil {
 			// "等待短信" 是正常轮询状态，不是错误：GetMessage 把豪猪的
@@ -569,6 +950,10 @@ func (a *AutoEnroller) pollCode(ctx context.Context, phone string) (string, erro
 		polls++
 		if code := haozhuma.ExtractCode(sms); code != "" {
 			return code, nil
+		}
+		// 最后一轮之后不用再等：没有下一次查询了。
+		if polls >= count {
+			break
 		}
 		select {
 		case <-ctx.Done():

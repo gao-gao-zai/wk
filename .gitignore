@@ -24,6 +24,8 @@ config.json
 react/node_modules/
 react/dist/
 __pycache__/
+# 交叉编译输出（linux/amd64 二进制），只用于部署，不进版本库。
+.build-out/
 
 # Backups (contains auth tokens)
 backups/

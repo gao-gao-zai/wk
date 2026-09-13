@@ -298,16 +298,18 @@ func main() {
 		SMSLogin: smsManager,
 		// 豪猪自动加号（可选）：取号→直登→落盘全自动。与手动发码共用代理池；
 		// AutoEnroll 在 NewHandler 内部组装（persist 回调指向 handler）。
-		HaozhumaClient:  newHaozhumaClient(cfg),
-		HaozhumaSid:     strings.TrimSpace(cfg.SMS.Haozhuma.Sid),
-		UpdateSchedule:  sch.UpdateSchedule,
-		Session:         sessRouter,
-		StickyCount:     sessCount,
-		RedisMode:       redisMode,
-		ResponseStore:   responseStore,
-		MetricsStore:    persistentMetrics,
-		RequestLogStore: requestLogs,
-		CompletionStore: completions,
+		HaozhumaClient: newHaozhumaClient(cfg),
+		HaozhumaSid:    strings.TrimSpace(cfg.SMS.Haozhuma.Sid),
+		// 号码账本放在 state.json 同目录（部署时该目录已挂载为卷）。
+		AutoEnrollLedger: autoEnrollLedgerPath(cfg),
+		UpdateSchedule:   sch.UpdateSchedule,
+		Session:          sessRouter,
+		StickyCount:      sessCount,
+		RedisMode:        redisMode,
+		ResponseStore:    responseStore,
+		MetricsStore:     persistentMetrics,
+		RequestLogStore:  requestLogs,
+		CompletionStore:  completions,
 		CreditPolicy: server.CreditPolicy{
 			InputPer1K:       cfg.Billing.InputCreditsPer1KTokens,
 			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,
@@ -319,6 +321,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 补释放上次进程非正常结束时遗留的号码。放在开始服务之前：容器重启是
+	// SIGKILL，收尾代码不会执行，号会一直占着豪猪的取号额度，导致之后每次
+	// 取号都返回"余额不足,请释放拉黑后再取号"（看着像没钱，其实是号没还）。
+	if h.AutoEnroller() != nil {
+		if n := h.AutoEnroller().ReclaimOrphans(); n > 0 {
+			log.Printf("auto-enroll: reclaimed %d number(s) left over from a previous run", n)
+		}
+	}
 	go sch.RunCreditRefreshNow()
 	go sch.RunRequestCreditRefreshNow()
 	go sch.Run(ctx)
@@ -376,6 +386,16 @@ func newSMSLoginManager(cfg *Config) *smslogin.Manager {
 			d.InjectSID, strings.ToUpper(strings.TrimSpace(cfg.SMS.Proxy.Region)), stickyMinutesOrDefault(cfg.SMS.Proxy.StickyMinutes))
 	}
 	return m
+}
+
+// autoEnrollLedgerPath 号码账本路径：与 state.json 同目录（部署时已挂载为卷，
+// 所以容器重建后文件还在）。StateFile 为空时返回空串 = 关闭持久化。
+func autoEnrollLedgerPath(cfg *Config) string {
+	sf := strings.TrimSpace(cfg.StateFile)
+	if sf == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(sf), "autoenroll-held.json")
 }
 
 func stickyMinutesOrDefault(v int) int {

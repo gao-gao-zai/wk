@@ -57,9 +57,14 @@ type Config struct {
 	// HaozhumaSid 豪猪项目 ID（如 52283 腾讯科技[限对接]）。
 	HaozhumaSid string
 	// AutoEnroll 豪猪自动加号（NewHandler 内部组装）。nil = 未启用该端点。
-	AutoEnroll     *AutoEnroller
-	UpdateSchedule func(checkinHours, keepaliveHours []int)
-	MaxRotate      int // 单请求最多换号次数，默认 3
+	AutoEnroll *AutoEnroller
+	// AutoEnrollLedger 号码账本落盘路径。号码取走后会占住豪猪的并发额度，
+	// 额度满了后续取号全部失败（报"余额不足,请释放拉黑后再取号"）。落盘后
+	// 容器被 SIGKILL 重启也能在下次启动时补释放（见 ReclaimOrphans）。
+	// 空 = 不落盘（只用内存账本，任务收尾仍会兜底释放）。
+	AutoEnrollLedger string
+	UpdateSchedule   func(checkinHours, keepaliveHours []int)
+	MaxRotate        int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -205,6 +210,7 @@ func NewHandler(cfg Config) *Handler {
 				return st.Nickname, true
 			},
 		)
+		h.cfg.AutoEnroll.SetLedgerPath(cfg.AutoEnrollLedger)
 	}
 	// Static console assets are served through an explicit allow-list (see
 	// staticConsoleHandler) instead of http.FileServer(http.Dir("frontend")).
@@ -234,6 +240,12 @@ var (
 )
 
 // staticConsole serves the console shell and its built assets from an allow-list.
+// AutoEnroller 返回组装好的自动加号器（未启用豪猪时为 nil）。
+// main 需要在开始服务前调用 ReclaimOrphans 补释放上次遗留的号码。
+func (h *Handler) AutoEnroller() *AutoEnroller {
+	return h.cfg.AutoEnroll
+}
+
 func (h *Handler) staticConsole() http.Handler {
 	dir := h.cfg.FrontendDir
 	if dir == "" {
@@ -1164,6 +1176,10 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Count   int `json:"count"`
 		Workers int `json:"workers"`
+		// PollCount 每个号等验证码的轮询次数（不填用后端默认 18 次 = 90s）。
+		PollCount int `json:"poll_count"`
+		// MaxAttempts 总尝试次数上限（不填按目标数推导：count*12，下限 20）。
+		MaxAttempts int `json:"max_attempts"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
@@ -1177,15 +1193,40 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workers 需在 1-8 之间（不填默认 3）"})
 		return
 	}
-	if err := h.cfg.AutoEnroll.AutoRun(req.Count, req.Workers); err != nil {
+	// 0 = 不指定（用默认）。越界直接报错而不是静默夹取：用户以为调到了 100 次，
+	// 实际只有 36 次，会一直困惑为什么还是收不到码。
+	if req.PollCount < 0 || req.PollCount > maxPollCount {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("poll_count 需在 1-%d 之间（不填默认 %d 次，约 %d 秒）",
+				maxPollCount, defaultPollCount, defaultPollCount*5),
+		})
+		return
+	}
+	if req.MaxAttempts < 0 || req.MaxAttempts > maxAttemptsLimit {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("max_attempts 需在 1-%d 之间（不填按目标数推导）", maxAttemptsLimit),
+		})
+		return
+	}
+	err := h.cfg.AutoEnroll.AutoRunWith(AutoRunOptions{
+		Want:        req.Count,
+		Workers:     req.Workers,
+		PollCount:   req.PollCount,
+		MaxAttempts: req.MaxAttempts,
+	})
+	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
+	// 回显**生效值**：前端据此显示"这次真的按几次轮询跑"。
+	st := h.cfg.AutoEnroll.Status()
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok":      true,
-		"count":   req.Count,
-		"workers": req.Workers,
-		"note":    "任务已在后台运行，用 GET /admin/account/sms/auto-enroll 查看进度",
+		"ok":           true,
+		"count":        req.Count,
+		"workers":      st.Workers,
+		"poll_count":   st.PollCount,
+		"max_attempts": st.MaxAttempts,
+		"note":         "任务已在后台运行，用 GET /admin/account/sms/auto-enroll 查看进度",
 	})
 }
 
@@ -1200,9 +1241,18 @@ func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Requ
 		"running": st.Running, "attempts": st.Attempts,
 		"ok": st.OK, "fail": st.Fail, "logs": st.Logs,
 		"consumed": st.Consumed,
+		// held > 0 表示还有号占着豪猪额度（会拖累后续取号），控制台要能看见。
+		"held": st.Held, "released": st.Released,
 	}
 	if st.Workers > 0 {
 		body["workers"] = st.Workers
+	}
+	// 本次生效的轮询次数 / 尝试上限：控制台据此显示，也让"填了但被夹住"可见。
+	if st.PollCount > 0 {
+		body["poll_count"] = st.PollCount
+	}
+	if st.MaxAttempts > 0 {
+		body["max_attempts"] = st.MaxAttempts
 	}
 	// 终止原因（余额不足/熔断/无号可取）：控制台据此提示用户，别只显示 0 成功。
 	if st.StopReason != "" {
