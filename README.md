@@ -130,7 +130,9 @@ curl -sN http://localhost:7863/v1/chat/completions \
     "keepalive_hours": [22]
   },
   "upstream": {
-    "timeout_seconds": 120
+    "timeout_seconds": 120,
+    "stream_timeout_seconds": 0,
+    "stream_idle_seconds": 120
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,
@@ -331,6 +333,19 @@ ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
 本服务也提供同鉴权的 `/chat/completions`、`/responses`、`/models` 别名，方便直连客户端。
 上游流读取超时会返回 `upstream_timeout` 错误帧和 `[DONE]`；Responses 使用
 `response.failed`，不会把中断保存为已完成的会话。
+
+上游超时分流为两套，语义不同：
+
+- `timeout_seconds`（默认 120）：**非流式**请求的整个请求上限，含读完响应体，同时也
+  约束刷新 token、对账、签到等控制面调用。
+- `stream_idle_seconds`（默认 120，`-1` 关闭）：**流式**请求两次收到数据之间的最大
+  间隔。上游持续产出时永不触发，因此长回答可以一直流下去；只有上游卡住不发数据时才
+  尽快失败。
+- `stream_timeout_seconds`（默认 `0`＝不限）：流式请求的总时长兜底，用于防止跑飞的流
+  长期占住账号租约。默认不限，因为把它当成唯一约束就等于给回答长度设了死限。
+
+对应环境变量 `WB2A_TIMEOUT_SECONDS`、`WB2A_STREAM_IDLE_SECONDS`、
+`WB2A_STREAM_TIMEOUT_SECONDS`；启动日志会打印三者生效值。
 
 上游 WorkBuddy 返回的请求 ID 会原值传给客户端：兼容响应体中的 `id`、`request_id`、
 `requestId`、`requestID`、`record_id`、`recordId`、`recordID` 以及常见请求 ID 响应头。Chat Completions、Responses

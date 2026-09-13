@@ -41,7 +41,18 @@ type Config struct {
 	} `json:"schedule"`
 
 	Upstream struct {
-		TimeoutSeconds int `json:"timeout_seconds"` // 默认 120
+		// TimeoutSeconds 非流式请求的**整请求**上限（含读完响应体），默认 120。
+		// 它同时约束控制面 JSON 调用（刷新 token、对账、签到等）。
+		TimeoutSeconds int `json:"timeout_seconds"`
+		// StreamTimeoutSeconds 流式请求的总时长上限，0 = 不限（默认）。
+		// 流式默认不设总上限：Client.Timeout 语义是"整请求含响应体"，用在流式上
+		// 等于给回答长度设死限，会把本来能继续输出的长回答掐断。
+		// 需要兜底（防跑飞的流长期占住账号租约）时再设一个较大的值。
+		StreamTimeoutSeconds int `json:"stream_timeout_seconds"`
+		// StreamIdleSeconds 流式请求两次成功读取之间的最大间隔，默认 120。
+		// 上游持续产出时永不触发；上游卡住不发数据时据此尽快失败。
+		// 未设置或 0 = 用默认 120；显式设 -1 = 关闭该项检查。
+		StreamIdleSeconds int `json:"stream_idle_seconds"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -148,6 +159,10 @@ type Config struct {
 	SMSProxyCooldownDur time.Duration `json:"-"`
 	PostgresMaxLifetime time.Duration `json:"-"`
 	PostgresMaxIdleTime time.Duration `json:"-"`
+	// StreamTimeoutDur 流式总时长上限；0 = 不限。
+	StreamTimeoutDur time.Duration `json:"-"`
+	// StreamIdleDur 流式空闲上限；0 = 不检查。
+	StreamIdleDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -167,6 +182,10 @@ func Default() *Config {
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Upstream.TimeoutSeconds = 120
+	// 流式默认不限总时长，只守空闲窗口。这正是本次改造的目的：长回答不再被一个
+	// 整请求超时掐断，而上游卡住时仍会在 StreamIdleSeconds 内失败。
+	c.Upstream.StreamTimeoutSeconds = 0
+	c.Upstream.StreamIdleSeconds = 120
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.Passthrough = false
 	c.Pool.MaxInFlight = 3
@@ -271,6 +290,17 @@ func applyEnv(c *Config) {
 			c.Upstream.TimeoutSeconds = n
 		}
 	}
+	if v := os.Getenv("WB2A_STREAM_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.StreamTimeoutSeconds = n
+		}
+	}
+	// 允许 -1（关闭空闲检查），所以不能只接受正数。
+	if v := os.Getenv("WB2A_STREAM_IDLE_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.StreamIdleSeconds = n
+		}
+	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
@@ -353,6 +383,22 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
+	}
+	// 流式：总时长 <=0 = 不限（默认，长回答不被掐断）；空闲窗口 0 = 默认 120s，
+	// 负数 = 显式关闭。用 -1 而不是 0 表示"关闭"，是为了不让漏配/写 0 意外关掉
+	// 唯一的流式保护——关掉空闲检查后，上游卡住只能靠调用方断开或总上限兜底。
+	if secs := c.Upstream.StreamTimeoutSeconds; secs > 0 {
+		c.StreamTimeoutDur = time.Duration(secs) * time.Second
+	} else {
+		c.StreamTimeoutDur = 0
+	}
+	switch {
+	case c.Upstream.StreamIdleSeconds < 0:
+		c.StreamIdleDur = 0 // 显式关闭
+	case c.Upstream.StreamIdleSeconds == 0:
+		c.StreamIdleDur = 120 * time.Second
+	default:
+		c.StreamIdleDur = time.Duration(c.Upstream.StreamIdleSeconds) * time.Second
 	}
 	c.Billing.InputCreditsPer1KTokens = validCreditRate(c.Billing.InputCreditsPer1KTokens)
 	c.Billing.OutputCreditsPer1KTokens = validCreditRate(c.Billing.OutputCreditsPer1KTokens)

@@ -2789,7 +2789,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		rc, status, respBody, upstreamHeaders, terr := h.cfg.Upstream.ChatStreamContextWithHeaders(r.Context(), acct, body)
+		// 时长策略按请求类型分流：流式走 Stream（默认不限总时长 + 守空闲），
+		// 非流式仍用整个请求的上限。二者语义不同，不能共用一个超时。
+		policy := h.cfg.Upstream.RequestPolicy(peek.Stream)
+		rc, status, respBody, upstreamHeaders, terr := h.cfg.Upstream.ChatStreamWithPolicy(r.Context(), acct, body, policy)
 		upstream.CopyResponseIDHeaders(w.Header(), upstreamHeaders)
 		upstreamHeaderID := upstream.ResponseIDFromHeader(upstreamHeaders)
 		if upstreamHeaderID != "" {

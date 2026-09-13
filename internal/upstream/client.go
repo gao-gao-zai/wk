@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -130,6 +131,11 @@ type apiEnvelope struct {
 type Client struct {
 	HTTP *http.Client
 
+	// Stream 是流式 chat 请求的时长策略。零值 = 只受调用方 ctx 约束（即不限总时长、
+	// 不检查空闲），对长回答最友好；main 会按配置注入非零值。
+	// 注意它**不**影响 HTTP.Timeout 所覆盖的非流式/控制面请求。
+	Stream StreamPolicy
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	effortsMu sync.RWMutex
 	efforts   map[string][]string
@@ -153,10 +159,13 @@ func New() *Client {
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
-		ChatBaseGlobal:       "https://www.workbuddy.ai",
-		BillingBaseGlob:      "https://www.workbuddy.ai",
+		// 生产默认：流式不限总时长（长回答不被掐断），但守 120s 空闲。
+		// 显式给出，避免零值悄悄退化成"既不限总时长也不查空闲"。
+		Stream:         StreamPolicy{Total: 0, Idle: 120 * time.Second},
+		ChatBaseCN:     "https://copilot.tencent.com",
+		BillingBaseCN:  "https://www.codebuddy.cn",
+		ChatBaseGlobal: "https://www.workbuddy.ai",
+		BillingBaseGlob: "https://www.workbuddy.ai",
 	}
 }
 
@@ -276,32 +285,148 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 // WorkBuddy response headers. Callers use them to pass request/record IDs to
 // downstream clients without rewriting their values.
 func (c *Client) ChatStreamContextWithHeaders(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
+	return c.ChatStreamWithPolicy(ctx, a, body, c.Stream)
+}
+
+// RequestPolicy 按请求类型选择时长策略。
+//
+// 非流式沿用 HTTP.Timeout（整请求上限，对"一次性拿完整响应"是正确语义）；
+// 流式用 Stream 策略（默认不限总时长 + 守空闲）。两者必须分开，否则要么长回答被
+// 掐断，要么非流式失去兜底而可能永远挂住。
+func (c *Client) RequestPolicy(stream bool) StreamPolicy {
+	if stream {
+		return c.Stream
+	}
+	// 非流式：整个请求（含读完响应体）的上限；等响应头同受其约束。
+	return StreamPolicy{Total: c.HTTP.Timeout}
+}
+
+// StreamPolicy 单个 chat 请求的时长策略。零值 = 不限总时长、不检查空闲。
+//
+// 之所以要区分 Total 与 Idle：http.Client.Timeout 是"整个请求（含读完响应体）"的
+// 墙钟上限，对非流式是恰当的，用在流式上却等于给回答长度设了死限。流式真正需要的是
+// Idle（上游卡住才失败，持续产出就一直流），Total 只作为防止流跑飞的兜底。
+type StreamPolicy struct {
+	// Total 整个请求（含读完响应体）的上限。0 = 不限，仅靠 Idle 与调用方 ctx 约束。
+	Total time.Duration
+	// Idle 两次成功读取之间的最大间隔。0 = 不检查。
+	// 上游持续发数据时永不影响；上游卡住时尽快失败。
+	Idle time.Duration
+	// HeaderWait 等待响应头的上限。0 = 沿用 Idle（见 headerWait）。
+	//
+	// 单独留一个窗口，是因为 Total=0（默认）时"等响应头"这一阶段否则完全不受约束：
+	// 那时还没拿到 body，看门狗无从守起，若上游接了连接却不回响应头，请求会一直挂住
+	// 并占着在途租约。它只约束**开始**，不影响已经开始产出的流。
+	HeaderWait time.Duration
+}
+
+// defaultHeaderWait 既没配 HeaderWait 也没配 Idle 时的兜底。
+// 取 120s：远小于"长回答"的时长，又足以容纳上游排队/建连较慢的情况。
+const defaultHeaderWait = 120 * time.Second
+
+// headerWait 解析等响应头的窗口。
+//
+// 默认沿用 Idle：语义上"还没收到任何数据"与"两次数据之间"是同一件事，用同一个窗口
+// 更符合直觉，也省掉一个需要单独调参的常量——把 idle 调大时，等响应头的容忍度随之
+// 变宽，反之亦然。仅在两者都没配时才用 defaultHeaderWait。
+func (p StreamPolicy) headerWait() time.Duration {
+	switch {
+	case p.HeaderWait > 0:
+		return p.HeaderWait
+	case p.Idle > 0:
+		return p.Idle
+	default:
+		return defaultHeaderWait
+	}
+}
+
+// ChatStreamWithPolicy 是 ChatStreamContextWithHeaders 加上显式时长策略的版本。
+//
+// 实现要点：不修改 c.HTTP.Timeout（那是控制面 JSON 请求的整请求超时），而是在本次
+// 请求上复制一份 client 并清零 Timeout，改由 ctx 承担 Total、由 idleBody 承担 Idle。
+// 复制是安全的——http.Client 不含任何锁；Transport 仍是同一个指针，因此测试里
+// 替换 up.HTTP.Transport 的做法照旧生效。
+func (c *Client) ChatStreamWithPolicy(ctx context.Context, a *auth.Auth, body []byte, policy StreamPolicy) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
 	outBody, err := c.prepareBody(body)
 	if err != nil {
 		return nil, 0, nil, nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(outBody))
+
+	// Total（可为 0=不限）覆盖全程：等响应头 + 读响应体。
+	reqCtx, cancel := context.WithCancel(ctx)
+	if policy.Total > 0 {
+		reqCtx, cancel = context.WithTimeout(ctx, policy.Total)
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(outBody))
 	if err != nil {
+		cancel()
 		return nil, 0, nil, nil, err
 	}
 	ChatHeaders(req, a)
-	resp, err := c.HTTP.Do(req)
+
+	// 等响应头单独设一个可解除的看门狗。不能直接用 context.WithTimeout 当这个窗口：
+	// 响应体的读取同样绑定在 reqCtx 上，那样等于又给整个流加了总时限，回到要修的问题。
+	// 所以只在"响应头还没到"这段时间计时，响应头一到就解除。
+	//
+	// 为什么需要它：默认 Total=0 时，这一阶段否则完全不受约束——那时还没有 body，
+	// timeoutBody 的看门狗无从守起；上游接了连接却不回响应头就会一直挂住并占着租约。
+	//
+	// 用 CAS 而不是"Stop + 事后读标志"：Stop 无法撤销一个已经开始执行的回调，若定时器
+	// 恰好在响应头到达的同时触发，就会出现"标志还没置上、ctx 已被取消"的窗口，把一个
+	// 健康的流打断。让回调和主流程争抢同一个原子量，只有抢到的一方能取消 ctx。
+	var headerArrived atomic.Bool
+	var headerTimedOut atomic.Bool
+	headerWait := policy.headerWait()
+	if policy.Total > 0 && policy.Total < headerWait {
+		headerWait = policy.Total
+	}
+	headerTimer := time.AfterFunc(headerWait, func() {
+		if headerArrived.CompareAndSwap(false, true) {
+			headerTimedOut.Store(true)
+			cancel()
+		}
+	})
+
+	// 复制 client 并清零 Timeout：流式的时长已完全交给 policy，若保留整请求超时
+	// 会把长流式回答再次掐断，那就白改了。
+	cli := *c.HTTP
+	cli.Timeout = 0
+	resp, err := cli.Do(req)
+	// 声明"响应头已到"：若回调抢先抢到 CAS，这里会失败且 headerTimedOut 已置位。
+	alreadyArrived := headerArrived.CompareAndSwap(false, true)
+	headerTimer.Stop()
 	if err != nil {
+		cancel()
+		if headerTimedOut.Load() {
+			// 换成可识别的哨兵，别让上游看到一句无来由的 "context canceled"。
+			err = fmt.Errorf("%w (waited %s for response headers)", ErrStreamHeaderTimeout, headerWait)
+		}
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
+		return nil, 0, nil, nil, err
+	}
+	if !alreadyArrived || headerTimedOut.Load() {
+		// 响应头刚到、定时器同时触发并取消了 reqCtx。此时 body 已随 ctx 失效，与其返回
+		// 一个注定读失败的流（下游只会看到一句语焉不详的 "context canceled"），不如在这里
+		// 就按"等响应头超时"如实报错。
+		resp.Body.Close()
+		cancel()
+		err := fmt.Errorf("%w (waited %s for response headers)", ErrStreamHeaderTimeout, headerWait)
+		log.Printf("chat_stream uid=%s: %v", a.UID, err)
 		return nil, 0, nil, nil, err
 	}
 	headers = resp.Header.Clone()
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, headers, nil
 	}
-	return resp.Body, resp.StatusCode, nil, headers, nil
-}
+	// 交还 body 时把 cancel 挂上：调用方 Close 即释放 ctx（含 Total 定时器）。
+	return newTimeoutBody(resp.Body, policy.Total, policy.Idle, cancel), resp.StatusCode, nil, headers, nil}
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
 type ModelInfo struct {

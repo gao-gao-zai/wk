@@ -262,8 +262,17 @@ func main() {
 	}
 
 	up := upstream.New()
+	// 非流式/控制面：整请求（含读完响应体）上限。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
+	// 流式：独立策略，不再受上面那个整请求超时约束。默认不限总时长、只守 120s 空闲，
+	// 这样长回答能一直流出，而上游卡住时仍会尽快失败。
+	up.Stream = upstream.StreamPolicy{
+		Total: cfg.StreamTimeoutDur,
+		Idle:  cfg.StreamIdleDur,
+	}
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	log.Printf("upstream timeouts: request=%ds stream_total=%s stream_idle=%s",
+		cfg.Upstream.TimeoutSeconds, durLabel(cfg.StreamTimeoutDur), durLabel(cfg.StreamIdleDur))
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
@@ -403,6 +412,15 @@ func stickyMinutesOrDefault(v int) int {
 		return v
 	}
 	return 30
+}
+
+// durLabel 渲染超时用于启动日志。0 在这里是"不限/不检查"而非"零时长"，
+// 直接打 Duration.String() 会显示 "0s"，容易被误读成一个立即超时的错误配置。
+func durLabel(d time.Duration) string {
+	if d <= 0 {
+		return "unlimited"
+	}
+	return d.String()
 }
 
 // newHaozhumaClient 建豪猪客户端。未配置账号或项目 ID 时返回 nil（端点关闭）。

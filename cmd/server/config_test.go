@@ -4,7 +4,101 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// 流式超时默认值：不限总时长（否则长回答仍会被整请求超时掐断，正是本次改造要解决的问题），
+// 但空闲窗口必须非零，否则上游卡住时没有任何保护。
+func TestStreamTimeoutDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Upstream.TimeoutSeconds != 120 {
+		t.Errorf("non-stream timeout=%ds want 120", c.Upstream.TimeoutSeconds)
+	}
+	if c.StreamTimeoutDur != 0 {
+		t.Errorf("StreamTimeoutDur=%v want 0 (unlimited by default)", c.StreamTimeoutDur)
+	}
+	if c.StreamIdleDur != 120*time.Second {
+		t.Errorf("StreamIdleDur=%v want 120s", c.StreamIdleDur)
+	}
+}
+
+// 未设置/写 0 = 用默认 120s；显式 -1 = 关闭空闲检查。两者必须区分，
+// 否则漏配一个 0 就会静默关掉唯一的流式保护。
+func TestStreamIdleSecondsZeroVsDisabled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		secs int
+		want time.Duration
+	}{
+		{"unset/zero uses default", 0, 120 * time.Second},
+		{"explicit value", 45, 45 * time.Second},
+		{"negative disables", -1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Default()
+			c.Upstream.StreamIdleSeconds = tc.secs
+			if err := c.normalize(); err != nil {
+				t.Fatalf("normalize: %v", err)
+			}
+			if c.StreamIdleDur != tc.want {
+				t.Errorf("secs=%d -> %v want %v", tc.secs, c.StreamIdleDur, tc.want)
+			}
+		})
+	}
+}
+
+// 流式总上限可显式开启（兜底跑飞的流），负数/0 都视为不限。
+func TestStreamTimeoutSecondsNormalization(t *testing.T) {
+	for _, tc := range []struct {
+		secs int
+		want time.Duration
+	}{
+		{600, 10 * time.Minute},
+		{0, 0},
+		{-5, 0},
+	} {
+		c := Default()
+		c.Upstream.StreamTimeoutSeconds = tc.secs
+		if err := c.normalize(); err != nil {
+			t.Fatalf("normalize: %v", err)
+		}
+		if c.StreamTimeoutDur != tc.want {
+			t.Errorf("secs=%d -> %v want %v", tc.secs, c.StreamTimeoutDur, tc.want)
+		}
+	}
+}
+
+func TestStreamTimeoutEnvOverrides(t *testing.T) {
+	t.Setenv("WB2A_STREAM_TIMEOUT_SECONDS", "600")
+	t.Setenv("WB2A_STREAM_IDLE_SECONDS", "-1")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.StreamTimeoutDur != 10*time.Minute {
+		t.Errorf("StreamTimeoutDur=%v want 10m", c.StreamTimeoutDur)
+	}
+	// -1 必须能通过 env 传进来（Atoi 接受负号），否则"关闭"无法远程配置。
+	if c.StreamIdleDur != 0 {
+		t.Errorf("StreamIdleDur=%v want 0 (disabled via env)", c.StreamIdleDur)
+	}
+}
+
+func TestStreamTimeoutFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":90,"stream_timeout_seconds":300,"stream_idle_seconds":30}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.TimeoutSeconds != 90 || c.StreamTimeoutDur != 300*time.Second || c.StreamIdleDur != 30*time.Second {
+		t.Fatalf("timeouts=%d/%v/%v", c.Upstream.TimeoutSeconds, c.StreamTimeoutDur, c.StreamIdleDur)
+	}
+}
 
 func TestDefault(t *testing.T) {
 	c := Default()
