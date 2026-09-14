@@ -120,7 +120,7 @@ func (s *Scheduler) RunRequestCreditRefreshNow() {
 	if s.cfg.RequestCredits == nil {
 		return
 	}
-	logs, err := s.cfg.RequestCredits.RecentRequests(200)
+	logs, err := s.cfg.RequestCredits.QueryRequests(metricsstore.RequestFilter{Limit: 200})
 	if err != nil {
 		log.Printf("request usage logs: %v", err)
 		return

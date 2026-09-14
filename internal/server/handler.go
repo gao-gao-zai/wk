@@ -1548,6 +1548,31 @@ func (h *Handler) requests(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []RequestLog{}})
 		return
 	}
+	// 控制台的请求日志页：带任何筛选参数时走数据库下推查询，支持
+	// 时间窗/模型/状态/账号等多维过滤；老客户端（只传 limit）行为不变——
+	// 无筛选时的 QueryRequests 与 RecentRequests 等价。
+	if queryStore, ok := h.cfg.RequestLogStore.(RequestLogQueryStore); ok {
+		filter, _ := parseRequestLogFilter(r, limit)
+		filter.Limit = limit
+		records, err := queryStore.QueryRequests(filter)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "request_log_unavailable", "message": err.Error()}})
+			return
+		}
+		if records == nil {
+			records = []RequestLog{}
+		}
+		body := map[string]any{"object": "list", "data": records}
+		// include=summary 时附带全量聚合（不受 limit 截断），仪表盘的
+		// 时间窗统计靠它显示精确总数。
+		if strings.Contains(r.URL.Query().Get("include"), "summary") {
+			if summary, err := queryStore.SummarizeRequests(filter); err == nil {
+				body["summary"] = summary
+			}
+		}
+		writeJSON(w, http.StatusOK, body)
+		return
+	}
 	records, err := h.cfg.RequestLogStore.RecentRequests(limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "request_log_unavailable", "message": err.Error()}})
@@ -1557,6 +1582,70 @@ func (h *Handler) requests(w http.ResponseWriter, r *http.Request) {
 		records = []RequestLog{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": records})
+}
+
+// parseRequestLogFilter decodes console filter query parameters. ok=false
+// means no filter parameter was supplied at all, letting the endpoint keep
+// its legacy behaviour.
+func parseRequestLogFilter(r *http.Request, limit int) (RequestLogFilter, bool) {
+	query := r.URL.Query()
+	filter := RequestLogFilter{Limit: limit}
+	seen := false
+	if raw := strings.TrimSpace(query.Get("since")); raw != "" {
+		if value, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			filter.SinceUnix = value
+			seen = true
+		}
+	}
+	if raw := strings.TrimSpace(query.Get("until")); raw != "" {
+		if value, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			filter.UntilUnix = value
+			seen = true
+		}
+	}
+	for param, target := range map[string]*string{
+		"model":   &filter.Model,
+		"route":   &filter.Route,
+		"account": &filter.AccountUID,
+		"region":  &filter.Region,
+		"code":    &filter.ErrorCode,
+		"error":   &filter.ErrorCode,
+		"id":      &filter.ID,
+	} {
+		if raw := strings.TrimSpace(query.Get(param)); raw != "" {
+			*target = raw
+			seen = true
+		}
+	}
+	if raw := strings.TrimSpace(query.Get("status")); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil {
+			filter.Status = value
+			seen = true
+		}
+	}
+	if raw := strings.TrimSpace(query.Get("success")); raw != "" {
+		value := false
+		if raw == "1" || strings.EqualFold(raw, "true") {
+			value = true
+		} else if raw != "0" && !strings.EqualFold(raw, "false") {
+			return filter, seen
+		}
+		filter.Success = &value
+		seen = true
+	}
+	if raw := strings.TrimSpace(query.Get("ttfb_min")); raw != "" {
+		if value, err := strconv.ParseInt(raw, 10, 64); err == nil && value > 0 {
+			filter.TTFBMinMillis = value
+			seen = true
+		}
+	}
+	if raw := strings.TrimSpace(query.Get("ttfb_max")); raw != "" {
+		if value, err := strconv.ParseInt(raw, 10, 64); err == nil && value > 0 {
+			filter.TTFBMaxMillis = value
+			seen = true
+		}
+	}
+	return filter, seen
 }
 
 func (h *Handler) metricsSnapshot() map[string]any {

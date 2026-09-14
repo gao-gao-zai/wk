@@ -74,6 +74,50 @@ type RequestLogStore interface {
 	RecentRequests(limit int) ([]RequestLog, error)
 }
 
+// RequestLogQueryStore is the optional richer query interface behind the
+// request-log console page. When the configured store implements it, the
+// /requests endpoint pushes filters (time window, model, status, account…)
+// down to the database instead of filtering a recent-rows page in memory.
+type RequestLogQueryStore interface {
+	QueryRequests(RequestLogFilter) ([]RequestLog, error)
+	SummarizeRequests(RequestLogFilter) (RequestSummary, error)
+}
+
+// RequestLogFilter mirrors metricsstore.RequestFilter at the HTTP boundary.
+// Zero values mean "not filtered".
+type RequestLogFilter struct {
+	Limit         int
+	SinceUnix     int64
+	UntilUnix     int64
+	Model         string
+	Route         string
+	AccountUID    string
+	Region        string
+	Status        int
+	Success       *bool
+	ErrorCode     string
+	ID            string
+	TTFBMinMillis int64
+	TTFBMaxMillis int64
+}
+
+// RequestSummary is the aggregate of every request log matching a filter.
+type RequestSummary struct {
+	Requests         int64   `json:"requests"`
+	Successes        int64   `json:"successes"`
+	Failures         int64   `json:"failures"`
+	InputTokens      int64   `json:"input_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
+	ToolCalls        int64   `json:"tool_calls"`
+	TTFBMillisSum    int64   `json:"ttfb_millis_sum"`
+	TTFBSamples      int64   `json:"ttfb_samples"`
+	LatencyMillisSum int64   `json:"latency_millis_sum"`
+	CreditsConsumed  float64 `json:"credits_consumed"`
+}
+
 // CreditMetricsStore persists credit totals alongside aggregate metrics.
 type CreditMetricsStore interface {
 	AddCredit(consumed float64, source string) error

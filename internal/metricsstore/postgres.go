@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -294,15 +295,22 @@ func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int
 }
 
 func (s *PostgresStore) RecentRequests(limit int) ([]RequestRecord, error) {
-	if limit <= 0 || limit > 200 {
+	return s.QueryRequests(RequestFilter{Limit: limit})
+}
+
+// QueryRequests returns request log rows matching the filter, newest first.
+func (s *PostgresStore) QueryRequests(filter RequestFilter) ([]RequestRecord, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	where, args := requestFilterWhere(filter, "$")
 	rows, err := s.db.Query(`SELECT id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
 		tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message
-		FROM request_logs ORDER BY created_at DESC, log_id DESC LIMIT $1`, limit)
+		FROM request_logs`+where+` ORDER BY created_at DESC, log_id DESC LIMIT $`+strconv.Itoa(len(args)+1), append(args, limit)...)
 	if err != nil {
 		return nil, err
 	}
@@ -318,6 +326,30 @@ func (s *PostgresStore) RecentRequests(limit int) ([]RequestRecord, error) {
 		out = append(out, record)
 	}
 	return out, rows.Err()
+}
+
+// SummarizeRequests aggregates every matching row without a LIMIT cap.
+func (s *PostgresStore) SummarizeRequests(filter RequestFilter) (RequestSummary, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	where, args := requestFilterWhere(filter, "$")
+	row := s.db.QueryRow(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END), 0),
+		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0),
+		COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(tool_calls), 0),
+		COALESCE(SUM(ttfb_millis), 0), COALESCE(SUM(CASE WHEN ttfb_millis > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(latency_millis), 0), COALESCE(SUM(credits_consumed), 0)
+		FROM request_logs`+where, args...)
+	var summary RequestSummary
+	if err := row.Scan(&summary.Requests, &summary.Successes, &summary.Failures,
+		&summary.InputTokens, &summary.OutputTokens, &summary.TotalTokens,
+		&summary.CacheReadTokens, &summary.CacheWriteTokens, &summary.ToolCalls,
+		&summary.TTFBMillisSum, &summary.TTFBSamples, &summary.LatencyMillisSum,
+		&summary.CreditsConsumed); err != nil {
+		return RequestSummary{}, err
+	}
+	return summary, nil
 }
 
 func (s *PostgresStore) Snapshot() (Snapshot, error) {

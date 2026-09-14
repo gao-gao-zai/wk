@@ -93,38 +93,79 @@ func requestRecord(record server.RequestLog) metricsstore.RequestRecord {
 }
 
 func (m metricsAdapter) RecentRequests(limit int) ([]server.RequestLog, error) {
-	records, err := m.store.RecentRequests(limit)
+	records, err := m.store.QueryRequests(metricsstore.RequestFilter{Limit: limit})
 	if err != nil {
 		return nil, err
 	}
 	out := make([]server.RequestLog, 0, len(records))
 	for _, record := range records {
-		out = append(out, server.RequestLog{
-			ID:                    record.ID,
-			CreatedAt:             record.CreatedAt,
-			Route:                 record.Route,
-			Model:                 record.Model,
-			Mode:                  record.Mode,
-			Status:                record.Status,
-			AccountUID:            record.AccountUID,
-			AccountRegion:         record.AccountRegion,
-			RequestedOutputTokens: record.RequestedOutputTokens,
-			InputTokens:           record.InputTokens,
-			OutputTokens:          record.OutputTokens,
-			TotalTokens:           record.TotalTokens,
-			CacheReadTokens:       record.CacheReadTokens,
-			CacheWriteTokens:      record.CacheWriteTokens,
-			ToolCalls:             record.ToolCalls,
-			TTFBMillis:            record.TTFBMillis,
-			LatencyMillis:         record.LatencyMillis,
-			CreditsConsumed:       record.CreditsConsumed,
-			CreditSource:          record.CreditSource,
-			Passthrough:           record.Passthrough,
-			ErrorCode:             record.ErrorCode,
-			ErrorMessage:          record.ErrorMessage,
-		})
+		out = append(out, serverRequestLog(record))
 	}
 	return out, nil
+}
+
+// QueryRequests / SummarizeRequests 把控制台请求日志页的筛选条件下推到
+// 存储层，映射字段与 metricsstore.RequestFilter 一一对应。
+func (m metricsAdapter) QueryRequests(filter server.RequestLogFilter) ([]server.RequestLog, error) {
+	records, err := m.store.QueryRequests(requestLogFilter(filter))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]server.RequestLog, 0, len(records))
+	for _, record := range records {
+		out = append(out, serverRequestLog(record))
+	}
+	return out, nil
+}
+
+func (m metricsAdapter) SummarizeRequests(filter server.RequestLogFilter) (server.RequestSummary, error) {
+	summary, err := m.store.SummarizeRequests(requestLogFilter(filter))
+	if err != nil {
+		return server.RequestSummary{}, err
+	}
+	return server.RequestSummary{
+		Requests: summary.Requests, Successes: summary.Successes, Failures: summary.Failures,
+		InputTokens: summary.InputTokens, OutputTokens: summary.OutputTokens, TotalTokens: summary.TotalTokens,
+		CacheReadTokens: summary.CacheReadTokens, CacheWriteTokens: summary.CacheWriteTokens,
+		ToolCalls: summary.ToolCalls, TTFBMillisSum: summary.TTFBMillisSum, TTFBSamples: summary.TTFBSamples,
+		LatencyMillisSum: summary.LatencyMillisSum, CreditsConsumed: summary.CreditsConsumed,
+	}, nil
+}
+
+func requestLogFilter(filter server.RequestLogFilter) metricsstore.RequestFilter {
+	return metricsstore.RequestFilter{
+		Limit: filter.Limit, SinceUnix: filter.SinceUnix, UntilUnix: filter.UntilUnix,
+		Model: filter.Model, Route: filter.Route, AccountUID: filter.AccountUID, Region: filter.Region,
+		Status: filter.Status, Success: filter.Success, ErrorCode: filter.ErrorCode, ID: filter.ID,
+		TTFBMinMillis: filter.TTFBMinMillis, TTFBMaxMillis: filter.TTFBMaxMillis,
+	}
+}
+
+func serverRequestLog(record metricsstore.RequestRecord) server.RequestLog {
+	return server.RequestLog{
+		ID:                    record.ID,
+		CreatedAt:             record.CreatedAt,
+		Route:                 record.Route,
+		Model:                 record.Model,
+		Mode:                  record.Mode,
+		Status:                record.Status,
+		AccountUID:            record.AccountUID,
+		AccountRegion:         record.AccountRegion,
+		RequestedOutputTokens: record.RequestedOutputTokens,
+		InputTokens:           record.InputTokens,
+		OutputTokens:          record.OutputTokens,
+		TotalTokens:           record.TotalTokens,
+		CacheReadTokens:       record.CacheReadTokens,
+		CacheWriteTokens:      record.CacheWriteTokens,
+		ToolCalls:             record.ToolCalls,
+		TTFBMillis:            record.TTFBMillis,
+		LatencyMillis:         record.LatencyMillis,
+		CreditsConsumed:       record.CreditsConsumed,
+		CreditSource:          record.CreditSource,
+		Passthrough:           record.Passthrough,
+		ErrorCode:             record.ErrorCode,
+		ErrorMessage:          record.ErrorMessage,
+	}
 }
 
 func (m metricsAdapter) SnapshotMetrics() map[string]any {

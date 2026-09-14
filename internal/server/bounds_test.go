@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -55,6 +56,107 @@ func TestRequestsLimitIsClamped(t *testing.T) {
 		}
 	}
 }
+
+// fakeQueryStore backs the /requests filter tests: it records the filter the
+// handler pushed down and returns one canned row plus a canned summary.
+type fakeQueryStore struct {
+	captureRequestLogStore
+	gotFilter  RequestLogFilter
+	queryCalls int
+	sumCalls   int
+}
+
+func (s *fakeQueryStore) QueryRequests(filter RequestLogFilter) ([]RequestLog, error) {
+	s.gotFilter = filter
+	s.queryCalls++
+	return []RequestLog{{ID: "req_x", CreatedAt: 1, Model: "m"}}, nil
+}
+
+func (s *fakeQueryStore) SummarizeRequests(filter RequestLogFilter) (RequestSummary, error) {
+	s.gotFilter = filter
+	s.sumCalls++
+	return RequestSummary{Requests: 7, Successes: 5, Failures: 2, CreditsConsumed: 1.25}, nil
+}
+
+// TestRequestsFiltersArePushedDown verifies the console page's filter
+// parameters survive parsing and reach the query store.
+func TestRequestsFiltersArePushedDown(t *testing.T) {
+	store := &fakeQueryStore{}
+	h := newTestHandler(t, Config{RequestLogStore: store})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/requests?since=100&until=200&model=glm-5v-turbo&route=/v1/responses&account=uid-a&region=global&status=429&code=rate_limited&id=req_9&ttfb_min=300&ttfb_max=900&include=summary&limit=77", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	f := store.gotFilter
+	if f.Limit != 77 || f.SinceUnix != 100 || f.UntilUnix != 200 {
+		t.Errorf("limit/since/until not parsed: %+v", f)
+	}
+	if f.Model != "glm-5v-turbo" || f.Route != "/v1/responses" {
+		t.Errorf("model/route not parsed: %+v", f)
+	}
+	if f.AccountUID != "uid-a" || f.Region != "global" || f.Status != 429 {
+		t.Errorf("account/region/status not parsed: %+v", f)
+	}
+	if f.ErrorCode != "rate_limited" || f.ID != "req_9" {
+		t.Errorf("error/id not parsed: %+v", f)
+	}
+	if f.TTFBMinMillis != 300 || f.TTFBMaxMillis != 900 {
+		t.Errorf("ttfb range not parsed: %+v", f)
+	}
+	if store.sumCalls != 1 {
+		t.Errorf("include=summary did not trigger summary (calls=%d)", store.sumCalls)
+	}
+	var body struct {
+		Data    []RequestLog   `json:"data"`
+		Summary *RequestSummary `json:"summary"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Data) != 1 || body.Data[0].ID != "req_x" {
+		t.Fatalf("data rows: %+v", body.Data)
+	}
+	if body.Summary == nil || body.Summary.Requests != 7 {
+		t.Fatalf("summary missing or wrong: %+v", body.Summary)
+	}
+}
+
+// TestRequestsSuccessFilterBoolean covers the success=0/1/true/false parsing
+// and that invalid values fall back to "not filtered" instead of erroring.
+func TestRequestsSuccessFilterBoolean(t *testing.T) {
+	cases := []struct {
+		raw     string
+		want    *bool
+	}{
+		{"1", boolPtr(true)},
+		{"true", boolPtr(true)},
+		{"TRUE", boolPtr(true)},
+		{"0", boolPtr(false)},
+		{"false", boolPtr(false)},
+		{"yes", nil},
+		{"", nil},
+	}
+	for _, tc := range cases {
+		store := &fakeQueryStore{}
+		h := newTestHandler(t, Config{RequestLogStore: store})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/requests?success="+tc.raw, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("success=%q code=%d", tc.raw, rec.Code)
+		}
+		got := store.gotFilter.Success
+		if tc.want == nil {
+			if got != nil {
+				t.Errorf("success=%q parsed %+v, want nil", tc.raw, *got)
+			}
+		} else if got == nil || *got != *tc.want {
+			t.Errorf("success=%q parsed %v, want %v", tc.raw, got, *tc.want)
+		}
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }
 
 // TestRateLimitResetAtRejectsAbsurdlyDistantReset is the account-freezing fix:
 // reset_at becomes the cooldown deadline, so an untrusted upstream body

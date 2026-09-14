@@ -78,9 +78,48 @@ type Backend interface {
 	RecordRequest(RequestRecord) error
 	RecordCompletion(Snapshot, RequestRecord) error
 	ReconcileRequestCredit(string, float64) error
-	RecentRequests(int) ([]RequestRecord, error)
+	QueryRequests(RequestFilter) ([]RequestRecord, error)
+	SummarizeRequests(RequestFilter) (RequestSummary, error)
 	Snapshot() (Snapshot, error)
 	Close() error
+}
+
+// RequestFilter describes searchable conditions for request log queries.
+// Zero-value fields are ignored, so an empty filter matches everything.
+// Limit caps the returned rows only; SummarizeRequests ignores it.
+type RequestFilter struct {
+	Limit         int
+	SinceUnix     int64 // 只保留 created_at >= SinceUnix 的行
+	UntilUnix     int64 // 只保留 created_at <= UntilUnix 的行
+	Model         string
+	Route         string
+	AccountUID    string
+	Region        string
+	Status        int    // 精确状态码；0 = 不过滤
+	Success       *bool  // nil = 不过滤；true = 2xx；false = 非 2xx
+	ErrorCode     string
+	ID            string
+	TTFBMinMillis int64 // 首字时间下限（含）；ttfb_millis=0 的行会被 min>0 排除
+	TTFBMaxMillis int64 // 首字时间上限（含）
+}
+
+// RequestSummary aggregates all request logs matching a filter. Unlike the
+// row query it is not capped by Limit, so a windowed dashboard can show exact
+// totals even when the matching rows far exceed the page size.
+type RequestSummary struct {
+	Requests         int64   `json:"requests"`
+	Successes        int64   `json:"successes"`
+	Failures         int64   `json:"failures"`
+	InputTokens      int64   `json:"input_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
+	ToolCalls        int64   `json:"tool_calls"`
+	TTFBMillisSum    int64   `json:"ttfb_millis_sum"`
+	TTFBSamples      int64   `json:"ttfb_samples"`
+	LatencyMillisSum int64   `json:"latency_millis_sum"`
+	CreditsConsumed  float64 `json:"credits_consumed"`
 }
 
 const maxRequestLogs = 10000
@@ -391,15 +430,22 @@ func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {
 }
 
 func (s *Store) RecentRequests(limit int) ([]RequestRecord, error) {
-	if limit <= 0 || limit > 200 {
+	return s.QueryRequests(RequestFilter{Limit: limit})
+}
+
+// QueryRequests returns request log rows matching the filter, newest first.
+func (s *Store) QueryRequests(filter RequestFilter) ([]RequestRecord, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	where, args := requestFilterWhere(filter, "?")
 	rows, err := s.db.Query(`SELECT id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
 		tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message
-		FROM request_logs ORDER BY created_at DESC, rowid DESC LIMIT ?`, limit)
+		FROM request_logs`+where+` ORDER BY created_at DESC, rowid DESC LIMIT ?`, append(args, limit)...)
 	if err != nil {
 		return nil, err
 	}
@@ -417,6 +463,96 @@ func (s *Store) RecentRequests(limit int) ([]RequestRecord, error) {
 		out = append(out, record)
 	}
 	return out, rows.Err()
+}
+
+// SummarizeRequests aggregates every matching row without a LIMIT cap.
+// COALESCE keeps SUM() NULL on an empty match set from failing the scan.
+func (s *Store) SummarizeRequests(filter RequestFilter) (RequestSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	where, args := requestFilterWhere(filter, "?")
+	row := s.db.QueryRow(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END), 0),
+		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0),
+		COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(tool_calls), 0),
+		COALESCE(SUM(ttfb_millis), 0), COALESCE(SUM(CASE WHEN ttfb_millis > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(latency_millis), 0), COALESCE(SUM(credits_consumed), 0)
+		FROM request_logs`+where, args...)
+	var summary RequestSummary
+	if err := row.Scan(&summary.Requests, &summary.Successes, &summary.Failures,
+		&summary.InputTokens, &summary.OutputTokens, &summary.TotalTokens,
+		&summary.CacheReadTokens, &summary.CacheWriteTokens, &summary.ToolCalls,
+		&summary.TTFBMillisSum, &summary.TTFBSamples, &summary.LatencyMillisSum,
+		&summary.CreditsConsumed); err != nil {
+		return RequestSummary{}, err
+	}
+	return summary, nil
+}
+
+// requestFilterWhere builds the shared SQL WHERE clause and bound arguments
+// for request log queries. placeholder is the dialect marker ("?" for SQLite,
+// "$N" for Postgres). The returned clause is either empty or begins with
+// " WHERE ".
+func requestFilterWhere(filter RequestFilter, placeholder string) (string, []any) {
+	useDollar := placeholder != "?"
+	args := []any{}
+	next := 1
+	// ph 返回下一个占位符并把 arg 追加到参数列表。
+	ph := func(arg any) string {
+		var p string
+		if useDollar {
+			p = fmt.Sprintf("$%d", next)
+		} else {
+			p = "?"
+		}
+		next++
+		args = append(args, arg)
+		return p
+	}
+	var clauses []string
+	if filter.SinceUnix > 0 {
+		clauses = append(clauses, "created_at >= "+ph(filter.SinceUnix))
+	}
+	if filter.UntilUnix > 0 {
+		clauses = append(clauses, "created_at <= "+ph(filter.UntilUnix))
+	}
+	if filter.Model != "" {
+		clauses = append(clauses, "model = "+ph(filter.Model))
+	}
+	if filter.Route != "" {
+		clauses = append(clauses, "route = "+ph(filter.Route))
+	}
+	if filter.AccountUID != "" {
+		clauses = append(clauses, "account_uid = "+ph(filter.AccountUID))
+	}
+	if filter.Region != "" {
+		clauses = append(clauses, "account_region = "+ph(filter.Region))
+	}
+	if filter.Status != 0 {
+		clauses = append(clauses, "status = "+ph(filter.Status))
+	}
+	if filter.Success != nil && *filter.Success {
+		clauses = append(clauses, "status >= 200 AND status < 300")
+	} else if filter.Success != nil {
+		clauses = append(clauses, "(status < 200 OR status >= 300)")
+	}
+	if filter.ErrorCode != "" {
+		clauses = append(clauses, "error_code = "+ph(filter.ErrorCode))
+	}
+	if filter.ID != "" {
+		clauses = append(clauses, "id = "+ph(filter.ID))
+	}
+	if filter.TTFBMinMillis > 0 {
+		clauses = append(clauses, "ttfb_millis >= "+ph(filter.TTFBMinMillis))
+	}
+	if filter.TTFBMaxMillis > 0 {
+		clauses = append(clauses, "ttfb_millis <= "+ph(filter.TTFBMaxMillis))
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
 }
 
 func (s *Store) Snapshot() (Snapshot, error) {
