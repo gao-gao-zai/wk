@@ -32,7 +32,9 @@ backups/
 
 # 账单导出：含 account_uid 与 account_nickname，而自动加号的账号昵称**就是手机号**
 # （见 autoenroll 的 maskPhone 注释），属于真实 PII，绝不能提交。
-billing-export/
+# 用 billing-export*/ 覆盖带日期后缀的目录（如 billing-export-0914/），
+# 否则新目录会漏网成为未跟踪文件。
+billing-export*/
 
 # IDE
 .idea/

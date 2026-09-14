@@ -60,6 +60,10 @@ type Config struct {
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 		// Passthrough enables raw upstream SSE forwarding for streaming chat completions.
 		Passthrough bool `json:"passthrough"`
+		// CodexCompat 改写 Codex CLI 系统提示词中的身份句（"open source"
+		// → "open-source"），绕开上游内容审核的逐字指纹匹配。句子不存在
+		// 时原样透传。默认 false。
+		CodexCompat bool `json:"codex_compat"`
 	} `json:"features"`
 
 	Billing struct {
@@ -188,6 +192,7 @@ func Default() *Config {
 	c.Upstream.StreamIdleSeconds = 120
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.Passthrough = false
+	c.Features.CodexCompat = false
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
@@ -309,6 +314,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PASSTHROUGH"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.Passthrough = b
+		}
+	}
+	if v := os.Getenv("WB2A_CODEX_COMPAT"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.CodexCompat = b
 		}
 	}
 	if v := os.Getenv("WB2A_INPUT_CREDITS_PER_1K"); v != "" {

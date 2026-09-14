@@ -312,6 +312,9 @@ func main() {
 		Idle:  cfg.StreamIdleDur,
 	}
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	// Codex 兼容：改写 Codex CLI 系统提示词身份句（open source → open-source），
+	// 绕开上游逐字指纹拦截。开关由 features.codex_compat / WB2A_CODEX_COMPAT 控制。
+	upstream.SetCodexCompat(cfg.Features.CodexCompat)
 	log.Printf("upstream timeouts: request=%ds stream_total=%s stream_idle=%s",
 		cfg.Upstream.TimeoutSeconds, durLabel(cfg.StreamTimeoutDur), durLabel(cfg.StreamIdleDur))
 

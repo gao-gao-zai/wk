@@ -136,7 +136,8 @@ curl -sN http://localhost:7863/v1/chat/completions \
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,
-    "passthrough": false
+    "passthrough": false,
+    "codex_compat": false
   },
   "billing": {
     "input_credits_per_1k_tokens": 0,
@@ -298,6 +299,17 @@ stdout 同时保留一行便于排查的表格日志：
 保留上游扩展字段，不再执行帧规范化或补写 `[DONE]`。启用总开关后，可在单次请求中
 发送 `X-WorkBuddy-Passthrough: false` 临时关闭。请求体中的未知字段本来就会保留；模型别名、
 `tool_choice`、`reasoning_effort` 和 `stream` 仍会按上游兼容要求转换。
+
+### Codex CLI 兼容
+
+设置 `features.codex_compat=true`（或环境变量 `WB2A_CODEX_COMPAT=true`）后，出站请求中
+系统提示词里的 Codex CLI 身份句会被最小改写：
+
+> "Codex CLI is an **open source** project led by OpenAI." → "Codex CLI is an **open-source** project led by OpenAI."
+
+一句话只改一处连字符，用于绕开上游内容审核对该句的逐字指纹匹配（与 `sanitize_blacklist_fingerprints`
+对 Claude 指纹的处理是同一机制、互不干扰）。句子不存在时原样透传，不做任何其他改动；
+非 system 消息（user/assistant）中出现的同句不会被改写。默认关闭。
 
 ## 工具脚本
 

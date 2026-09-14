@@ -21,7 +21,8 @@
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,
-    "passthrough": false
+    "passthrough": false,
+    "codex_compat": false
   },
   "billing": {
     "input_credits_per_1k_tokens": 0,

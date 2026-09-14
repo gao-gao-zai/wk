@@ -25,6 +25,13 @@ func PrepareBodyOpt(src []byte, sanitize bool) ([]byte, error) {
 	return PrepareBodyOptWithEfforts(src, sanitize, nil)
 }
 
+// codexCompatEnabled 进程级开关：true 时改写 Codex CLI 的系统提示词身份句
+// （见 codex.go）。由 main 按 features.codex_compat 注入；测试里也直接设置。
+var codexCompatEnabled bool
+
+// SetCodexCompat 设置 Codex 兼容改写开关（进程级，启动时配置一次）。
+func SetCodexCompat(enabled bool) { codexCompatEnabled = enabled }
+
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
@@ -55,6 +62,14 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	ensureSystemFirstMessage(obj)
 	normalizeToolChoice(obj)
 	normalizeReasoningEffort(obj, efforts)
+	// Codex 兼容改写放在角色映射之后：developer→system 已完成，system
+	// 消息（含由 developer 映射来的）都会被检查；放在脱敏之前，两层
+	// 改写互不干扰（脱敏管 Claude 指纹，这里管 Codex 身份句）。
+	if codexCompatEnabled {
+		if msgs, ok := obj["messages"].([]any); ok {
+			rewriteCodexPromptMessages(msgs)
+		}
+	}
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
