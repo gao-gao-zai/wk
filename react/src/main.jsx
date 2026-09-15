@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
-  Alert, App as AntApp, Button, Card, ConfigProvider, Empty, Form, Input, Layout, Menu, Modal,
+  Alert, App as AntApp, Button, Card, ConfigProvider, Empty, Form, Input, InputNumber, Layout, Menu, Modal,
   Select, Space, Statistic, Switch, Table, Tag, Typography, message,
 } from 'antd';
 import {
@@ -91,7 +91,10 @@ function Console() {
   // 拉取时把 since 传给 /requests（带 include=summary），统计走全量聚合。
   const [dashboardWindow, setDashboardWindow] = useState('24h');
   const [dashboardSummary, setDashboardSummary] = useState(null);
-  const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn' });
+  const [config, setConfig] = useState({
+    checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn',
+    features: null, billing: null,
+  });
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
   const [answer, setAnswer] = useState('');
@@ -165,9 +168,15 @@ function Console() {
     try {
       const currentConfig = await api('/admin/config', { signal: controller.signal });
       if (serial !== refreshSerial.current) return;
-      if (currentConfig.schedule || currentConfig.region) {
-        setConfig(current => ({ ...current, ...(currentConfig.schedule || {}), region: currentConfig.region || current.region || 'cn' }));
-      }
+      // features/billing 是运行时可变开关与费率（老后端没有这两个字段时保持 null，
+      // 管理设置页据此隐藏开关区，避免误导）。
+      setConfig(current => ({
+        ...current,
+        ...(currentConfig.schedule || {}),
+        region: currentConfig.region || current.region || 'cn',
+        features: currentConfig.features || current.features,
+        billing: currentConfig.billing || current.billing,
+      }));
     } catch (error) {
       if (error.name === 'AbortError') return;
       // Dashboard data can still refresh when configuration is unavailable.
@@ -249,6 +258,47 @@ function Console() {
       message.success(result.restart_required ? '配置已保存，重启后生效' : '配置已保存');
     } catch (error) {
       message.error(error.message);
+    }
+  };
+
+  // saveFeatures 保存特性开关：即时生效（后端同时落盘 config.json 并推给
+  // 运行时组件，无需重启）。schedule 字段是必填校验项，这里回传当前值。
+  const saveFeatures = async features => {
+    try {
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          checkin_hours: config.checkin_hours || [9],
+          keepalive_hours: config.keepalive_hours || [22],
+          features,
+        }),
+      });
+      setConfig(current => ({ ...current, features: { ...(current.features || {}), ...features } }));
+      message.success('特性开关已保存并即时生效');
+      return result;
+    } catch (error) {
+      message.error(error.message);
+      return null;
+    }
+  };
+
+  // saveBilling 保存积分估算费率：即时生效。留空视为 0（不估算）。
+  const saveBilling = async billing => {
+    try {
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          checkin_hours: config.checkin_hours || [9],
+          keepalive_hours: config.keepalive_hours || [22],
+          billing,
+        }),
+      });
+      setConfig(current => ({ ...current, billing: { ...(current.billing || {}), ...billing } }));
+      message.success('费率已保存并即时生效');
+      return result;
+    } catch (error) {
+      message.error(error.message);
+      return null;
     }
   };
 
@@ -505,7 +555,7 @@ function Console() {
     {
       key: 'admin', label: '管理设置',
       children: (
-        <Space direction="vertical" style={{ width: '100%' }}>
+        <Space direction="vertical" size={16} style={{ width: '100%' }}>
           <Card title="签到与保活">
             <Form form={form} layout="inline" onFinish={saveConfig}>
               <Form.Item name="checkin" label="签到小时"><Input placeholder="9,21" /></Form.Item>
@@ -520,6 +570,57 @@ function Console() {
               <Button icon={<ReloadOutlined />} loading={creditRefreshing} onClick={refreshCredits}>立即刷新积分</Button>
             </Space>
           </Card>
+          {config.features && (
+            <Card title="特性开关">
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                <Paragraph type="secondary" style={{ margin: 0 }}>
+                  保存后即时生效（同时写回 config.json，重启不丢）。只影响出站请求改写，不改变路由与账号选择。
+                </Paragraph>
+                {[
+                  ['codex_compat', 'Codex 兼容', '改写 Codex CLI 系统提示词身份句（open source → open-source），绕开上游逐字指纹拦截；句子不存在时原样透传。'],
+                  ['sanitize_blacklist_fingerprints', '指纹脱敏', '剥离/改写出站请求中的 Claude Code 指纹模板句；关闭后完全原样发送（调试用）。'],
+                  ['passthrough', '原始流透传', '流式响应原样转发上游 SSE 字节，保留扩展字段；单请求可用 X-WorkBuddy-Passthrough: false 临时关闭。'],
+                  ['responses_api', 'Responses API', '开放 /v1/responses 端点（OpenAI Responses 协议，Codex CLI 等客户端使用）；关闭后返回 404，只用 Chat Completions 的部署建议关掉。'],
+                ].map(([key, label, desc]) => (
+                  <div key={key} style={{ display: 'flex', justifyContent: 'space-between', gap: 24, alignItems: 'flex-start' }}>
+                    <div>
+                      <Text strong>{label}</Text>
+                      <Paragraph type="secondary" style={{ margin: '4px 0 0' }}>{desc}</Paragraph>
+                    </div>
+                    <Switch
+                      checked={!!config.features?.[key]}
+                      onChange={checked => saveFeatures({ [key]: checked })}
+                    />
+                  </div>
+                ))}
+              </Space>
+            </Card>
+          )}
+          {config.billing && (
+            <Card title="积分估算费率">
+              <Paragraph type="secondary" style={{ margin: '0 0 12px' }}>
+                上游响应未带积分字段时按费率估算消耗（每 1,000 token 积分）。填 0 表示不估算。保存后即时生效。
+              </Paragraph>
+              <Form
+                layout="inline"
+                onFinish={values => saveBilling({
+                  input_credits_per_1k_tokens: Number(values.input) || 0,
+                  output_credits_per_1k_tokens: Number(values.output) || 0,
+                  cached_input_credits_per_1k_tokens: Number(values.cached) || 0,
+                })}
+                initialValues={{
+                  input: config.billing?.input_credits_per_1k_tokens ?? 0,
+                  output: config.billing?.output_credits_per_1k_tokens ?? 0,
+                  cached: config.billing?.cached_input_credits_per_1k_tokens ?? 0,
+                }}
+              >
+                <Form.Item name="input" label="输入"><InputNumber min={0} step={0.001} style={{ width: 140 }} /></Form.Item>
+                <Form.Item name="output" label="输出"><InputNumber min={0} step={0.001} style={{ width: 140 }} /></Form.Item>
+                <Form.Item name="cached" label="缓存读取"><InputNumber min={0} step={0.001} style={{ width: 140 }} /></Form.Item>
+                <Button type="primary" htmlType="submit">保存费率</Button>
+              </Form>
+            </Card>
+          )}
         </Space>
       ),
     },

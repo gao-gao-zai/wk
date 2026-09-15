@@ -64,6 +64,11 @@ type Config struct {
 		// → "open-source"），绕开上游内容审核的逐字指纹匹配。句子不存在
 		// 时原样透传。默认 false。
 		CodexCompat bool `json:"codex_compat"`
+		// ResponsesAPI 是否暴露 Responses 端点（/v1/responses、/responses）。
+		// 关闭时返回 404（表现为端点不存在）。默认 true。
+		// 用途：只用 Chat Completions 的部署关掉它，缩小攻击面与日志噪音
+		// （Responses 带会话历史存储，比 chat 多一块状态）。
+		ResponsesAPI bool `json:"responses_api"`
 	} `json:"features"`
 
 	Billing struct {
@@ -193,6 +198,7 @@ func Default() *Config {
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.Passthrough = false
 	c.Features.CodexCompat = false
+	c.Features.ResponsesAPI = true
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
@@ -319,6 +325,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_CODEX_COMPAT"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.CodexCompat = b
+		}
+	}
+	if v := os.Getenv("WB2A_RESPONSES_API"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.ResponsesAPI = b
 		}
 	}
 	if v := os.Getenv("WB2A_INPUT_CREDITS_PER_1K"); v != "" {

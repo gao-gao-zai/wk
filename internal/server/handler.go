@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -87,6 +88,15 @@ type Config struct {
 	CompletionStore CompletionStore // optional atomic writer replacing separate metric/log writes
 	CreditPolicy    CreditPolicy
 	Passthrough     bool
+	// DisableResponses 关闭 Responses 端点（/v1/responses、/responses
+	// 返回 404）。反转语义（而不是 ResponsesAPI）是因为 Config 零值必须
+	// 保持"端点开"——大量单测直接构造 Config{}，默认关会全部打挂。
+	// main 从 features.responses_api 反转后传入。
+	DisableResponses bool
+	// SetSanitizeFingerprints / SetCodexCompat 把 WebUI 保存的特性开关
+	// 推到 upstream Client（运行时即时生效）。可选：nil 时仅更新 handler 本地副本。
+	SetSanitizeFingerprints func(bool)
+	SetCodexCompat          func(bool)
 }
 
 // ResponseStore is the optional Redis-backed persistence used by
@@ -112,6 +122,20 @@ type Handler struct {
 	unlockGlobalFailures     int
 	unlockGlobalWindowStart  time.Time
 	unlockGlobalBlockedUntil time.Time
+
+	// featuresMu 保护运行时可变的特性开关与费率（WebUI 保存即时生效，
+	// 同时落盘 config.json 供重启后保持）。读侧在请求热路径，写侧仅管理
+	// 端点，锁竞争可忽略。
+	featuresMu    sync.RWMutex
+	passthrough   bool
+	responsesOff  bool
+	creditPolicy  CreditPolicy
+	sanitizeHooks struct {
+		// upstream SetSanitizeFingerprints / SetCodexCompat 回调；nil 时
+		// （如单测直接构造 Handler）仅更新本地副本，不外呼。
+		setSanitize func(bool)
+		setCodex    func(bool)
+	}
 }
 
 type unlockAttempt struct {
@@ -160,6 +184,16 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
+	// 运行时特性开关/费率从启动配置拷贝一份；WebUI 保存时经 updateFeatures
+	// 同时改这里和 upstream Client（见 saveAdminConfig）。sanitizeHooks 为 nil
+	// 时（单测直接构造 Handler）只更新本地副本。
+	h.passthrough = cfg.Passthrough
+	h.responsesOff = cfg.DisableResponses
+	h.creditPolicy = cfg.CreditPolicy
+	h.featuresMu.Lock()
+	h.sanitizeHooks.setSanitize = cfg.SetSanitizeFingerprints
+	h.sanitizeHooks.setCodex = cfg.SetCodexCompat
+	h.featuresMu.Unlock()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
@@ -600,7 +634,23 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 			KeepaliveHours []int `json:"keepalive_hours"`
 		} `json:"schedule"`
 		Region string `json:"region"`
+		// Features/Billing 是 WebUI 可改的运行时开关与费率（第一批：
+		// 布尔开关和估算系数，读时生效）。凭据/路径/存储类配置仍只能改文件。
+		// responses_api 默认开：老配置文件里没有该字段时 unmarshal 得到
+		// 零值 false，必须在解码前预置 true。
+		Features struct {
+			SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+			Passthrough                   bool `json:"passthrough"`
+			CodexCompat                   bool `json:"codex_compat"`
+			ResponsesAPI                  bool `json:"responses_api"`
+		} `json:"features"`
+		Billing struct {
+			InputCreditsPer1KTokens       float64 `json:"input_credits_per_1k_tokens"`
+			OutputCreditsPer1KTokens      float64 `json:"output_credits_per_1k_tokens"`
+			CachedInputCreditsPer1KTokens float64 `json:"cached_input_credits_per_1k_tokens"`
+		} `json:"billing"`
 	}
+	c.Features.ResponsesAPI = true
 	if json.Unmarshal(raw, &c) != nil {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
@@ -608,14 +658,32 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, c)
 }
 
+// featuresPatch / billingPatch 是 POST /admin/config 的可选字段组。
+// 指针类型区分"未提供"与"显式 false/0"：老前端只发 schedule 时两者为 nil，
+// 落盘与运行时都不碰 features/billing。
+type featuresPatch struct {
+	SanitizeBlacklistFingerprints *bool `json:"sanitize_blacklist_fingerprints"`
+	Passthrough                   *bool `json:"passthrough"`
+	CodexCompat                   *bool `json:"codex_compat"`
+	ResponsesAPI                  *bool `json:"responses_api"`
+}
+
+type billingPatch struct {
+	InputCreditsPer1KTokens       *float64 `json:"input_credits_per_1k_tokens"`
+	OutputCreditsPer1KTokens      *float64 `json:"output_credits_per_1k_tokens"`
+	CachedInputCreditsPer1KTokens *float64 `json:"cached_input_credits_per_1k_tokens"`
+}
+
 func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
 	var req struct {
-		CheckinHours   []int `json:"checkin_hours"`
-		KeepaliveHours []int `json:"keepalive_hours"`
+		CheckinHours   []int         `json:"checkin_hours"`
+		KeepaliveHours []int         `json:"keepalive_hours"`
+		Features       *featuresPatch `json:"features"`
+		Billing        *billingPatch  `json:"billing"`
 	}
-	if json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req) != nil {
+	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -624,6 +692,15 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if !checkinOK || !keepaliveOK {
 		writeJSON(w, 400, map[string]string{"error": "每项至少填写一个 0-23 的整数小时"})
 		return
+	}
+	// 费率只接受非负有限值：负数/Inf/NaN 会污染积分估算与请求日志聚合。
+	if req.Billing != nil {
+		for _, v := range []*float64{req.Billing.InputCreditsPer1KTokens, req.Billing.OutputCreditsPer1KTokens, req.Billing.CachedInputCreditsPer1KTokens} {
+			if v != nil && (*v < 0 || math.IsInf(*v, 0) || math.IsNaN(*v)) {
+				writeJSON(w, 400, map[string]string{"error": "billing 费率必须是非负数值"})
+				return
+			}
+		}
 	}
 	raw, err := os.ReadFile(h.cfg.ConfigPath)
 	if err != nil {
@@ -637,6 +714,44 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	schedule := map[string]any{"checkin_hours": checkinHours, "keepalive_hours": keepaliveHours}
 	doc["schedule"] = schedule
+
+	// —— 落盘：只覆盖请求里显式给出的子字段，其余保留原值 ——
+	if req.Features != nil {
+		features, _ := doc["features"].(map[string]any)
+		if features == nil {
+			features = map[string]any{}
+		}
+		if req.Features.SanitizeBlacklistFingerprints != nil {
+			features["sanitize_blacklist_fingerprints"] = *req.Features.SanitizeBlacklistFingerprints
+		}
+		if req.Features.Passthrough != nil {
+			features["passthrough"] = *req.Features.Passthrough
+		}
+		if req.Features.CodexCompat != nil {
+			features["codex_compat"] = *req.Features.CodexCompat
+		}
+		if req.Features.ResponsesAPI != nil {
+			features["responses_api"] = *req.Features.ResponsesAPI
+		}
+		doc["features"] = features
+	}
+	if req.Billing != nil {
+		billing, _ := doc["billing"].(map[string]any)
+		if billing == nil {
+			billing = map[string]any{}
+		}
+		if req.Billing.InputCreditsPer1KTokens != nil {
+			billing["input_credits_per_1k_tokens"] = *req.Billing.InputCreditsPer1KTokens
+		}
+		if req.Billing.OutputCreditsPer1KTokens != nil {
+			billing["output_credits_per_1k_tokens"] = *req.Billing.OutputCreditsPer1KTokens
+		}
+		if req.Billing.CachedInputCreditsPer1KTokens != nil {
+			billing["cached_input_credits_per_1k_tokens"] = *req.Billing.CachedInputCreditsPer1KTokens
+		}
+		doc["billing"] = billing
+	}
+
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
@@ -646,7 +761,55 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.UpdateSchedule != nil {
 		h.cfg.UpdateSchedule(checkinHours, keepaliveHours)
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule})
+	// —— 运行时生效：开关与费率即时更新，不需要重启 ——
+	updated := h.applyRuntimeFeatures(req.Features, req.Billing)
+	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "updated": updated})
+}
+
+// applyRuntimeFeatures 把 WebUI 保存的特性开关/费率推到运行时状态：
+// handler 本地副本（passthrough/responsesOff/creditPolicy）+ upstream Client
+// （脱敏、Codex 改写）。返回实际生效的值供前端回显确认。
+func (h *Handler) applyRuntimeFeatures(features *featuresPatch, billing *billingPatch) map[string]any {
+	h.featuresMu.Lock()
+	defer h.featuresMu.Unlock()
+	updated := map[string]any{}
+	if features != nil {
+		if features.Passthrough != nil {
+			h.passthrough = *features.Passthrough
+			updated["passthrough"] = *features.Passthrough
+		}
+		if features.ResponsesAPI != nil {
+			h.responsesOff = !*features.ResponsesAPI
+			updated["responses_api"] = *features.ResponsesAPI
+		}
+		if features.SanitizeBlacklistFingerprints != nil {
+			if h.sanitizeHooks.setSanitize != nil {
+				h.sanitizeHooks.setSanitize(*features.SanitizeBlacklistFingerprints)
+			}
+			updated["sanitize_blacklist_fingerprints"] = *features.SanitizeBlacklistFingerprints
+		}
+		if features.CodexCompat != nil {
+			if h.sanitizeHooks.setCodex != nil {
+				h.sanitizeHooks.setCodex(*features.CodexCompat)
+			}
+			updated["codex_compat"] = *features.CodexCompat
+		}
+	}
+	if billing != nil {
+		if billing.InputCreditsPer1KTokens != nil {
+			h.creditPolicy.InputPer1K = *billing.InputCreditsPer1KTokens
+			updated["input_credits_per_1k_tokens"] = *billing.InputCreditsPer1KTokens
+		}
+		if billing.OutputCreditsPer1KTokens != nil {
+			h.creditPolicy.OutputPer1K = *billing.OutputCreditsPer1KTokens
+			updated["output_credits_per_1k_tokens"] = *billing.OutputCreditsPer1KTokens
+		}
+		if billing.CachedInputCreditsPer1KTokens != nil {
+			h.creditPolicy.CachedInputPer1K = *billing.CachedInputCreditsPer1KTokens
+			updated["cached_input_credits_per_1k_tokens"] = *billing.CachedInputCreditsPer1KTokens
+		}
+	}
+	return updated
 }
 
 func normalizeScheduleHours(hours []int) ([]int, bool) {
@@ -1763,6 +1926,12 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 // execution path, preserving account rotation, retries, sticky sessions and
 // upstream error handling in one place.
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
+	// responsesAPIEnabled：关闭时 Responses 端点整体 404（含会话历史
+	// 存取路径）。WebUI 特性开关可运行时切换。
+	if !h.responsesAPIEnabled() {
+		writeOpenAIError(w, http.StatusNotFound, "endpoint_disabled", "Responses API is disabled on this deployment (features.responses_api=false)")
+		return
+	}
 	body, tooLarge, err := readRequestBody(r)
 	if tooLarge {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8 MiB limit")
@@ -2787,7 +2956,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	passthrough := h.requestPassthrough(r)
-	st := newChatStatWithOptions(time.Now(), body, peek.Stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.cfg.CreditPolicy, passthrough, r.URL.Path)
+	st := newChatStatWithOptions(time.Now(), body, peek.Stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.currentCreditPolicy(), passthrough, r.URL.Path)
 	st.completionStore = h.cfg.CompletionStore
 	defer st.done()
 	// The upstream client canonicalizes public aliases before sending the body.
@@ -3047,7 +3216,7 @@ func truncateRequestError(message string) string {
 }
 
 func (h *Handler) requestPassthrough(r *http.Request) bool {
-	if !h.cfg.Passthrough {
+	if !h.currentPassthrough() {
 		return false
 	}
 	value := strings.TrimSpace(strings.ToLower(r.Header.Get("X-WorkBuddy-Passthrough")))
@@ -3055,6 +3224,27 @@ func (h *Handler) requestPassthrough(r *http.Request) bool {
 		return true
 	}
 	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+// currentPassthrough 读运行时透传开关（WebUI 保存后即时变更，不再读启动配置）。
+func (h *Handler) currentPassthrough() bool {
+	h.featuresMu.RLock()
+	defer h.featuresMu.RUnlock()
+	return h.passthrough
+}
+
+// responsesAPIEnabled 读运行时 Responses 端点开关。
+func (h *Handler) responsesAPIEnabled() bool {
+	h.featuresMu.RLock()
+	defer h.featuresMu.RUnlock()
+	return !h.responsesOff
+}
+
+// currentCreditPolicy 读运行时费率（billing.* 由 WebUI 修改即时生效）。
+func (h *Handler) currentCreditPolicy() CreditPolicy {
+	h.featuresMu.RLock()
+	defer h.featuresMu.RUnlock()
+	return h.creditPolicy
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。

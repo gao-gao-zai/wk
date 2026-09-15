@@ -141,7 +141,11 @@ type Client struct {
 	efforts   map[string][]string
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
+	// 运行时经 SetSanitizeFingerprints 修改（WebUI 特性开关）；并发请求路径
+	// 在 prepareBody 里读，写侧持 flagsMu 保证不撕裂。
 	SanitizeFingerprints bool
+
+	flagsMu sync.Mutex
 
 	ChatBaseCN      string
 	BillingBaseCN   string
@@ -180,7 +184,21 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // 返回错误表示请求体无法解码——此时必须拒绝请求而不是原样转发，
 // 否则内容脱敏会被一个畸形 body 绕过（见 ErrUnprocessableBody）。
 func (c *Client) prepareBody(body []byte) ([]byte, error) {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot())
+	return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), c.effortsSnapshot())
+}
+
+// sanitizeEnabled 读取脱敏开关的并发安全快照。
+func (c *Client) sanitizeEnabled() bool {
+	c.flagsMu.Lock()
+	defer c.flagsMu.Unlock()
+	return c.SanitizeFingerprints
+}
+
+// SetSanitizeFingerprints 运行时切换指纹脱敏开关（WebUI 特性开关用）。
+func (c *Client) SetSanitizeFingerprints(enabled bool) {
+	c.flagsMu.Lock()
+	defer c.flagsMu.Unlock()
+	c.SanitizeFingerprints = enabled
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
