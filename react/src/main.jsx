@@ -179,6 +179,7 @@ function Console() {
         features: currentConfig.features || current.features,
         billing: currentConfig.billing || current.billing,
         upstream: currentConfig.upstream || current.upstream,
+        sms: currentConfig.sms || current.sms,
       }));
     } catch (error) {
       if (error.name === 'AbortError') return;
@@ -318,6 +319,27 @@ function Console() {
       });
       setConfig(current => ({ ...current, upstream: { ...(current.upstream || {}), ...upstream } }));
       message.success('上游超时已保存并即时生效');
+      return result;
+    } catch (error) {
+      message.error(error.message);
+      return null;
+    }
+  };
+
+  // saveHaozhumaSid 保存豪猪项目 ID：即时生效（新取号立刻用新项目；
+  // 在途号码按旧项目自然收尾）。schedule 是必填校验项，回传当前值。
+  const saveHaozhumaSid = async sid => {
+    try {
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          checkin_hours: config.checkin_hours || [9],
+          keepalive_hours: config.keepalive_hours || [22],
+          sms: { haozhuma: { sid } },
+        }),
+      });
+      setConfig(current => ({ ...current, sms: { haozhuma: { ...(current.sms?.haozhuma || {}), sid } } }));
+      message.success(result?.updated?.haozhuma_sid_restart_required ? '项目 ID 已保存，重启后生效' : '豪猪项目 ID 已切换，新取号立即生效');
       return result;
     } catch (error) {
       message.error(error.message);
@@ -801,7 +823,7 @@ function Console() {
             {activeSection === 'requests' && <RequestLogsPage api={api} models={models} accounts={data.accounts || []} />}
             {activeSection === 'pool' && <AccountListPage api={api} data={data} refresh={refresh} refreshCredits={refreshCredits} creditRefreshing={creditRefreshing} />}
             {activeSection === 'accounts' && <AccountSettingsPage api={api} refresh={refresh} region={config.region} />}
-            {activeSection === 'auto-enroll' && <AutoEnrollPage api={api} />}
+            {activeSection === 'auto-enroll' && <AutoEnrollPage api={api} haozhumaSid={config.sms?.haozhuma?.sid || ''} onSaveHaozhumaSid={saveHaozhumaSid} />}
             {activeSection === 'groups' && <GroupsAndKeysPage api={api} />}
             {activeSection === 'proxy' && <ProxyPoolPage api={api} />}
             {tabItems.find(item => item.key === activeTab)?.children}

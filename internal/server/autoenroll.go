@@ -29,11 +29,15 @@ import (
 //   - 连续失败达到熔断阈值（通道或接收率崩了，继续跑也不会有结果）
 //   - token 失效：自动重登一次，重登后仍失败则终止
 type AutoEnroller struct {
-	sms              *smslogin.Manager
-	hzm              *haozhuma.Client
-	sid              string
-	persist          func(accountCredential, string) (map[string]any, int, error)
-	find             func(mobile string) (nickname string, exists bool)
+	sms *smslogin.Manager
+	hzm *haozhuma.Client
+	// sid 豪猪项目 ID。运行时可改（SetSid）：换对接项目不停服。
+	// 读取点（GetPhone/GetMessage/Release/Blacklist）都在 a.mu 内或
+	// 单次调用内快照，改号对在途号码的影响见 SetSid 注释。
+	sid     string
+	persist func(accountCredential, string) (map[string]any, int, error)
+	find    func(mobile string) (nickname string, exists bool)
+	// setAccountGroups 分组登记回调（handler 注入）。
 	setAccountGroups func(uid string, groups []string) error
 
 	mu      sync.Mutex
@@ -220,6 +224,36 @@ func NewAutoEnroller(sms *smslogin.Manager, hzm *haozhuma.Client, sid string,
 		// 单次任务还能再用 poll_count 覆盖它。
 		pollCount: envInt("AUTO_ENROLL_POLL_COUNT", defaultPollCount),
 	}
+}
+
+// currentSid 读取当前项目 ID 快照（mu 保护，与 SetSid 并发安全）。
+func (a *AutoEnroller) currentSid() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sid
+}
+
+// SetSid 运行时切换豪猪项目 ID（WebUI「豪猪项目」设置）。
+//
+// 对在途任务的影响：已取到的号继续按 tryOne 开头快照的旧 sid 收码/
+// 释放/拉黑（号码归属项目，跨 sid 释放报"手机号不存在"——releaseAllHeld
+// 的失败留账本 + reclaim 的 goneUpstream 判定兜底，无额度泄漏）。
+// 新取号立刻用新 sid。任务运行中允许切换、不中断。
+func (a *AutoEnroller) SetSid(sid string) {
+	sid = strings.TrimSpace(sid)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if sid != "" && a.sid != sid {
+		msg := time.Now().Format("15:04:05 ") + maskPhonesIn(fmt.Sprintf("豪猪项目 ID 已切换: %s → %s（新取号立即生效）", a.sid, sid))
+		log.Printf("[auto-enroll] %s", msg)
+		a.logs = append(a.logs, msg)
+	}
+	a.sid = sid
+}
+
+// Sid 返回当前项目 ID（观测/测试用）。
+func (a *AutoEnroller) Sid() string {
+	return a.currentSid()
 }
 
 // logf 记录自动加号日志。所有日志都经过 maskPhonesIn，因为豪猪取号返回的
@@ -687,10 +721,13 @@ func (a *AutoEnroller) reclaim(phones []string, report bool) int {
 		log.Printf("[auto-enroll] "+format, args...)
 	}
 	bg := context.Background()
+	// 释放用当前 sid：账本里可能是切换前旧项目取的号，用新 sid 释放会报
+	// "手机号不存在"→ goneUpstream 视为归还（豪猪侧到期自动回收，无泄漏）。
+	sid := a.currentSid()
 	var done int
 	var stuck []string
 	for _, phone := range phones {
-		rerr := a.hzm.Release(bg, a.sid, phone)
+		rerr := a.hzm.Release(bg, sid, phone)
 		switch {
 		case rerr == nil:
 			done++
@@ -858,9 +895,12 @@ func (a *AutoEnroller) releaseAllHeld() {
 	}
 	a.logf("任务结束，兜底释放 %d 个仍占用的号码", len(left))
 	bg := context.Background()
+	// 任务中途切过 sid 时，在途号属于旧项目：当前 sid 释放报"手机号不
+	// 存在"→ 失败留账本，下次启动 reclaim 走 goneUpstream 判定收尾。
+	sid := a.currentSid()
 	var failed int
 	for _, phone := range left {
-		if err := a.hzm.Release(bg, a.sid, phone); err != nil {
+		if err := a.hzm.Release(bg, sid, phone); err != nil {
 			a.logf("兜底释放 %s 失败（号仍占着豪猪额度）: %v", phone, err)
 			failed++
 			continue
@@ -905,8 +945,11 @@ func (a *AutoEnroller) reloginOnce() {
 //
 // 黑名单在 release 之前调用（豪猪要求的顺序）。
 func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bool, usedPhone bool, err error) {
+	// sid 在函数开头快照一次：取号、收码、释放/拉黑全流程必须用同一个
+	// 项目 ID（号码归属项目；中途切 sid 会让释放报"手机号不存在"）。
+	sid := a.currentSid()
 	// 1) 豪猪取号。
-	phone, err := a.hzm.GetPhone(ctx, a.sid)
+	phone, err := a.hzm.GetPhone(ctx, sid)
 	if err != nil {
 		// 没取到号 = 没有消耗。
 		return false, false, fmt.Errorf("取号失败: %w", err)
@@ -943,11 +986,11 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 	finish := func(blacklist bool) {
 		bg := context.Background()
 		if blacklist {
-			if err := a.hzm.Blacklist(bg, a.sid, phone); err != nil {
+			if err := a.hzm.Blacklist(bg, sid, phone); err != nil {
 				a.logf("拉黑 %s 失败: %v", phone, err)
 			}
 		}
-		if err := a.hzm.Release(bg, a.sid, phone); err != nil {
+		if err := a.hzm.Release(bg, sid, phone); err != nil {
 			a.logf("释放 %s 失败: %v（留待任务收尾重试）", phone, err)
 			return
 		}
@@ -973,14 +1016,14 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 		finish(true)
 		return false, true, err
 	}
-	sid := send.SessionID
-	if len(sid) > 8 {
-		sid = sid[:8]
+	sess := send.SessionID
+	if len(sess) > 8 {
+		sess = sess[:8]
 	}
-	a.logf("已发码 session=%s… 等短信", sid)
+	a.logf("已发码 session=%s… 等短信", sess)
 
 	// 4) 轮询豪猪收码。轮询次数由调用方传入（用户可调），默认 18 次 × 5s。
-	code, waitErr := a.pollCode(ctx, phone, pollCount)
+	code, waitErr := a.pollCode(ctx, sid, phone, pollCount)
 
 	// 5) 验码（Verify 内部走完整 12 步并落凭据）。
 	if waitErr == nil && code != "" {
@@ -1038,7 +1081,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 //
 // "等待"是正常轮询状态（豪猪返回 code=-1 msg=等待短信）——GetMessage 把它
 // 当成功返回空 sms，这里只记轮次。
-func (a *AutoEnroller) pollCode(ctx context.Context, phone string, count int) (string, error) {
+func (a *AutoEnroller) pollCode(ctx context.Context, sid, phone string, count int) (string, error) {
 	pollInterval := a.pollInterval
 	if pollInterval <= 0 {
 		pollInterval = 5 * time.Second
@@ -1064,7 +1107,7 @@ func (a *AutoEnroller) pollCode(ctx context.Context, phone string, count int) (s
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		sms, err := a.hzm.GetMessage(ctx, a.sid, phone)
+		sms, err := a.hzm.GetMessage(ctx, sid, phone)
 		if err != nil {
 			// "等待短信" 是正常轮询状态，不是错误：GetMessage 把豪猪的
 			// code=-1/msg=等待短信 包成 APIError 返回，必须用 errors.As 取出来判断。

@@ -42,7 +42,7 @@ function logTone(text) {
  * 计费前提必须在界面上说清楚（见下方 Alert）：豪猪只在**收码成功**时扣费，
  * 取号后收不到码不扣费。否则用户会以为失败也在烧钱。
  */
-export default function AutoEnroll({ api }) {
+export default function AutoEnroll({ api, haozhumaSid = '', onSaveHaozhumaSid }) {
   const [count, setCount] = useState(5);
   const [workers, setWorkers] = useState(3);
   // pollCount 每号收码轮询次数；0 表示交给后端默认（18 次 ≈ 90 秒）。
@@ -52,6 +52,9 @@ export default function AutoEnroll({ api }) {
   // groups 任务新账号登记的分组（多选，默认 default）。
   const [selectedGroups, setSelectedGroups] = useState(['default']);
   const [groupOptions, setGroupOptions] = useState(null);
+  // sidDraft 豪猪项目 ID 输入草稿（保存成功后清空回显 Tag）。
+  const [sidDraft, setSidDraft] = useState('');
+  const [savingSid, setSavingSid] = useState(false);
   const [status, setStatus] = useState(null);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -306,6 +309,44 @@ export default function AutoEnroll({ api }) {
         <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
           并发越高越快，但腾讯对同批次注册有风控，建议 3-4。每个号开始时会绑定一个专属代理出口，全程不换 IP。
           {' '}收不到码时先调大「收码轮询次数」——豪猪短信入库有延迟，多轮几次常能捞到。
+        </Paragraph>
+      </Card>
+
+      <Card title="豪猪项目" extra={<Tag>{haozhumaSid || '未配置'}</Tag>}>
+        <Space wrap size={16} align="end">
+          <div>
+            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
+              <Tooltip title="豪猪的项目 ID（如 52283 = 腾讯科技[限对接]）。切换后新取号立即用新项目；任务运行中也可切换，在途号码按旧项目自然收尾。">
+                <span style={{ borderBottom: '1px dashed #bfbfbf' }}>项目 ID</span>
+              </Tooltip>
+            </Text>
+            <InputNumber
+              min={1}
+              precision={0}
+              value={sidDraft}
+              onChange={v => setSidDraft(v == null ? '' : String(v))}
+              placeholder="如 52283"
+              style={{ width: 160 }}
+              disabled={!onSaveHaozhumaSid}
+            />
+          </div>
+          <Button
+            type="primary"
+            loading={savingSid}
+            disabled={!onSaveHaozhumaSid || !sidDraft || sidDraft === haozhumaSid}
+            onClick={async () => {
+              setSavingSid(true);
+              const result = await onSaveHaozhumaSid?.(sidDraft);
+              setSavingSid(false);
+              if (result) setSidDraft('');
+            }}
+          >
+            切换项目
+          </Button>
+        </Space>
+        <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
+          只换项目 ID，豪猪账号与对接码不动。切换是即时的：下一个取号请求就用新项目。
+          {' '}改错项目会导致取号全部失败（豪猪报项目不存在），改回来即可。
         </Paragraph>
       </Card>
 

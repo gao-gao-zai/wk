@@ -60,6 +60,10 @@ type Config struct {
 	HaozhumaClient *haozhuma.Client
 	// HaozhumaSid 豪猪项目 ID（如 52283 腾讯科技[限对接]）。
 	HaozhumaSid string
+	// SetHaozhumaSid 运行时切换豪猪项目 ID。NewHandler 组装 AutoEnroll 后
+	// 自动接上（见 NewHandler）；main 无需注入。nil = 自动加号未启用，
+	// WebUI 改 sid 只落盘（重启后生效）。
+	SetHaozhumaSid func(sid string)
 	// AutoEnroll 豪猪自动加号（NewHandler 内部组装）。nil = 未启用该端点。
 	AutoEnroll *AutoEnroller
 	// AutoEnrollLedger 号码账本落盘路径。号码取走后会占住豪猪的并发额度，
@@ -273,6 +277,9 @@ func NewHandler(cfg Config) *Handler {
 			},
 		)
 		h.cfg.AutoEnroll.SetLedgerPath(cfg.AutoEnrollLedger)
+		// WebUI 运行时切换项目 ID 直接推给 AutoEnroll（组装在 NewHandler
+		// 内部，main 拿不到指针，这里自接回调最省事）。
+		h.cfg.SetHaozhumaSid = h.cfg.AutoEnroll.SetSid
 	}
 	// Static console assets are served through an explicit allow-list (see
 	// staticConsoleHandler) instead of http.FileServer(http.Dir("frontend")).
@@ -764,6 +771,12 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 			StreamTimeoutSeconds int `json:"stream_timeout_seconds"`
 			StreamIdleSeconds    int `json:"stream_idle_seconds"`
 		} `json:"upstream"`
+		// SMS 豪猪项目 ID（WebUI 可改，运行时生效）。
+		SMS struct {
+			Haozhuma struct {
+				Sid string `json:"sid"`
+			} `json:"haozhuma"`
+		} `json:"sms"`
 	}
 	c.Features.ResponsesAPI = true
 	c.Upstream.TimeoutSeconds = 120
@@ -807,6 +820,15 @@ type upstreamPatch struct {
 	StreamIdleSeconds    *int `json:"stream_idle_seconds"`
 }
 
+// smsPatch 豪猪接码设置的可选字段组（WebUI「自动加号」卡片）。当前只开放
+// 项目 ID：账号/token 属于凭据，凭轮换走文件；uid（对接码钉死）依赖豪猪
+// 后台的具体对接列表，WebUI 改错会让取号全挂，也不开放。
+type smsPatch struct {
+	Haozhuma struct {
+		Sid *string `json:"sid"`
+	} `json:"haozhuma"`
+}
+
 func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
@@ -816,6 +838,7 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		Features       *featuresPatch `json:"features"`
 		Billing        *billingPatch  `json:"billing"`
 		Upstream       *upstreamPatch `json:"upstream"`
+		SMS            *smsPatch      `json:"sms"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
@@ -852,6 +875,22 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		} {
 			if pair.v != nil && !pair.ok(*pair.v) {
 				writeJSON(w, 400, map[string]string{"error": pair.msg})
+				return
+			}
+		}
+	}
+	// 豪猪项目 ID：非空时必须是纯数字（豪猪 sid 是数字串，如 52283）。
+	// 允许显式清空？不允许——清空等于关闭自动加号却让 UI 看起来还能用，
+	// 那属于部署级变更，改配置文件。
+	if req.SMS != nil && req.SMS.Haozhuma.Sid != nil {
+		sid := strings.TrimSpace(*req.SMS.Haozhuma.Sid)
+		if sid == "" {
+			writeJSON(w, 400, map[string]string{"error": "豪猪项目 ID 不能为空（关闭自动加号请改配置文件）"})
+			return
+		}
+		for _, r := range sid {
+			if r < '0' || r > '9' {
+				writeJSON(w, 400, map[string]string{"error": "豪猪项目 ID 必须是数字（如 52283）"})
 				return
 			}
 		}
@@ -927,6 +966,21 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		doc["upstream"] = ups
 	}
+	if req.SMS != nil && req.SMS.Haozhuma.Sid != nil {
+		sid := strings.TrimSpace(*req.SMS.Haozhuma.Sid)
+		// 校验已保证非空数字。落盘保留 sms 节的其余字段（账号/token/uid）。
+		sms, _ := doc["sms"].(map[string]any)
+		if sms == nil {
+			sms = map[string]any{}
+		}
+		hz, _ := sms["haozhuma"].(map[string]any)
+		if hz == nil {
+			hz = map[string]any{}
+		}
+		hz["sid"] = sid
+		sms["haozhuma"] = hz
+		doc["sms"] = sms
+	}
 
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
@@ -940,6 +994,17 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	// —— 运行时生效：开关与费率即时更新，不需要重启 ——
 	updated := h.applyRuntimeFeatures(req.Features, req.Billing)
 	h.applyRuntimeUpstreamTimeouts(req.Upstream, updated)
+	if req.SMS != nil && req.SMS.Haozhuma.Sid != nil {
+		sid := strings.TrimSpace(*req.SMS.Haozhuma.Sid)
+		if h.cfg.SetHaozhumaSid != nil {
+			h.cfg.SetHaozhumaSid(sid)
+			updated["haozhuma_sid"] = sid
+		} else {
+			// 已落盘但没注入回调（老部署/测试）：重启后生效，如实告知。
+			updated["haozhuma_sid"] = sid
+			updated["haozhuma_sid_restart_required"] = true
+		}
+	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "updated": updated})
 }
 

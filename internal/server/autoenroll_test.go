@@ -696,7 +696,7 @@ func TestPollCountControlsPollingRounds(t *testing.T) {
 		en.pollInterval = time.Millisecond
 		en.pollCount = want
 
-		code, err := en.pollCode(context.Background(), "17000000001", want)
+		code, err := en.pollCode(context.Background(), "52283", "17000000001", want)
 		if code != "" {
 			t.Fatalf("count=%d: unexpected code %q", want, code)
 		}
@@ -742,7 +742,7 @@ func TestPollCountZeroUsesTimeoutDerivedDefault(t *testing.T) {
 	en.pollInterval = time.Millisecond
 	en.pollTimeout = 5 * time.Millisecond // 5ms / 1ms = 5 次
 
-	_, _ = en.pollCode(context.Background(), "17000000001", 0)
+	_, _ = en.pollCode(context.Background(), "52283", "17000000001", 0)
 	if got := int(f.getMsg.Load()); got != 5 {
 		t.Fatalf("getMessage called %d times, want 5 (derived from pollTimeout/pollInterval)", got)
 	}
@@ -759,7 +759,7 @@ func TestPollCodeReturnsEarlyOnCode(t *testing.T) {
 		nil)
 	en.pollInterval = time.Millisecond
 
-	code, err := en.pollCode(context.Background(), "17000000001", 10)
+	code, err := en.pollCode(context.Background(), "52283", "17000000001", 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1281,3 +1281,4 @@ func waitDone(t *testing.T, en *AutoEnroller) {
 	}
 	t.Fatal("auto-enroll did not finish in 30s")
 }
+
