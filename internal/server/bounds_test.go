@@ -108,7 +108,7 @@ func TestRequestsFiltersArePushedDown(t *testing.T) {
 		t.Errorf("include=summary did not trigger summary (calls=%d)", store.sumCalls)
 	}
 	var body struct {
-		Data    []RequestLog   `json:"data"`
+		Data    []RequestLog    `json:"data"`
 		Summary *RequestSummary `json:"summary"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -126,8 +126,8 @@ func TestRequestsFiltersArePushedDown(t *testing.T) {
 // and that invalid values fall back to "not filtered" instead of erroring.
 func TestRequestsSuccessFilterBoolean(t *testing.T) {
 	cases := []struct {
-		raw     string
-		want    *bool
+		raw  string
+		want *bool
 	}{
 		{"1", boolPtr(true)},
 		{"true", boolPtr(true)},

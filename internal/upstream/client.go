@@ -134,6 +134,8 @@ type Client struct {
 	// Stream 是流式 chat 请求的时长策略。零值 = 只受调用方 ctx 约束（即不限总时长、
 	// 不检查空闲），对长回答最友好；main 会按配置注入非零值。
 	// 注意它**不**影响 HTTP.Timeout 所覆盖的非流式/控制面请求。
+	// 运行时经 SetStreamPolicy 热改（WebUI 上游超时设置）；请求路径在
+	// RequestPolicy/ChatStreamContextWithHeaders 里读快照。
 	Stream StreamPolicy
 
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
@@ -165,10 +167,10 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		// 生产默认：流式不限总时长（长回答不被掐断），但守 120s 空闲。
 		// 显式给出，避免零值悄悄退化成"既不限总时长也不查空闲"。
-		Stream:         StreamPolicy{Total: 0, Idle: 120 * time.Second},
-		ChatBaseCN:     "https://copilot.tencent.com",
-		BillingBaseCN:  "https://www.codebuddy.cn",
-		ChatBaseGlobal: "https://www.workbuddy.ai",
+		Stream:          StreamPolicy{Total: 0, Idle: 120 * time.Second},
+		ChatBaseCN:      "https://copilot.tencent.com",
+		BillingBaseCN:   "https://www.codebuddy.cn",
+		ChatBaseGlobal:  "https://www.workbuddy.ai",
 		BillingBaseGlob: "https://www.workbuddy.ai",
 	}
 }
@@ -199,6 +201,31 @@ func (c *Client) SetSanitizeFingerprints(enabled bool) {
 	c.flagsMu.Lock()
 	defer c.flagsMu.Unlock()
 	c.SanitizeFingerprints = enabled
+}
+
+// SetStreamPolicy 运行时更新流式时长策略（WebUI 上游超时设置用）。
+// Total/Idle/HeaderWait 同步替换；已在途的流不受影响（它们的看门狗
+// 建立时已取好策略副本）。
+func (c *Client) SetStreamPolicy(p StreamPolicy) {
+	c.flagsMu.Lock()
+	defer c.flagsMu.Unlock()
+	c.Stream = p
+}
+
+// SetRequestTimeout 运行时更新非流式整请求上限（WebUI 上游超时设置用）。
+// http.Client.Timeout 文档未承诺并发读写安全，这里经 flagsMu 串行化写；
+// 读侧（RequestPolicy）拿的是瞬时值，撕裂窗口内最多旧值多生效一个请求。
+func (c *Client) SetRequestTimeout(d time.Duration) {
+	c.flagsMu.Lock()
+	defer c.flagsMu.Unlock()
+	c.HTTP.Timeout = d
+}
+
+// streamPolicySnapshot 返回当前流式策略的并发安全快照。
+func (c *Client) streamPolicySnapshot() StreamPolicy {
+	c.flagsMu.Lock()
+	defer c.flagsMu.Unlock()
+	return c.Stream
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -303,7 +330,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 // WorkBuddy response headers. Callers use them to pass request/record IDs to
 // downstream clients without rewriting their values.
 func (c *Client) ChatStreamContextWithHeaders(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
-	return c.ChatStreamWithPolicy(ctx, a, body, c.Stream)
+	return c.ChatStreamWithPolicy(ctx, a, body, c.streamPolicySnapshot())
 }
 
 // RequestPolicy 按请求类型选择时长策略。
@@ -313,9 +340,12 @@ func (c *Client) ChatStreamContextWithHeaders(ctx context.Context, a *auth.Auth,
 // 掐断，要么非流式失去兜底而可能永远挂住。
 func (c *Client) RequestPolicy(stream bool) StreamPolicy {
 	if stream {
-		return c.Stream
+		return c.streamPolicySnapshot()
 	}
 	// 非流式：整个请求（含读完响应体）的上限；等响应头同受其约束。
+	// 经锁读 HTTP.Timeout：SetRequestTimeout 的并发写才有确定的 happens-before。
+	c.flagsMu.Lock()
+	defer c.flagsMu.Unlock()
 	return StreamPolicy{Total: c.HTTP.Timeout}
 }
 
@@ -444,7 +474,8 @@ func (c *Client) ChatStreamWithPolicy(ctx context.Context, a *auth.Auth, body []
 		return nil, resp.StatusCode, raw, headers, nil
 	}
 	// 交还 body 时把 cancel 挂上：调用方 Close 即释放 ctx（含 Total 定时器）。
-	return newTimeoutBody(resp.Body, policy.Total, policy.Idle, cancel), resp.StatusCode, nil, headers, nil}
+	return newTimeoutBody(resp.Body, policy.Total, policy.Idle, cancel), resp.StatusCode, nil, headers, nil
+}
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
 type ModelInfo struct {

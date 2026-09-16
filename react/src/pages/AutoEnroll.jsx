@@ -156,6 +156,29 @@ export default function AutoEnroll({ api }) {
     }
   };
 
+  // releaseAll 一键释放豪猪名下所有占用号码（cancelAllRecv），同时清空
+  // 本地账本。用于"额度被历史遗留号占满"的手动兜底——语义同豪猪后台的
+  // 「释放全部」按钮。任务运行中后端会拒绝（409）。
+  const [releasingAll, setReleasingAll] = useState(false);
+  const releaseAll = async () => {
+    setReleasingAll(true);
+    try {
+      const body = await api('/admin/account/sms/release-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      if (body.ok) {
+        message.success(`已释放豪猪名下全部占用号码（含账本遗留 ${body.ledger_cleared || 0} 个）`);
+      }
+      await load();
+    } catch (err) {
+      message.error(err.message);
+    } finally {
+      setReleasingAll(false);
+    }
+  };
+
   const running = status?.running === true;
   const ok = Number(status?.ok || 0);
   const attempts = Number(status?.attempts || 0);
@@ -234,6 +257,11 @@ export default function AutoEnroll({ api }) {
             </Button>
           </Tooltip>
           <Button icon={<ReloadOutlined />} loading={loadingStatus} onClick={load}>刷新</Button>
+          <Tooltip title="调用豪猪「释放全部」（cancelAllRecv），释放账户名下所有占用中的号码，并清空本地遗留账本。额度被旧号占满时的手动兜底；任务运行中不可用。">
+            <Button loading={releasingAll} disabled={running} onClick={releaseAll}>
+              一键释放全部号码
+            </Button>
+          </Tooltip>
         </Space>
         <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
           并发越高越快，但腾讯对同批次注册有风控，建议 3-4。每个号开始时会绑定一个专属代理出口，全程不换 IP。
@@ -302,7 +330,17 @@ export default function AutoEnroll({ api }) {
           type="error"
           showIcon
           message={`还有 ${holding} 个号码占着豪猪额度`}
-          description="未归还的号会占住豪猪的并发额度，额度满了后续取号会一直返回「您的余额不足,请释放拉黑后再取号」（看着像没钱，其实是号没还）。正常任务结束会自动归还；若持续存在，请稍后重跑一次让收尾兜底再试，或到豪猪后台手动释放。"
+          description={(
+            <div>
+              未归还的号会占住豪猪的并发额度，额度满了后续取号会一直返回「您的余额不足,请释放拉黑后再取号」（看着像没钱，其实是号没还）。
+              正常任务结束会自动归还。也可以直接点上方「一键释放全部号码」（豪猪 cancelAllRecv，立即归还全部占用并清空本地账本）。
+              <div style={{ marginTop: 8 }}>
+                <Button size="small" danger loading={releasingAll} disabled={running} onClick={releaseAll}>
+                  一键释放全部号码
+                </Button>
+              </div>
+            </div>
+          )}
         />
       )}
 

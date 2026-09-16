@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // adminConfigTestEnv 组装一个带临时 config.json 的 handler。
@@ -28,7 +31,7 @@ func adminConfigTestEnv(t *testing.T) (authedHandler, string) {
 	// CreditPolicy/Features 的运行时副本模拟 main 的注入：handler 构造时
 	// 从（已加载的）启动配置拷贝。测试不走 main，所以这里手动给。
 	h := newTestHandler(t, Config{
-		ConfigPath: configPath,
+		ConfigPath:   configPath,
 		CreditPolicy: CreditPolicy{InputPer1K: 0.01, OutputPer1K: 0.05, CachedInputPer1K: 0.001},
 	})
 	return h, configPath
@@ -101,7 +104,7 @@ func TestSaveAdminConfigFeaturesRuntimeAndPersist(t *testing.T) {
 		"checkin_hours":   []int{9, 21},
 		"keepalive_hours": []int{22},
 		"features": map[string]any{
-			"passthrough": true,
+			"passthrough":  true,
 			"codex_compat": false,
 		},
 	})
@@ -217,6 +220,110 @@ func TestSaveAdminConfigRejectsInvalidBilling(t *testing.T) {
 	}
 	if doc.Billing.Input != 0.01 {
 		t.Errorf("rejected request still mutated config file: %v", doc.Billing.Input)
+	}
+}
+
+// TestAdminConfigUpstreamTimeouts 上游超时的 GET 默认值 + POST 读写 +
+// 运行时生效 + idle 0/-1 双向翻译。
+func TestAdminConfigUpstreamTimeouts(t *testing.T) {
+	h, configPath := adminConfigTestEnv(t)
+	// 需要 upstream Client + hook 才能走运行时更新；模拟 main 的注入。
+	up := upstream.New()
+	h.cfg.Upstream = up
+	h.cfg.SetUpstreamTimeouts = func(reqSecs, streamTotalSecs, streamIdleSecs int) {
+		up.SetRequestTimeout(time.Duration(reqSecs) * time.Second)
+		up.SetStreamPolicy(upstream.StreamPolicy{
+			Total: time.Duration(streamTotalSecs) * time.Second,
+			Idle:  time.Duration(streamIdleSecs) * time.Second,
+		})
+	}
+
+	// GET：老配置无 upstream 节 → 默认值（120/0/120）。
+	out := doAdminConfig(t, h, http.MethodGet, nil)
+	ups, ok := out["upstream"].(map[string]any)
+	if !ok {
+		t.Fatalf("upstream missing in GET: %v", out)
+	}
+	if ups["timeout_seconds"] != float64(120) || ups["stream_timeout_seconds"] != float64(0) || ups["stream_idle_seconds"] != float64(120) {
+		t.Errorf("GET defaults wrong: %v", ups)
+	}
+
+	// POST：改三个值，idle 显式 0（关闭）。
+	out = doAdminConfig(t, h, http.MethodPost, map[string]any{
+		"checkin_hours":   []int{9},
+		"keepalive_hours": []int{22},
+		"upstream": map[string]any{
+			"timeout_seconds":        180,
+			"stream_timeout_seconds": 600,
+			"stream_idle_seconds":    0,
+		},
+	})
+	updated, _ := out["updated"].(map[string]any)
+	if updated["timeout_seconds"] != float64(180) || updated["stream_timeout_seconds"] != float64(600) {
+		t.Errorf("updated = %v", updated)
+	}
+
+	// 运行时生效：Client 的策略已变（180s 非流式、600s 流式总、idle 0=关）。
+	pol := h.cfg.Upstream.RequestPolicy(false)
+	if pol.Total != 180*time.Second {
+		t.Errorf("request policy = %v, want 180s", pol.Total)
+	}
+	spol := h.cfg.Upstream.RequestPolicy(true)
+	if spol.Total != 600*time.Second || spol.Idle != 0 {
+		t.Errorf("stream policy = %+v, want total=600s idle=0", spol)
+	}
+
+	// 落盘：idle 0 翻译回 -1（config 语义），其余原样。
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Upstream struct {
+			TimeoutSeconds       int `json:"timeout_seconds"`
+			StreamTimeoutSeconds int `json:"stream_timeout_seconds"`
+			StreamIdleSeconds    int `json:"stream_idle_seconds"`
+		} `json:"upstream"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Upstream.TimeoutSeconds != 180 || doc.Upstream.StreamTimeoutSeconds != 600 || doc.Upstream.StreamIdleSeconds != -1 {
+		t.Errorf("persisted upstream = %+v (idle must be -1 for 'off')", doc.Upstream)
+	}
+
+	// GET 回读：-1 再翻译回 0 给前端。
+	out = doAdminConfig(t, h, http.MethodGet, nil)
+	ups, _ = out["upstream"].(map[string]any)
+	if ups["stream_idle_seconds"] != float64(0) {
+		t.Errorf("GET after save: idle = %v, want 0 (translated from -1)", ups["stream_idle_seconds"])
+	}
+}
+
+// TestAdminConfigUpstreamTimeoutsValidation 非法值 400 且不落盘。
+func TestAdminConfigUpstreamTimeoutsValidation(t *testing.T) {
+	h, configPath := adminConfigTestEnv(t)
+	up := upstream.New()
+	h.cfg.Upstream = up
+
+	for _, body := range []string{
+		`{"checkin_hours":[9],"keepalive_hours":[22],"upstream":{"timeout_seconds":5}}`,
+		`{"checkin_hours":[9],"keepalive_hours":[22],"upstream":{"timeout_seconds":9999}}`,
+		`{"checkin_hours":[9],"keepalive_hours":[22],"upstream":{"stream_timeout_seconds":10}}`,
+		`{"checkin_hours":[9],"keepalive_hours":[22],"upstream":{"stream_idle_seconds":5}}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/admin/config", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 400 {
+			t.Errorf("body %s = %d, want 400", body, rec.Code)
+		}
+	}
+	// 文件未被改动（老 seed 没有 upstream 节）。
+	raw, _ := os.ReadFile(configPath)
+	if bytes.Contains(raw, []byte(`"upstream"`)) {
+		t.Error("rejected request must not persist upstream section")
 	}
 }
 

@@ -375,6 +375,14 @@ func main() {
 		// WebUI 特性开关保存后即时推到 upstream Client（脱敏/Codex 改写）。
 		SetSanitizeFingerprints: up.SetSanitizeFingerprints,
 		SetCodexCompat:          upstream.SetCodexCompat,
+		// WebUI 上游超时保存后即时生效（单位秒）。
+		SetUpstreamTimeouts: func(reqSecs, streamTotalSecs, streamIdleSecs int) {
+			up.SetRequestTimeout(time.Duration(reqSecs) * time.Second)
+			up.SetStreamPolicy(upstream.StreamPolicy{
+				Total: time.Duration(streamTotalSecs) * time.Second,
+				Idle:  time.Duration(streamIdleSecs) * time.Second,
+			})
+		},
 		SoftCooldown: cfg.SoftRateDur,
 	})
 

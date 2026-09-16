@@ -499,6 +499,18 @@ func (c *Client) Release(ctx context.Context, sid, phone string) error {
 	return err
 }
 
+// ReleaseAll 一键释放账户名下所有占用中的号码（cancelAllRecv）。
+// 只需 token，不需要 sid/phone——用于"额度被旧号占满"时批量归还，
+// 或界面上手动兜底（豪猪后台也有同款按钮）。注意它会释放**所有**
+// 占用号，不区分是谁取的；任务运行中调用会把在途号码一起放掉，
+// 调用方需自行保证没有并发取号。
+func (c *Client) ReleaseAll(ctx context.Context) error {
+	_, err := c.call(ctx, "cancelAllRecv", url.Values{
+		"token": {c.Token},
+	})
+	return err
+}
+
 // Blacklist 拉黑号码（收不到码的号）。
 func (c *Client) Blacklist(ctx context.Context, sid, phone string) error {
 	_, err := c.call(ctx, "addBlacklist", url.Values{

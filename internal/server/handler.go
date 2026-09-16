@@ -97,6 +97,11 @@ type Config struct {
 	// 推到 upstream Client（运行时即时生效）。可选：nil 时仅更新 handler 本地副本。
 	SetSanitizeFingerprints func(bool)
 	SetCodexCompat          func(bool)
+	// SetUpstreamTimeouts 把 WebUI 保存的上游超时推到 upstream Client。
+	// 参数单位：秒；streamTotal/streamIdle 0 = 不限/不查（与 config 语义一致，
+	// 但不支持 -1 关闭——WebUI 上「0」即代表关闭，落盘时再翻译回 -1）。
+	// 可选：nil 时仅落盘（重启后生效）。
+	SetUpstreamTimeouts func(requestSecs, streamTotalSecs, streamIdleSecs int)
 }
 
 // ResponseStore is the optional Redis-backed persistence used by
@@ -221,6 +226,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/account/sms/auto-enroll", h.withFrontend(h.accountSMSAutoEnroll))
 	h.mux.HandleFunc("GET /admin/account/sms/auto-enroll", h.withFrontend(h.accountSMSAutoEnrollStatus))
 	h.mux.HandleFunc("POST /admin/account/sms/auto-enroll/stop", h.withFrontend(h.accountSMSAutoEnrollStop))
+	// 一键释放豪猪名下所有占用号码（cancelAllRecv）：额度被旧号占满时的
+	// 手动兜底，对齐豪猪后台的"释放全部"按钮。
+	h.mux.HandleFunc("POST /admin/account/sms/release-all", h.withFrontend(h.accountSMSReleaseAll))
 	h.mux.HandleFunc("GET /admin/proxy/status", h.withFrontend(h.proxyStatus))
 	h.mux.HandleFunc("POST /admin/account/{uid}/enable", h.withFrontend(h.enableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/disable", h.withFrontend(h.disableAccount))
@@ -649,11 +657,24 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 			OutputCreditsPer1KTokens      float64 `json:"output_credits_per_1k_tokens"`
 			CachedInputCreditsPer1KTokens float64 `json:"cached_input_credits_per_1k_tokens"`
 		} `json:"billing"`
+		// Upstream 超时（WebUI 可改；秒）。老配置没有该节时显示默认值。
+		Upstream struct {
+			TimeoutSeconds       int `json:"timeout_seconds"`
+			StreamTimeoutSeconds int `json:"stream_timeout_seconds"`
+			StreamIdleSeconds    int `json:"stream_idle_seconds"`
+		} `json:"upstream"`
 	}
 	c.Features.ResponsesAPI = true
+	c.Upstream.TimeoutSeconds = 120
+	c.Upstream.StreamIdleSeconds = 120
 	if json.Unmarshal(raw, &c) != nil {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
+	}
+	// 老配置里 stream_idle_seconds 用 -1 表示关闭：统一成 0（=关闭）给前端，
+	// 避免输入框里出现负数。落盘时再翻译回 -1。
+	if c.Upstream.StreamIdleSeconds < 0 {
+		c.Upstream.StreamIdleSeconds = 0
 	}
 	writeJSON(w, 200, c)
 }
@@ -674,14 +695,26 @@ type billingPatch struct {
 	CachedInputCreditsPer1KTokens *float64 `json:"cached_input_credits_per_1k_tokens"`
 }
 
+// upstreamPatch 上游超时的可选字段组（WebUI「上游超时」卡片）。
+// 三个值都是秒；语义与 config.json 的 upstream 节一致：
+//   - timeout_seconds：非流式请求整请求上限（含控制面），默认 120；
+//   - stream_timeout_seconds：流式总时长上限，0 = 不限（默认）；
+//   - stream_idle_seconds：流式空闲上限，默认 120；-1 = 关闭检查。
+type upstreamPatch struct {
+	TimeoutSeconds       *int `json:"timeout_seconds"`
+	StreamTimeoutSeconds *int `json:"stream_timeout_seconds"`
+	StreamIdleSeconds    *int `json:"stream_idle_seconds"`
+}
+
 func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
 	var req struct {
-		CheckinHours   []int         `json:"checkin_hours"`
-		KeepaliveHours []int         `json:"keepalive_hours"`
+		CheckinHours   []int          `json:"checkin_hours"`
+		KeepaliveHours []int          `json:"keepalive_hours"`
 		Features       *featuresPatch `json:"features"`
 		Billing        *billingPatch  `json:"billing"`
+		Upstream       *upstreamPatch `json:"upstream"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
@@ -698,6 +731,26 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		for _, v := range []*float64{req.Billing.InputCreditsPer1KTokens, req.Billing.OutputCreditsPer1KTokens, req.Billing.CachedInputCreditsPer1KTokens} {
 			if v != nil && (*v < 0 || math.IsInf(*v, 0) || math.IsNaN(*v)) {
 				writeJSON(w, 400, map[string]string{"error": "billing 费率必须是非负数值"})
+				return
+			}
+		}
+	}
+	// 上游超时校验：三个值都是秒。
+	// timeout_seconds：非流式整请求上限，必须为正（0 会让请求永远挂住）。
+	// stream_timeout_seconds：流式总时长，0 = 不限（默认）。
+	// stream_idle_seconds：流式空闲，0 = 关闭检查（落盘翻译回 -1）。
+	if req.Upstream != nil {
+		for _, pair := range []struct {
+			v   *int
+			ok  func(int) bool
+			msg string
+		}{
+			{req.Upstream.TimeoutSeconds, func(v int) bool { return v >= 10 && v <= 3600 }, "timeout_seconds 需在 10-3600 秒之间"},
+			{req.Upstream.StreamTimeoutSeconds, func(v int) bool { return v == 0 || (v >= 30 && v <= 86400) }, "stream_timeout_seconds 需为 0（不限）或 30-86400 秒"},
+			{req.Upstream.StreamIdleSeconds, func(v int) bool { return v == 0 || (v >= 10 && v <= 3600) }, "stream_idle_seconds 需为 0（关闭）或 10-3600 秒"},
+		} {
+			if pair.v != nil && !pair.ok(*pair.v) {
+				writeJSON(w, 400, map[string]string{"error": pair.msg})
 				return
 			}
 		}
@@ -751,6 +804,28 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		doc["billing"] = billing
 	}
+	if req.Upstream != nil {
+		ups, _ := doc["upstream"].(map[string]any)
+		if ups == nil {
+			ups = map[string]any{}
+		}
+		if req.Upstream.TimeoutSeconds != nil {
+			ups["timeout_seconds"] = *req.Upstream.TimeoutSeconds
+		}
+		if req.Upstream.StreamTimeoutSeconds != nil {
+			ups["stream_timeout_seconds"] = *req.Upstream.StreamTimeoutSeconds
+		}
+		if req.Upstream.StreamIdleSeconds != nil {
+			// WebUI 用 0 表示"关闭检查"；config 语义是 -1。翻译落盘，
+			// GET 时再翻译回来（前端永远只见 0）。
+			idle := *req.Upstream.StreamIdleSeconds
+			if idle == 0 {
+				idle = -1
+			}
+			ups["stream_idle_seconds"] = idle
+		}
+		doc["upstream"] = ups
+	}
 
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
@@ -763,7 +838,40 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	// —— 运行时生效：开关与费率即时更新，不需要重启 ——
 	updated := h.applyRuntimeFeatures(req.Features, req.Billing)
+	h.applyRuntimeUpstreamTimeouts(req.Upstream, updated)
 	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "updated": updated})
+}
+
+// applyRuntimeUpstreamTimeouts 把超时变更推到 upstream Client。
+// 三个值只有请求里显式给出的才动；未给的保持 Client 当前值。
+// Client 侧 SetStreamPolicy/HTTP.Timeout 自带并发安全（或经锁），
+// 已在途请求不受影响——它们的看门狗建立时已取好策略副本。
+func (h *Handler) applyRuntimeUpstreamTimeouts(p *upstreamPatch, updated map[string]any) {
+	if p == nil {
+		return
+	}
+	if h.cfg.SetUpstreamTimeouts == nil || h.cfg.Upstream == nil {
+		return
+	}
+	// 读取 Client 当前值做基准：未显式给出的字段沿用现状而不是重置默认。
+	cur := h.cfg.Upstream.RequestPolicy(true)     // 流式策略
+	curReq := h.cfg.Upstream.RequestPolicy(false) // 非流式 = HTTP.Timeout
+	total := int(cur.Total / time.Second)
+	idle := int(cur.Idle / time.Second)
+	reqSecs := int(curReq.Total / time.Second)
+	if p.TimeoutSeconds != nil {
+		reqSecs = *p.TimeoutSeconds
+		updated["timeout_seconds"] = reqSecs
+	}
+	if p.StreamTimeoutSeconds != nil {
+		total = *p.StreamTimeoutSeconds
+		updated["stream_timeout_seconds"] = total
+	}
+	if p.StreamIdleSeconds != nil {
+		idle = *p.StreamIdleSeconds
+		updated["stream_idle_seconds"] = idle
+	}
+	h.cfg.SetUpstreamTimeouts(reqSecs, total, idle)
 }
 
 // applyRuntimeFeatures 把 WebUI 保存的特性开关/费率推到运行时状态：
@@ -1426,6 +1534,32 @@ func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Requ
 		body["balance"] = bal
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+// accountSMSReleaseAll 一键释放豪猪名下所有占用中的号码（cancelAllRecv）。
+//
+// 使用场景：额度被历史遗留号占满（「您的余额不足,请释放拉黑后再取号」）
+// 但逐号补释放一直失败，或账本外的号（手动测试等）也占着额度。语义与
+// 豪猪后台的"释放全部"按钮相同。任务运行中返回 409（在途号码会被一并
+// 放掉，所有 worker 白等）。
+func (h *Handler) accountSMSReleaseAll(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.AutoEnroll == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用"})
+		return
+	}
+	done, heldBefore, err := h.cfg.AutoEnroll.ReleaseAllHeld(r.Context())
+	if errors.Is(err, ErrBusy) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "豪猪释放失败: " + err.Error()})
+		return
+	}
+	h.cfg.AutoEnroll.AppendLog("一键释放完成：豪猪名下占用号码已全部归还（含账本外 %d 个遗留号）", heldBefore)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "released": done, "ledger_cleared": heldBefore,
+	})
 }
 
 // smsLoginStatus 把登录失败映射到 HTTP 状态码：会话失效用 410，其余上游/参数

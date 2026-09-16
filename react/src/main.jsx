@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Alert, App as AntApp, Button, Card, ConfigProvider, Empty, Form, Input, InputNumber, Layout, Menu, Modal,
-  Select, Space, Statistic, Switch, Table, Tag, Typography, message,
+  Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import {
   ApiOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined,
@@ -93,7 +93,7 @@ function Console() {
   const [dashboardSummary, setDashboardSummary] = useState(null);
   const [config, setConfig] = useState({
     checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn',
-    features: null, billing: null,
+    features: null, billing: null, upstream: null,
   });
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
@@ -168,14 +168,15 @@ function Console() {
     try {
       const currentConfig = await api('/admin/config', { signal: controller.signal });
       if (serial !== refreshSerial.current) return;
-      // features/billing 是运行时可变开关与费率（老后端没有这两个字段时保持 null，
-      // 管理设置页据此隐藏开关区，避免误导）。
+      // features/billing/upstream 是运行时可变配置（老后端没有这些字段时保持 null，
+      // 管理设置页据此隐藏对应区域，避免误导）。
       setConfig(current => ({
         ...current,
         ...(currentConfig.schedule || {}),
         region: currentConfig.region || current.region || 'cn',
         features: currentConfig.features || current.features,
         billing: currentConfig.billing || current.billing,
+        upstream: currentConfig.upstream || current.upstream,
       }));
     } catch (error) {
       if (error.name === 'AbortError') return;
@@ -295,6 +296,26 @@ function Console() {
       });
       setConfig(current => ({ ...current, billing: { ...(current.billing || {}), ...billing } }));
       message.success('费率已保存并即时生效');
+      return result;
+    } catch (error) {
+      message.error(error.message);
+      return null;
+    }
+  };
+
+  // saveUpstreamTimeouts 保存上游超时（秒）：即时生效（已在途请求不受影响）。
+  const saveUpstreamTimeouts = async upstream => {
+    try {
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          checkin_hours: config.checkin_hours || [9],
+          keepalive_hours: config.keepalive_hours || [22],
+          upstream,
+        }),
+      });
+      setConfig(current => ({ ...current, upstream: { ...(current.upstream || {}), ...upstream } }));
+      message.success('上游超时已保存并即时生效');
       return result;
     } catch (error) {
       message.error(error.message);
@@ -618,6 +639,59 @@ function Console() {
                 <Form.Item name="output" label="输出"><InputNumber min={0} step={0.001} style={{ width: 140 }} /></Form.Item>
                 <Form.Item name="cached" label="缓存读取"><InputNumber min={0} step={0.001} style={{ width: 140 }} /></Form.Item>
                 <Button type="primary" htmlType="submit">保存费率</Button>
+              </Form>
+            </Card>
+          )}
+          {config.upstream && (
+            <Card title="上游请求超时（秒）">
+              <Paragraph type="secondary" style={{ margin: '0 0 12px' }}>
+                保存后即时生效，已在途请求不受影响（同时写回 config.json，重启不丢）。
+                非流式超时也约束控制面调用（刷 token、签到、对账）。
+              </Paragraph>
+              <Form
+                layout="inline"
+                onFinish={values => saveUpstreamTimeouts({
+                  timeout_seconds: Number(values.timeout) || 120,
+                  stream_timeout_seconds: Number(values.streamTotal) || 0,
+                  stream_idle_seconds: Number(values.streamIdle) || 120,
+                })}
+                initialValues={{
+                  timeout: config.upstream?.timeout_seconds ?? 120,
+                  streamTotal: config.upstream?.stream_timeout_seconds ?? 0,
+                  streamIdle: config.upstream?.stream_idle_seconds ?? 120,
+                }}
+              >
+                <Form.Item
+                  name="timeout"
+                  label={(
+                    <Tooltip title="非流式请求（一次性拿完整响应）的整请求上限，含读完响应体。同时约束控制面调用。范围 10-3600。">
+                      <span style={{ borderBottom: '1px dashed #bfbfbf' }}>非流式超时</span>
+                    </Tooltip>
+                  )}
+                >
+                  <InputNumber min={10} max={3600} style={{ width: 130 }} addonAfter="秒" />
+                </Form.Item>
+                <Form.Item
+                  name="streamTotal"
+                  label={(
+                    <Tooltip title="流式请求总时长上限。0 = 不限（默认，长回答不会被掐断）。需要兜底（防跑飞的流长期占住账号）时设一个较大的值，范围 30-86400。">
+                      <span style={{ borderBottom: '1px dashed #bfbfbf' }}>流式总时长</span>
+                    </Tooltip>
+                  )}
+                >
+                  <InputNumber min={0} max={86400} style={{ width: 150 }} addonAfter="秒" />
+                </Form.Item>
+                <Form.Item
+                  name="streamIdle"
+                  label={(
+                    <Tooltip title="流式请求两次数据之间的最大间隔。上游持续产出时永不触发；卡住不发数据时据此尽快失败。0 = 关闭检查（不推荐）。范围 10-3600。">
+                      <span style={{ borderBottom: '1px dashed #bfbfbf' }}>流式空闲</span>
+                    </Tooltip>
+                  )}
+                >
+                  <InputNumber min={0} max={3600} style={{ width: 130 }} addonAfter="秒" />
+                </Form.Item>
+                <Button type="primary" htmlType="submit">保存超时</Button>
               </Form>
             </Card>
           )}

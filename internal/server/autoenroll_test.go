@@ -80,9 +80,12 @@ func newFakeHZM(t *testing.T) *fakeHZM {
 				return
 			}
 			// 按注入的次数失败，用来验证收尾兜底会重试。
+			// 注意文案：不能用"释放失败"——那已被 goneUpstream 认作
+			// "号已不在豪猪"（一键释放/过期后的实测文案），会被算归还
+			// 而不是留在账本。这里要模拟的是平台持续故障（重试有意义）。
 			if f.releaseFail.Load() > 0 {
 				f.releaseFail.Add(-1)
-				_, _ = w.Write([]byte(`{"code":"-1","msg":"释放失败（模拟）"}`))
+				_, _ = w.Write([]byte(`{"code":"-1","msg":"系统繁忙，请稍后再试（模拟）"}`))
 				return
 			}
 			f.releaseOK.Add(1)
@@ -410,11 +413,15 @@ func TestAutoEnrollConcurrentRespectsTarget(t *testing.T) {
 	}
 }
 
-// TestAutoEnrollBlacklistsEveryPhone 成功和失败的号都必须进黑名单——
-// 成功的号已有账号不该再发，失败的号收不到码不该再被取到。
-func TestAutoEnrollBlacklistsEveryPhone(t *testing.T) {
+// TestAutoEnrollBlacklistPolicy 拉黑策略（2026-09 与豪猪官方 SDK next_code
+// 语义对齐后）：**失败号**（收不到码/验码失败）必须拉黑+释放；
+// **成功号**（接码成功、账号落盘）只释放不拉黑——拉黑已成功的号会让
+// 号主以后在本项目收不到码。
+func TestAutoEnrollBlacklistPolicy(t *testing.T) {
 	f := newFakeHZM(t)
-	var blacklisted, released sync.Map
+	var mu sync.Mutex
+	blacklistCalls := map[string]bool{}
+	releaseCalls := map[string]bool{}
 	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		switch q.Get("api") {
@@ -434,10 +441,14 @@ func TestAutoEnrollBlacklistsEveryPhone(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"code":"0","msg":"ok","sms":"验证码123456"}`))
 		case "addBlacklist":
-			blacklisted.Store(q.Get("phone"), true)
+			mu.Lock()
+			blacklistCalls[q.Get("phone")] = true
+			mu.Unlock()
 			_, _ = w.Write([]byte(`{"code":"0","msg":"ok"}`))
 		case "cancelRecv":
-			released.Store(q.Get("phone"), true)
+			mu.Lock()
+			releaseCalls[q.Get("phone")] = true
+			mu.Unlock()
 			_, _ = w.Write([]byte(`{"code":"0","msg":"ok"}`))
 		default:
 			_, _ = w.Write([]byte(`{"code":"0","msg":"ok"}`))
@@ -456,18 +467,27 @@ func TestAutoEnrollBlacklistsEveryPhone(t *testing.T) {
 	}
 	waitDone(t, en)
 
-	var nBlack, nRel int
-	blacklisted.Range(func(k, _ any) bool { nBlack++; return true })
-	released.Range(func(k, _ any) bool { nRel++; return true })
-	if nBlack == 0 {
-		t.Fatal("nothing was blacklisted")
+	mu.Lock()
+	defer mu.Unlock()
+	// 每个取到过的号都要被释放（成功失败都一样：额度必须归还）。
+	if n := int(f.getPhone.Load()); len(releaseCalls) != n {
+		t.Fatalf("released=%d but took %d numbers, every taken number must be released", len(releaseCalls), n)
 	}
-	// 每一个取到过的号都要既拉黑又释放。
-	if nBlack != nRel {
-		t.Fatalf("blacklisted=%d released=%d, must match", nBlack, nRel)
+	for phone := range releaseCalls {
+		last := phone[len(phone)-1]
+		if last == '0' || last == '2' || last == '4' || last == '6' || last == '8' {
+			// 偶数 = 失败号：必须拉黑。
+			if !blacklistCalls[phone] {
+				t.Errorf("failed number %s was not blacklisted", phone)
+			}
+		}
 	}
-	if n := int(f.getPhone.Load()); nBlack != n {
-		t.Fatalf("blacklisted=%d but took %d numbers, every taken number must be blacklisted", nBlack, n)
+	// 成功号（奇数）不允许出现在黑名单里。
+	for phone := range blacklistCalls {
+		last := phone[len(phone)-1]
+		if last == '1' || last == '3' || last == '5' || last == '7' || last == '9' {
+			t.Errorf("successful number %s must NOT be blacklisted (release only)", phone)
+		}
 	}
 }
 
@@ -861,9 +881,9 @@ func TestTaskEndReleasesAllNumbers(t *testing.T) {
 	if want := int(f.getPhone.Load()); st.Released != want {
 		t.Fatalf("released=%d but %d numbers were taken; all must be returned", st.Released, want)
 	}
-	// 每个号都必须被拉黑（成功号也一样：已有账号，不该再发给我）。
+	// 本测试的号全部收不到码（fake 默认"等待短信"）→ 失败路径必须拉黑。
 	if got := int(f.blacklist.Load()); got != int(f.getPhone.Load()) {
-		t.Fatalf("blacklisted=%d but took %d numbers", got, f.getPhone.Load())
+		t.Fatalf("blacklisted=%d but took %d numbers (all failed numbers must be blacklisted)", got, f.getPhone.Load())
 	}
 }
 
@@ -926,9 +946,11 @@ func TestReclaimOrphansOnStartup(t *testing.T) {
 	if got := f.releaseOK.Load(); got != 2 {
 		t.Fatalf("releaseOK=%d want 2 — every orphan must be released", got)
 	}
-	// 遗留号也要拉黑（成功号同样：已有账号，不该再发给我）。
-	if got := f.blacklist.Load(); got != 2 {
-		t.Fatalf("blacklist=%d want 2", got)
+	// 遗留号不拉黑：账本可能混有接码已成功的号（成功路径释放失败也会留下），
+	// 拉黑它会让号主以后在本项目收不到码。真正收不到码的号，下次被取到时
+	// 走 tryOne 失败路径自然会拉黑。
+	if got := f.blacklist.Load(); got != 0 {
+		t.Fatalf("blacklist=%d want 0 — reclaim must not blacklist (ledger may contain successful numbers)", got)
 	}
 	// 账本必须被清空，否则每次启动都重复释放同一批号。
 	if b, err := os.ReadFile(ledger); err != nil {
@@ -1083,6 +1105,139 @@ func TestGoneNumberCountsAsReclaimed(t *testing.T) {
 	}
 	if raw, _ := os.ReadFile(ledger); strings.Contains(string(raw), "17000000008") {
 		t.Fatalf("gone number must be dropped from the ledger: %s", raw)
+	}
+}
+
+// TestReleaseFailedCountsAsReclaimed 一键释放/占用过期后，豪猪对逐号
+// cancelRecv 回 code=-1 "释放失败"（实测：51 个号 1 秒内全部同文案）。
+// 这些号不在豪猪手里，必须算归还，否则账本永久滞留、每次任务开跑空转。
+func TestReleaseFailedCountsAsReclaimed(t *testing.T) {
+	f := newFakeHZM(t)
+	// cancelRecv 一律回"释放失败"（模拟豪猪对无占用记录的通用拒绝）。
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("api") {
+		case "login":
+			_, _ = w.Write([]byte(`{"code":"0","msg":"ok","token":"tok-1"}`))
+		case "cancelRecv":
+			_, _ = w.Write([]byte(`{"code":"-1","msg":"释放失败"}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":"0","msg":"ok"}`))
+		}
+	})
+	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil)
+	en.SetLedgerPath(ledger)
+	if err := os.WriteFile(ledger, []byte(`["17000000001","17000000002"]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := en.ReclaimOrphans(); n != 2 {
+		t.Fatalf("reclaimed=%d want 2 ('释放失败' means the number is gone upstream)", n)
+	}
+	st := en.Status()
+	if st.Held != 0 {
+		t.Fatalf("held=%d want 0 (ledger must be cleared)", st.Held)
+	}
+}
+
+// TestReleaseAllHeldViaCancelAllRecv 一键释放走豪猪的 cancelAllRecv（平台侧
+// 全量释放），并清空整个账本——包括账本文件。held 统计随之归零，released
+// 补记账本遗留数。
+func TestReleaseAllHeldViaCancelAllRecv(t *testing.T) {
+	f := newFakeHZM(t)
+	var cancelAll atomic.Int32
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("api") {
+		case "login":
+			_, _ = w.Write([]byte(`{"code":"0","msg":"ok","token":"tok-1"}`))
+		case "cancelAllRecv":
+			cancelAll.Add(1)
+			_, _ = w.Write([]byte(`{"code":"0","msg":"ok"}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":"0","msg":"ok"}`))
+		}
+	})
+	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil)
+	en.SetLedgerPath(ledger)
+	// 模拟账本里有 3 个遗留号。
+	for _, p := range []string{"17000000001", "17000000002", "17000000003"} {
+		en.trackHeld(p)
+	}
+
+	done, heldBefore, err := en.ReleaseAllHeld(context.Background())
+	if err != nil || !done {
+		t.Fatalf("ReleaseAllHeld = (%v, %d, %v), want (true, 3, nil)", done, heldBefore, err)
+	}
+	if heldBefore != 3 {
+		t.Fatalf("heldBefore=%d want 3", heldBefore)
+	}
+	if cancelAll.Load() != 1 {
+		t.Fatalf("cancelAllRecv called %d times, want 1", cancelAll.Load())
+	}
+	st := en.Status()
+	if st.Held != 0 {
+		t.Fatalf("held=%d after release-all, want 0", st.Held)
+	}
+	if st.Released != 3 {
+		t.Fatalf("released=%d want 3 (ledger backlog counted)", st.Released)
+	}
+	if raw, _ := os.ReadFile(ledger); strings.TrimSpace(string(raw)) != "[]" {
+		t.Fatalf("ledger must be cleared after release-all: %s", raw)
+	}
+}
+
+// TestReleaseAllHeldRejectedWhileRunning 任务运行中拒绝一键释放：
+// cancelAllRecv 会把正在收码的在途号码一起放掉，所有 worker 白等。
+func TestReleaseAllHeldRejectedWhileRunning(t *testing.T) {
+	f := newFakeHZM(t)
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil)
+	en.retryDelay = time.Millisecond
+
+	if err := en.AutoRun(50, 1); err != nil {
+		t.Fatal(err)
+	}
+	defer waitDone(t, en)
+
+	_, _, err := en.ReleaseAllHeld(context.Background())
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("ReleaseAllHeld during a run = %v, want ErrBusy", err)
+	}
+}
+
+// TestReleaseAllHeldUpstreamError 豪猪侧失败时账本必须原样保留
+// （清空等于遗忘仍占额度的号）。
+func TestReleaseAllHeldUpstreamError(t *testing.T) {
+	f := newFakeHZM(t)
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("api") {
+		case "login":
+			_, _ = w.Write([]byte(`{"code":"0","msg":"ok","token":"tok-1"}`))
+		case "cancelAllRecv":
+			_, _ = w.Write([]byte(`{"code":"-1","msg":"释放失败（模拟）"}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":"0","msg":"ok"}`))
+		}
+	})
+	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil)
+	en.SetLedgerPath(ledger)
+	en.trackHeld("17000000001")
+
+	done, _, err := en.ReleaseAllHeld(context.Background())
+	if err == nil || done {
+		t.Fatalf("ReleaseAllHeld = (%v, _, %v), want (false, _, error)", done, err)
+	}
+	if st := en.Status(); st.Held != 1 {
+		t.Fatalf("held=%d after a failed release-all, want 1 (ledger preserved)", st.Held)
 	}
 }
 
