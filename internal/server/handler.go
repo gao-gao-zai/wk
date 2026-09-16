@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/scheduler"
@@ -39,8 +40,10 @@ import (
 type Config struct {
 	Pool             *pool.Pool
 	Upstream         *upstream.Client
-	APIKey           string // 空 = 不鉴权
+	APIKey           string // 管理员密钥（空 = 无管理员密钥；多密钥体系下的全权限密钥）
 	FrontendPassword string // 前端控制台密码；空 = 不启用前端密码
+	// Groups 分组 + 多密钥存储（可选；nil = 分组功能关闭，仅管理员密钥）。
+	Groups *groups.Store
 	ConfigPath       string // 配置文件路径，供控制台保存签到配置
 	AuthDir          string
 	Region           string
@@ -215,6 +218,17 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/unlock", h.unlock)
 	h.mux.HandleFunc("GET /admin/config", h.withFrontend(h.adminConfig))
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
+	// 分组 + 密钥管理（多密钥体系）。分组存储未启用时端点回 503。
+	h.mux.HandleFunc("GET /admin/groups", h.withFrontend(h.adminGroups))
+	h.mux.HandleFunc("POST /admin/groups", h.withFrontend(h.adminGroups))
+	h.mux.HandleFunc("PUT /admin/groups/{name}", h.withFrontend(h.adminGroup))
+	h.mux.HandleFunc("DELETE /admin/groups/{name}", h.withFrontend(h.adminGroup))
+	h.mux.HandleFunc("GET /admin/accounts/{uid}/groups", h.withFrontend(h.adminAccountGroups))
+	h.mux.HandleFunc("PUT /admin/accounts/{uid}/groups", h.withFrontend(h.adminAccountGroups))
+	h.mux.HandleFunc("GET /admin/keys", h.withFrontend(h.adminKeys))
+	h.mux.HandleFunc("POST /admin/keys", h.withFrontend(h.adminKeys))
+	h.mux.HandleFunc("PUT /admin/keys/{id}", h.withFrontend(h.adminKey))
+	h.mux.HandleFunc("DELETE /admin/keys/{id}", h.withFrontend(h.adminKey))
 	h.mux.HandleFunc("POST /admin/checkin", h.withFrontend(h.runCheckin))
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
@@ -250,6 +264,12 @@ func NewHandler(cfg Config) *Handler {
 					return "", false
 				}
 				return st.Nickname, true
+			},
+			func(uid string, gs []string) error {
+				if h.cfg.Groups == nil {
+					return nil // 分组存储未启用：登记是无操作
+				}
+				return h.cfg.Groups.SetAccountGroups(uid, gs)
 			},
 		)
 		h.cfg.AutoEnroll.SetLedgerPath(cfg.AutoEnrollLedger)
@@ -390,13 +410,79 @@ func (h *Handler) authOK(r *http.Request) bool {
 	return h.validAPIKey(r) || h.frontendSession(r)
 }
 
+// requestScope 是一次请求的鉴权结果：密钥身份 + 分组作用域。
+//
+//   - admin（管理员）：config 全局 APIKey 命中或前端会话。可选所有分组
+//     的账号；管理端点只对管理员开放（密钥即使是分组密钥也不能进管理面）。
+//   - group（分组密钥）：keys.json 里的密钥命中。只能用绑定分组的账号；
+//     不能访问 /admin/*。
+type requestScope struct {
+	kind     string // "admin" | "group"
+	group    string // group 密钥的绑定分组（"" = 不限，但 kind=group 时恒非空）
+	keyID    string // 密钥 id（日志归因用）
+	adminKey bool   // true = 命中 config 全局 APIKey
+}
+
+type scopeKey struct{}
+
+// scopeFromRequest 取请求的鉴权作用域；withAuth 已保证非 nil。
+func scopeFromRequest(r *http.Request) requestScope {
+	if s, ok := r.Context().Value(scopeKey{}).(requestScope); ok {
+		return s
+	}
+	// 未走 withAuth 的路径（理论上不存在）按最保守处理：空分组 = 选不到任何账号。
+	return requestScope{kind: "group", group: ""}
+}
+
+// resolveScope 解析 Bearer 密钥 → 作用域。顺序：
+//  1. config 全局 APIKey（管理员）
+//  2. keys.json 分组密钥
+//
+// 不命中返回 false。
+func (h *Handler) resolveScope(r *http.Request) (requestScope, bool) {
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, "Bearer ") {
+		return requestScope{}, false
+	}
+	token := strings.TrimPrefix(authz, "Bearer ")
+	if h.cfg.APIKey != "" && token == h.cfg.APIKey {
+		return requestScope{kind: "admin", adminKey: true}, true
+	}
+	if h.cfg.Groups != nil {
+		if k, err := h.cfg.Groups.LookupKey(token); err == nil {
+			if k.Group == "" {
+				// 不绑分组的密钥按管理员语义（全池可用）。创建入口
+				// 不再产生这种密钥，但旧数据/手改文件可能存在。
+				return requestScope{kind: "admin", keyID: k.ID}, true
+			}
+			return requestScope{kind: "group", group: k.Group, keyID: k.ID}, true
+		}
+	}
+	return requestScope{}, false
+}
+
+// allowSet 把作用域转成选号过滤集合。管理员/无分组存储返回 nil（不过滤）；
+// 分组密钥返回该分组的 uid 集合（可能为空 map = 该分组无账号，选号直接 nil）。
+func (h *Handler) allowSet(s requestScope) map[string]bool {
+	if s.kind != "group" || h.cfg.Groups == nil {
+		return nil
+	}
+	return h.cfg.Groups.AccountsInGroup(s.group)
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !h.authOK(r) {
+		// Bearer 密钥（管理员或分组密钥）→ 解析作用域注入 context。
+		// 前端会话没有 Bearer，走管理语义（控制台本身不受分组限制）。
+		scope, ok := h.resolveScope(r)
+		if !ok && h.frontendSession(r) {
+			scope, ok = requestScope{kind: "admin"}, true
+		}
+		if !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), scopeKey{}, scope)))
 	}
 }
 
@@ -428,13 +514,14 @@ func (h *Handler) frontendSession(r *http.Request) bool {
 
 func (h *Handler) withFrontend(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Admin endpoints accept either the configured API key or the frontend
-		// unlock cookie. Deny-by-default: see authOK.
-		if !h.authOK(r) {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"code": "frontend_locked", "message": "frontend password or API key required"}})
+		// Admin endpoints accept only the admin credential (global API key or
+		// frontend session cookie). Group keys deliberately cannot reach the
+		// management plane. Deny-by-default: see authOK.
+		if !h.validAPIKey(r) && !h.frontendSession(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"code": "frontend_locked", "message": "admin credential required"}})
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), scopeKey{}, requestScope{kind: "admin"})))
 	}
 }
 
@@ -449,10 +536,24 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Password string `json:"password"`
+		// Key 管理员密钥（config api_key）。多密钥体系下控制台解锁的主路径：
+		// 分组密钥不能解锁控制台（管理面只认管理员）。
+		Key string `json:"key"`
 	}
-	if json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req) != nil || h.cfg.FrontendPassword == "" || req.Password != h.cfg.FrontendPassword {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		h.recordUnlockFailure(clientKey)
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "密码错误"})
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "请求格式不正确"})
+		return
+	}
+	// 双通道：管理员密钥（主）或前端密码（兼容保留——老部署的 config 里
+	// 只配了 frontend_password 时仍可登录）。
+	ok := req.Key != "" && h.cfg.APIKey != "" && req.Key == h.cfg.APIKey
+	if !ok && h.cfg.FrontendPassword != "" && req.Password != "" && req.Password == h.cfg.FrontendPassword {
+		ok = true
+	}
+	if !ok {
+		h.recordUnlockFailure(clientKey)
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "密钥或密码错误"})
 		return
 	}
 	h.clearUnlockFailures(clientKey)
@@ -1451,6 +1552,8 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		PollCount int `json:"poll_count"`
 		// MaxAttempts 总尝试次数上限（不填按目标数推导：count*12，下限 20）。
 		MaxAttempts int `json:"max_attempts"`
+		// Groups 新账号登记的分组（多选；不填/空 = default）。
+		Groups []string `json:"groups"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
@@ -1459,6 +1562,20 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 	if req.Count < 1 || req.Count > 50 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "count 需在 1-50 之间"})
 		return
+	}
+	// 分组在启动时就校验存在性：比等到加号成功才在登记回调里失败好——
+	// 那时号码已消耗，登记失败只能事后手动补。
+	if h.cfg.Groups != nil {
+		known := map[string]bool{}
+		for _, g := range h.cfg.Groups.List() {
+			known[g] = true
+		}
+		for _, g := range req.Groups {
+			if g = strings.TrimSpace(g); g != "" && !known[g] {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "分组 " + g + " 不存在"})
+				return
+			}
+		}
 	}
 	if req.Workers < 0 || req.Workers > 8 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workers 需在 1-8 之间（不填默认 3）"})
@@ -1484,6 +1601,7 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		Workers:     req.Workers,
 		PollCount:   req.PollCount,
 		MaxAttempts: req.MaxAttempts,
+		Groups:      req.Groups,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -1714,6 +1832,11 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.cfg.Pool.Flush()
+	// 分组归属一并清理（分组存储启用时）；失败不阻塞删除——残留的
+	// 归属记录只影响分组计数展示，下次该 uid 重加时会被覆盖。
+	if h.cfg.Groups != nil {
+		h.cfg.Groups.RemoveAccount(uid)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已删除"})
 }
 
@@ -1810,8 +1933,14 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	if redisMode == "" {
 		redisMode = "noop"
 	}
+	// 分组归属快照（分组存储启用时）：账号列表页一次拉齐，省得逐账号 GET。
+	var accountGroups map[string][]string
+	if h.cfg.Groups != nil {
+		accountGroups = h.cfg.Groups.SnapshotAccountGroups()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":        h.cfg.Pool.List(),
+		"account_groups":  accountGroups,
 		"total":           total,
 		"healthy":         healthy,
 		"cooling":         cooling,
@@ -3092,6 +3221,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	passthrough := h.requestPassthrough(r)
 	st := newChatStatWithOptions(time.Now(), body, peek.Stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.currentCreditPolicy(), passthrough, r.URL.Path)
 	st.completionStore = h.cfg.CompletionStore
+	// 影子扣减：成功请求的真实费用（upstream usage.credit 或费率估算）
+	// 实时回写账号池，weightOf 的有效余额因子据此均衡组内消耗。
+	if h.cfg.Pool != nil {
+		st.spendHook = h.cfg.Pool.SpendCredits
+	}
 	defer st.done()
 	// The upstream client canonicalizes public aliases before sending the body.
 	// Use the same canonical ID for model-level routing/cooldowns so a limit
@@ -3136,19 +3270,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 分组作用域：分组密钥把选号范围收窄到绑定分组的账号；管理员/会话
+	// 请求为 nil（全池）。粘性号不属于当前分组时按"粘性号不可用"处理
+	// （解绑回落），否则分组密钥会借粘性会话越权用别的分组的账号。
+	scopeAllow := h.allowSet(scopeFromRequest(r))
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（同时校验账号级状态和当前模型限流），否则按当前模型轮换。
 		var acct *auth.Auth
-		if stickyUID != "" {
+		if stickyUID != "" && (scopeAllow == nil || scopeAllow[stickyUID]) {
 			acct = h.cfg.Pool.PickAndAcquireByUIDForModel(stickyUID, routeModel)
 			if acct == nil {
 				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
 				h.cfg.Session.Unbind(sessKey)
 				stickyUID = ""
 			}
+		} else if stickyUID != "" {
+			// 粘性号不在当前密钥的分组里 → 解绑（不是失败，是权限边界）。
+			h.cfg.Session.Unbind(sessKey)
+			stickyUID = ""
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickAndAcquireForModel(routeModel, tried)
+			acct = h.cfg.Pool.PickAndAcquireForModelAllow(routeModel, tried, scopeAllow)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable

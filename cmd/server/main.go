@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
@@ -330,11 +331,26 @@ func main() {
 	// 各建一份会让手动发码和自动加号在 30 分钟内撞同一个出口 IP。
 	smsManager := newSMSLoginManager(cfg)
 
+	// 分组 + 多密钥存储：与 state.json 同目录（部署时已挂载为卷）。
+	// 初始化失败是致命的：密钥文件损坏时宁可不起服务，也不要退化成
+	// "只有管理员密钥"——那会让所有分组密钥静默失效。
+	groupStore, err := groups.New(groupsStoreDir(cfg))
+	if err != nil {
+		log.Fatalf("groups store: %v", err)
+	}
+	// 存量账号显式迁移进 default：读取路径有"未登记=default"的兜底，
+	// 但选号过滤和分组计数只看归属表，不迁移的话 default 密钥会
+	// 选不到任何号。
+	if n := groupStore.MigrateUnregistered(p.UIDs()); n > 0 {
+		log.Printf("groups: %d 个存量账号已归入 default 分组", n)
+	}
+
 	h := server.NewHandler(server.Config{
 		Pool:             p,
 		Upstream:         up,
 		APIKey:           cfg.APIKey,
 		FrontendPassword: cfg.FrontendPassword,
+		Groups:           groupStore,
 		ConfigPath:       *cfgPath,
 		AuthDir:          cfg.AuthDir,
 		Region:           cfg.Region,
@@ -368,7 +384,7 @@ func main() {
 			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,
 			CachedInputPer1K: cfg.Billing.CachedInputCreditsPer1KTokens,
 		},
-		Passthrough:  cfg.Features.Passthrough,
+		Passthrough: cfg.Features.Passthrough,
 		// Responses 端点开关反转：Config 零值必须表示"开"（单测约定），
 		// 配置文件语义是 responses_api=true 开。
 		DisableResponses: !cfg.Features.ResponsesAPI,
@@ -463,6 +479,16 @@ func autoEnrollLedgerPath(cfg *Config) string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(sf), "autoenroll-held.json")
+}
+
+// groupsStoreDir 分组/密钥存储目录：与 state.json 同目录（同 autoEnrollLedgerPath
+// 的理由——挂载卷里，容器重建不丢）。StateFile 为空（池不落盘）时退回当前目录。
+func groupsStoreDir(cfg *Config) string {
+	sf := strings.TrimSpace(cfg.StateFile)
+	if sf == "" {
+		return "."
+	}
+	return filepath.Dir(sf)
 }
 
 func stickyMinutesOrDefault(v int) int {

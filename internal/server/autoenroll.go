@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/smslogin"
 )
@@ -28,11 +29,12 @@ import (
 //   - 连续失败达到熔断阈值（通道或接收率崩了，继续跑也不会有结果）
 //   - token 失效：自动重登一次，重登后仍失败则终止
 type AutoEnroller struct {
-	sms     *smslogin.Manager
-	hzm     *haozhuma.Client
-	sid     string
-	persist func(accountCredential, string) (map[string]any, int, error)
-	find    func(mobile string) (nickname string, exists bool)
+	sms              *smslogin.Manager
+	hzm              *haozhuma.Client
+	sid              string
+	persist          func(accountCredential, string) (map[string]any, int, error)
+	find             func(mobile string) (nickname string, exists bool)
+	setAccountGroups func(uid string, groups []string) error
 
 	mu      sync.Mutex
 	running bool
@@ -75,6 +77,9 @@ type AutoEnroller struct {
 	// 让 /status 能回显"这次到底按几次轮询在跑"，而不只是用户填了什么。
 	runPollCount   int
 	runMaxAttempts int
+	// runGroups 本次运行新账号要登记的分组（AutoRunWith 时定格；
+	// 运行期间只读）。空 = default。
+	runGroups []string
 
 	// held 本次运行中"已从豪猪取走、但还没确认释放"的号码。
 	//
@@ -143,6 +148,26 @@ func envFloat(key string, def float64) float64 {
 	return def
 }
 
+// normalizeRunGroups 清洗任务指定的分组列表：去空白、去重、保序；
+// 空列表回落 ["default"]。有效性（分组是否存在）由 setAccountGroups
+// 回调在登记时校验——启动时校验会在"任务跑着时用户改分组"的场景下
+// 产生假失败。
+func normalizeRunGroups(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, g := range in {
+		if g = strings.TrimSpace(g); g == "" || seen[g] {
+			continue
+		}
+		seen[g] = true
+		out = append(out, g)
+	}
+	if len(out) == 0 {
+		return []string{groups.DefaultGroup}
+	}
+	return out
+}
+
 type AutoEnrollStatus struct {
 	Running    bool     `json:"running"`
 	Attempts   int      `json:"attempts"`
@@ -166,10 +191,13 @@ type AutoEnrollStatus struct {
 }
 
 // NewAutoEnroller 组装自动加号器。persist 落盘回调必填（nil 时 tryOne 会
-// 直接报错而不是 panic）；findAccountByMobile 可选，用于跳过已在池里的号。
+// 直接报错而不是 panic）；findAccountByMobile 可选，用于跳过已在池里的号；
+// setAccountGroups 可选（分组存储启用时由 handler 注入），加号成功后把
+// 新账号登记进任务指定的分组。
 func NewAutoEnroller(sms *smslogin.Manager, hzm *haozhuma.Client, sid string,
 	persist func(accountCredential, string) (map[string]any, int, error),
-	findAccountByMobile func(string) (string, bool)) *AutoEnroller {
+	findAccountByMobile func(string) (string, bool),
+	setAccountGroups func(uid string, groups []string) error) *AutoEnroller {
 	if persist == nil {
 		persist = func(accountCredential, string) (map[string]any, int, error) {
 			return nil, 500, errors.New("persist 回调未配置")
@@ -178,12 +206,16 @@ func NewAutoEnroller(sms *smslogin.Manager, hzm *haozhuma.Client, sid string,
 	if findAccountByMobile == nil {
 		findAccountByMobile = func(string) (string, bool) { return "", false }
 	}
+	if setAccountGroups == nil {
+		setAccountGroups = func(string, []string) error { return nil }
+	}
 	return &AutoEnroller{
-		sms:     sms,
-		hzm:     hzm,
-		sid:     sid,
-		persist: persist,
-		find:    findAccountByMobile,
+		sms:              sms,
+		hzm:              hzm,
+		sid:              sid,
+		persist:          persist,
+		find:             findAccountByMobile,
+		setAccountGroups: setAccountGroups,
 		// 默认轮询次数可用 AUTO_ENROLL_POLL_COUNT 覆盖（部署级调参），
 		// 单次任务还能再用 poll_count 覆盖它。
 		pollCount: envInt("AUTO_ENROLL_POLL_COUNT", defaultPollCount),
@@ -249,6 +281,8 @@ type AutoRunOptions struct {
 	// MaxAttempts 总尝试次数上限。<=0 用 want*12（下限 20）。
 	// 对接商质量差时可能试很多次才成一个，用户需要能放宽。
 	MaxAttempts int
+	// Groups 加号成功后新账号登记进这些分组（多归属）。空 = default。
+	Groups []string
 }
 
 // AutoRun 对外入口（保持旧签名）。已在跑时返回错误。
@@ -301,6 +335,8 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	a.attempts = 0
 	a.ok = 0
 	a.fail = 0
+	// runGroups 在启动时定格：任务期间用户改分组列表不影响本次任务的归属。
+	a.runGroups = normalizeRunGroups(opts.Groups)
 	// consumed 必须一起清零：它是"本次运行取了多少号"，漏掉它会残留上一次
 	// 任务的计数——界面显示 1 而实际已取走 5 个号。号码是花钱的资产，
 	// 这个数错得让人以为没消耗。
@@ -968,6 +1004,14 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 				return false, true, perr
 			}
 			// 接码成功：只释放不拉黑（对齐豪猪官方 SDK next_code 语义）。
+			// 分组登记失败只告警不影响加号结果：账号已落盘可用，分组是
+			// 归属元数据，用户可以在账号列表里事后补设。
+			a.mu.Lock()
+			runGroups := a.runGroups
+			a.mu.Unlock()
+			if err := a.setAccountGroups(creds.UID, runGroups); err != nil {
+				a.logf("号 %s 加号成功但分组登记失败: %v（可在账号列表手动补设）", phone, err)
+			}
 			a.logf("号 %s 加号成功 uid=%s…（已释放）", phone, shortUID(creds.UID))
 			finish(false)
 			return true, true, nil

@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Alert, Button, Card, Empty, InputNumber, Progress, Space, Statistic, Tag, Tooltip,
+  Alert, Button, Card, Empty, InputNumber, Progress, Select, Space, Statistic, Tag, Tooltip,
   Typography, message,
 } from 'antd';
 import {
@@ -49,6 +49,9 @@ export default function AutoEnroll({ api }) {
   const [pollCount, setPollCount] = useState(DEFAULT_POLL_COUNT);
   // maxAttempts 总尝试次数上限；null/0 表示按目标数推导（count*12，下限 20）。
   const [maxAttempts, setMaxAttempts] = useState(null);
+  // groups 任务新账号登记的分组（多选，默认 default）。
+  const [selectedGroups, setSelectedGroups] = useState(['default']);
+  const [groupOptions, setGroupOptions] = useState(null);
   const [status, setStatus] = useState(null);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -100,6 +103,24 @@ export default function AutoEnroll({ api }) {
     if (box) box.scrollTop = box.scrollHeight;
   }, [status?.logs]);
 
+  // 分组选项：加载失败（老后端没有分组端点）时静默隐藏选择器，
+  // 行为退回"新账号进 default"。
+  useEffect(() => {
+    let alive = true;
+    api('/admin/groups')
+      .then(body => {
+        if (!alive) return;
+        const names = (body.groups || []).map(g => g.name);
+        setGroupOptions(names);
+        setSelectedGroups(current => (
+          current.every(g => names.includes(g)) ? current : current.filter(g => names.includes(g)).length ? current.filter(g => names.includes(g)) : ['default']
+        ));
+      })
+      .catch(() => alive && setGroupOptions(null));
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const start = async () => {
     setStarting(true);
     setError('');
@@ -112,6 +133,7 @@ export default function AutoEnroll({ api }) {
           workers,
           poll_count: Number(pollCount) || 0,
           max_attempts: Number(maxAttempts) || 0,
+          groups: selectedGroups.length ? selectedGroups : ['default'],
         }),
       });
       // 提示用后端回的**生效值**：填了超范围的值时，这里显示的就是真实生效的那个。
@@ -248,6 +270,24 @@ export default function AutoEnroll({ api }) {
               style={{ width: 160 }}
             />
           </div>
+          {groupOptions && groupOptions.length > 0 && (
+            <div>
+              <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
+                <Tooltip title="新加的账号登记进这些分组（可多选）。分组密钥只能用对应分组里的账号。">
+                  <span style={{ borderBottom: '1px dashed #bfbfbf' }}>所属分组</span>
+                </Tooltip>
+              </Text>
+              <Select
+                mode="multiple"
+                value={selectedGroups}
+                onChange={setSelectedGroups}
+                disabled={running}
+                style={{ minWidth: 220 }}
+                placeholder="default"
+                options={groupOptions.map(g => ({ value: g, label: g }))}
+              />
+            </div>
+          )}
           <Button type="primary" icon={<PlayCircleOutlined />} loading={starting} disabled={running} onClick={start}>
             开始加号
           </Button>

@@ -156,6 +156,10 @@ type chatStat struct {
 	metricsStore          MetricsStore
 	requestLogStore       RequestLogStore
 	completionStore       CompletionStore
+	// spendHook 影子扣减回调（handler 注入 Pool.SpendCredits）：请求成功
+	// 且费用已知（upstream/estimated）时按实际金额扣减，供选号均衡。
+	// nil = 不扣（单测未注入 Pool 的场景）。
+	spendHook func(uid string, amount float64)
 
 	logged bool
 }
@@ -235,6 +239,11 @@ func (s *chatStat) done() {
 		} else {
 			s.creditSource = "unknown"
 		}
+	}
+	// 影子扣减：成功请求且费用已知时喂给选号均衡（负反馈）。失败请求不扣
+	// ——上游对失败请求也不收费；unknown 也跳过，宁可不均衡也不错扣。
+	if s.spendHook != nil && success && s.creditSource != "unknown" && s.uid != "" {
+		s.spendHook(s.uid, s.creditsConsumed)
 	}
 	requestMetrics.requests.Add(1)
 	if success {

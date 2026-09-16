@@ -131,6 +131,12 @@ type entry struct {
 	fails        int       // 连续失败计数（熔断用，唯一权威）
 	retryCount   int       // 已熔断次数（指数退避的指数）
 
+	// spent 影子扣减累计（运行态，不持久化）：请求成功结束时按上游
+	// usage.credit（或费率估算）累计，weightOf 里从 credits 里减去后再
+	// 参与比例——消耗领先的号权重自动下降，组内余额收敛到同一水平。
+	// 对账（SetCreditDetail/SetCredits 拿到真实快照）时清零。
+	spent float64
+
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 }
@@ -591,6 +597,41 @@ func (p *Pool) PickAndAcquireForModel(model string, tried map[string]bool) *auth
 	return a
 }
 
+// PickAndAcquireForModelAllow 同 PickAndAcquireForModel，但只在 allow 集合
+// （uid -> true）内的账号里选。nil = 不过滤（全池）；显式空 map = 无可选
+// 账号（返回 nil，不回落全池——分组语义）。
+// 分组路由用：密钥绑定分组后，选号范围收窄到该分组的账号。
+func (p *Pool) PickAndAcquireForModelAllow(model string, tried map[string]bool, allow map[string]bool) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var a *auth.Auth
+	if allow == nil {
+		a = p.pickForModelLocked(normalizeModel(model), tried)
+	} else {
+		a = p.pickForModelAllowLocked(normalizeModel(model), tried, allow)
+	}
+	if a != nil {
+		p.byUID[a.UID].inFlight.Add(1)
+	}
+	return a
+}
+
+// pickForModelAllowLocked 在 allow 集合内复用既有选择管线：把 allow 之外的
+// uid 并进 tried 副本（pickForModelLocked 与 pickEarliestExpiryLocked 都
+// 只认 tried），保证分组账号与全池账号走完全相同的三因子/防撞号/兜底规则。
+func (p *Pool) pickForModelAllowLocked(model string, tried, allow map[string]bool) *auth.Auth {
+	merged := make(map[string]bool, len(tried)+len(p.byUID))
+	for uid := range tried {
+		merged[uid] = true
+	}
+	for uid := range p.byUID {
+		if !allow[uid] {
+			merged[uid] = true
+		}
+	}
+	return p.pickForModelLocked(model, merged)
+}
+
 func (p *Pool) pickForModelLocked(model string, tried map[string]bool) *auth.Auth {
 	now := time.Now()
 
@@ -614,10 +655,14 @@ func (p *Pool) pickForModelLocked(model string, tried map[string]bool) *auth.Aut
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
+	//
+	// anchor 用**有效余额**（credits - spent，见 weightOf）：候选集里
+	// 消耗领先者不再抬高归一化锚点。
 	var maxCredits int64
 	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
+		eff := float64(e.credits) - e.spent
+		if eff > float64(maxCredits) {
+			maxCredits = int64(eff)
 		}
 	}
 	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
@@ -808,12 +853,22 @@ func (p *Pool) pickWeightedPrepared(cands []weighted) *entry {
 }
 
 // weightOf 计算单个账号的三因子权重。
+//
+// credits 因子用的是**有效余额** = 上次对账快照 - 影子扣减（spent）：
+// 消耗领先的号有效余额下降、权重随之下降，负反馈让组内余额收敛到
+// 同一水平（而不是快照最高的号被打到干枯才轮换）。
 func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := 1.0
 
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
 	if maxCredits > 0 {
-		w += float64(e.credits) / float64(maxCredits) * 10
+		effective := float64(e.credits) - e.spent
+		if effective < 0 {
+			// 烧穿的号钳 0：全员烧穿时 credits 项退化，选择回落到
+			// idle + 成功率继续均匀轮换（真耗尽会走 402 hard 冷却）。
+			effective = 0
+		}
+		w += effective / float64(maxCredits) * 10
 	}
 
 	// 2. 闲置补偿。
@@ -841,14 +896,48 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	return w
 }
 
-// SetCredits 更新账号余额。
+// SetCredits 更新账号余额（对账快照）：影子扣减随之清零——真实快照
+// 已覆盖一切，影子账使命完成。
 func (p *Pool) SetCredits(uid string, credits int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
+		e.spent = 0
 		p.dirty.Store(true)
 	}
+}
+
+// SpendCredits 影子扣减：请求成功结束后按上游 usage.credit（拿不到时
+// 用费率估算）累计。weightOf 用有效余额（credits - spent）参与比例，
+// 消耗领先的号权重自动下降 → 组内余额收敛到同一水平。
+//
+// 负值忽略（上游费用字段异常时不动账本）。脏标记不置位：spent 不持久化，
+// 没必要为此触发 state.json 落盘。
+func (p *Pool) SpendCredits(uid string, amount float64) {
+	if amount <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.spent += amount
+	}
+}
+
+// EffectiveCredits 返回有效余额（对账快照 - 影子扣减），供观测/测试。
+func (p *Pool) EffectiveCredits(uid string) (int64, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return 0, false
+	}
+	eff := float64(e.credits) - e.spent
+	if eff < 0 {
+		eff = 0
+	}
+	return int64(eff), true
 }
 
 // SetCreditDetail updates the latest upstream billing counters and applies the
@@ -864,6 +953,7 @@ func (p *Pool) SetCreditDetail(uid string, detail CreditDetail) {
 		e.cycleCapacityRemain = detail.CycleCapacityRemain
 		e.cycleCapacityUsed = detail.CycleCapacityUsed
 		e.creditUpdatedAt = time.Now()
+		e.spent = 0 // 对账清零影子账
 		p.updateCreditsLocked(e, detail.Remaining)
 		p.dirty.Store(true)
 	}
@@ -1238,6 +1328,18 @@ func (p *Pool) ServableNow() bool {
 		}
 	}
 	return false
+}
+
+// UIDs 返回池中全部账号 uid（有序副本）。分组迁移等启动期批量操作用。
+func (p *Pool) UIDs() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]string, 0, len(p.byUID))
+	for uid := range p.byUID {
+		out = append(out, uid)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // List 返回所有账号状态（按 UID 排序，稳定输出）。

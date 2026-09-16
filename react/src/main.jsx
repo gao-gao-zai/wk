@@ -5,13 +5,14 @@ import {
   Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import {
-  ApiOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined,
+  ApiOutlined, ApartmentOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined,
   ReloadOutlined, SendOutlined, SettingOutlined, TeamOutlined,
   ThunderboltOutlined, CloudServerOutlined, UserAddOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
 import './theme.css';
 import AutoEnrollPage from './pages/AutoEnroll';
+import GroupsAndKeysPage from './pages/GroupsAndKeys';
 import ProxyPoolPage from './pages/ProxyPool';
 import RequestLogsPage from './pages/RequestLogs';
 import AccountSettingsPage from './pages/AccountSettings';
@@ -42,7 +43,7 @@ const parseHours = value => String(value || '').split(',').map(item => item.trim
 
 // 页面标识。用 hash 路由（#/auto-enroll）而不是给每页单独打包：
 // 刷新能停在原页、地址可收藏转发，且不引入 react-router 依赖。
-const SECTIONS = ['dashboard', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'settings'];
+const SECTIONS = ['dashboard', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'groups', 'settings'];
 
 // sectionFromHash 读取地址栏里的页面标识；非法/缺失时回落到仪表盘。
 function sectionFromHash() {
@@ -82,7 +83,6 @@ function Console() {
   // 刷新页面后需要重新输入，这是有意的取舍 —— 换取 key 不被同源脚本读取。
   const [apiKey, setApiKey] = useState('');
   const [locked, setLocked] = useState(false);
-  const [password, setPassword] = useState('');
   const [activeSection, setActiveSection] = useState(() => sectionFromHash());
   const [data, setData] = useState({ accounts: [], metrics: {}, total: 0, healthy: 0, cooling: 0, disabled: 0 });
   const [models, setModels] = useState([]);
@@ -162,7 +162,9 @@ function Console() {
       setLocked(false);
     } catch (error) {
       if (error.name === 'AbortError') return;
-      if (error.message.includes('invalid') || error.message.includes('password')) setLocked(true);
+      // 401 的错误文案里带 invalid / credential / 密钥 等；宽松匹配避免后端
+      // 文案微调后这里静默失效（锁死在解锁弹窗之外）。
+      if (/invalid|credential|unauthorized|密钥/i.test(error.message)) setLocked(true);
       return;
     }
     try {
@@ -216,22 +218,22 @@ function Console() {
   }, []);
 
   const unlock = async () => {
-    // 只输入 API Key（不输密码）时直接用 key 解锁：key 留在内存，不写存储。
-    if (!password.trim() && apiKey.trim()) {
-      setLocked(false);
-      await refresh();
+    // 密钥解锁：输入管理员密钥（config api_key）→ 后端校验后发会话 cookie。
+    // 密码通道已下线（多密钥体系下管理员密钥就是控制台凭据）；分组密钥
+    // 不能解锁控制台——后端只认管理员。
+    if (!apiKey.trim()) {
+      message.error('请输入管理员密钥');
       return;
     }
     try {
       const response = await fetch('/admin/unlock', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: apiKey.trim() }),
       });
       if (!response.ok) {
         const body = await response.json();
-        throw Error(body.error || '密码错误');
+        throw Error(body.error || '密钥错误');
       }
       setLocked(false);
-      setPassword('');
       await refresh();
       message.success('控制台已解锁');
     } catch (error) {
@@ -513,6 +515,7 @@ function Console() {
     accounts: ['账号配置', '添加与授权账号：OAuth 登录链接、短信直登，以及账号池区域信息。'],
     'auto-enroll': ['自动加号', '用豪猪接码平台批量添加中国区账号：取号 → 发码 → 收码 → 自动落盘，全程免浏览器。'],
     proxy: ['代理池', '短信直登链路的出口代理：池内容量、冷却状态和后续扩展。'],
+    groups: ['分组与密钥', '账号分组与 API 密钥管理：分组密钥只能使用绑定分组的账号；管理员密钥不受限。'],
     settings: ['管理设置', '配置签到与保活计划，手动触发签到和积分刷新。'],
   };
   const [pageTitle, pageDescription] = pageCopy[activeSection] || pageCopy.dashboard;
@@ -531,6 +534,7 @@ function Console() {
         { key: 'proxy', icon: <CloudServerOutlined />, label: '代理池' },
       ],
     },
+    { key: 'groups', icon: <ApartmentOutlined />, label: '分组与密钥' },
     { key: 'settings', icon: <SettingOutlined />, label: '管理设置' },
   ];
   const tabItems = [
@@ -798,14 +802,14 @@ function Console() {
             {activeSection === 'pool' && <AccountListPage api={api} data={data} refresh={refresh} refreshCredits={refreshCredits} creditRefreshing={creditRefreshing} />}
             {activeSection === 'accounts' && <AccountSettingsPage api={api} refresh={refresh} region={config.region} />}
             {activeSection === 'auto-enroll' && <AutoEnrollPage api={api} />}
+            {activeSection === 'groups' && <GroupsAndKeysPage api={api} />}
             {activeSection === 'proxy' && <ProxyPoolPage api={api} />}
             {tabItems.find(item => item.key === activeTab)?.children}
           </Content>
         </Layout>
         <Modal open={locked} title="控制台验证" onOk={unlock} onCancel={() => {}} okText="解锁" cancelButtonProps={{ style: { display: 'none' } }}>
-          <Alert message="请输入前端访问密码，或填写 API Key" type="info" showIcon style={{ marginBottom: 14 }} />
-          <Input.Password prefix={<KeyOutlined />} value={password} onChange={event => setPassword(event.target.value)} onPressEnter={unlock} placeholder="输入访问密码" />
-          <Input prefix={<ApiOutlined />} value={apiKey} onChange={event => setApiKey(event.target.value)} onPressEnter={unlock} placeholder="输入 API Key" style={{ marginTop: 10 }} />
+          <Alert message="请输入管理员密钥（config 里的 api_key）。分组密钥不能解锁控制台。" type="info" showIcon style={{ marginBottom: 14 }} />
+          <Input.Password prefix={<KeyOutlined />} value={apiKey} onChange={event => setApiKey(event.target.value)} onPressEnter={unlock} placeholder="输入管理员密钥" />
         </Modal>
     </Layout>
   );

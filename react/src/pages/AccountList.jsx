@@ -1,9 +1,9 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   App, Button, Card, Input, Select, Space, Statistic, Table, Tag, Tooltip, Typography,
 } from 'antd';
 import {
-  CheckCircleOutlined, DeleteOutlined, ReloadOutlined, StopOutlined,
+  ApartmentOutlined, CheckCircleOutlined, DeleteOutlined, ReloadOutlined, StopOutlined,
   ThunderboltOutlined, UnlockOutlined,
 } from '@ant-design/icons';
 
@@ -106,6 +106,62 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
   const [accountSearch, setAccountSearch] = useState('');
   const [accountStatusFilter, setAccountStatusFilter] = useState('all');
   const [accountRegionFilter, setAccountRegionFilter] = useState('all');
+  // 分组筛选（'all' = 不过滤）。
+  const [accountGroupFilter, setAccountGroupFilter] = useState('all');
+  // 分组功能：groups 列表来自 /admin/groups；每账号归属来自 /status 的
+  // account_groups 快照（一次拉齐，不逐账号 GET）。老后端两个字段都缺时
+  // groupNames 为 null，分组列与按钮整体隐藏。
+  const [groupNames, setGroupNames] = useState(null);
+
+  useEffect(() => {
+    if (groupNames !== null || !data.accounts?.length) return;
+    api('/admin/groups')
+      .then(body => setGroupNames((body.groups || []).map(g => g.name)))
+      .catch(() => setGroupNames(null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data.accounts?.length > 0]);
+
+  // 每账号分组：data.account_groups 里没有的 uid = 未登记 = default 语义。
+  const accountGroups = data.account_groups || {};
+
+  // editAccountGroups 打开分组编辑弹窗（多选）。未登记账号初始值 = default。
+  const editAccountGroups = record => {
+    const uid = record.uid || '';
+    const current = accountGroups[uid];
+    let selected = current && current.length ? [...current] : ['default'];
+    modal.confirm({
+      title: `设置账号 ${record.nickname || uid.slice(0, 12)} 的分组`,
+      icon: null,
+      content: (
+        <div style={{ marginTop: 12 }}>
+          <Text type="secondary">账号可属于多个分组；分组密钥只能用对应分组里的账号。</Text>
+          <Select
+            mode="multiple"
+            defaultValue={selected}
+            style={{ width: '100%', marginTop: 8 }}
+            onChange={value => { selected = value; }}
+            options={(groupNames || []).map(g => ({ value: g, label: g }))}
+          />
+        </div>
+      ),
+      okText: '保存',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          await api(`/admin/accounts/${encodeURIComponent(uid)}/groups`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ groups: selected.length ? selected : ['default'] }),
+          });
+          message.success('分组已保存');
+          await refresh(); // /status 的 account_groups 快照随之更新
+        } catch (error) {
+          message.error(error.message);
+          throw error;
+        }
+      },
+    });
+  };
 
   const runAccountAction = async (record, action) => {
     const uid = record.uid || '';
@@ -173,7 +229,8 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
     });
   };
 
-  // filteredAccounts 支持按昵称/UID 搜索 + 状态/区域筛选，与表格排序组合使用。
+  // filteredAccounts 支持按昵称/UID 搜索 + 状态/区域/分组筛选，与表格排序组合使用。
+  // 分组筛选语义：多归属账号属于任一所选分组即命中（OR）。
   const filteredAccounts = useMemo(() => {
     const query = accountSearch.trim().toLowerCase();
     return (data.accounts || []).filter(record => {
@@ -182,6 +239,12 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
       const matchesQuery = !query || [record.nickname, record.uid, record.reason]
         .some(value => String(value || '').toLowerCase().includes(query));
       const matchesRegion = accountRegionFilter === 'all' || (record.region || 'cn') === accountRegionFilter;
+      let matchesGroup = true;
+      if (accountGroupFilter !== 'all') {
+        const gs = accountGroups[record.uid];
+        const shown = gs && gs.length ? gs : ['default'];
+        matchesGroup = shown.includes(accountGroupFilter);
+      }
       let matchesStatus = true;
       if (accountStatusFilter === 'healthy') {
         matchesStatus = !record.disabled && !portrait.untilActive && !portrait.breakerActive && !modelCooling;
@@ -190,9 +253,9 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
       } else if (accountStatusFilter === 'disabled') {
         matchesStatus = !!record.disabled;
       }
-      return matchesQuery && matchesRegion && matchesStatus;
+      return matchesQuery && matchesRegion && matchesGroup && matchesStatus;
     });
-  }, [data.accounts, accountSearch, accountStatusFilter, accountRegionFilter]);
+  }, [data.accounts, accountGroups, accountSearch, accountStatusFilter, accountRegionFilter, accountGroupFilter]);
 
   const columns = [
     {
@@ -204,6 +267,17 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
         </Space>
       ),
     },
+    // 分组列：分组存储可用时展示（默认隐藏于老后端）。
+    // 未登记的账号显示 default（后端语义：未登记 = default 归属）。
+    ...(groupNames ? [{
+      title: '分组',
+      key: 'groups',
+      render: (_, record) => {
+        const gs = accountGroups[record.uid];
+        const shown = gs && gs.length ? gs : ['default'];
+        return <Space size={2} wrap>{shown.map(g => <Tag key={g} color={g === 'default' ? 'blue' : 'purple'} style={{ marginInlineEnd: 0 }}>{g}</Tag>)}</Space>;
+      },
+    }] : []),
     {
       title: '区域',
       dataIndex: 'region',
@@ -312,6 +386,14 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
                 onClick={() => accountActionHandler(record, 'clear-cooldown')}
               >清冷却</Button>
             </Tooltip>
+            {groupNames && (
+              <Button
+                size="small"
+                type="link"
+                icon={<ApartmentOutlined />}
+                onClick={() => editAccountGroups(record)}
+              >分组</Button>
+            )}
             <Button
               size="small"
               type="link"
@@ -411,6 +493,12 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
             { value: 'cn', label: '中国区' },
             { value: 'global', label: '海外版' },
           ]} />
+          {groupNames && groupNames.length > 0 && (
+            <Select value={accountGroupFilter} onChange={setAccountGroupFilter} style={{ width: 150 }} options={[
+              { value: 'all', label: '全部分组' },
+              ...groupNames.map(g => ({ value: g, label: `分组：${g}` })),
+            ]} />
+          )}
         </Space>
       </Card>
       <Card

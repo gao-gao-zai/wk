@@ -133,6 +133,7 @@ func TestAutoEnrollStopsOnFatalError(t *testing.T) {
 	f.phoneResp.Store(`{"code":"201","msg":"余额不足，请充值"}`)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 
 	if err := en.AutoRun(5, 1); err != nil {
@@ -160,6 +161,7 @@ func TestAutoEnrollStopsOnLowBalance(t *testing.T) {
 	f.summary.Store(`{"code":"0","msg":"ok","money":"1.20"}`)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 
@@ -187,6 +189,7 @@ func TestAutoEnrollCircuitBreaker(t *testing.T) {
 	// 取号正常，但 SMSLogin 用坏端点：每个号发码都失败 -> 连续失败。
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond // 测试里别真等 5s
 
@@ -239,6 +242,7 @@ func TestAutoEnrollReloginOnTokenInvalid(t *testing.T) {
 
 	en := NewAutoEnroller(noSMSManager(), c, "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 
@@ -395,6 +399,7 @@ func TestAutoEnrollConcurrentRespectsTarget(t *testing.T) {
 	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
 		func(string) (string, bool) { return "", false },
+		nil,
 	)
 	en.retryDelay = time.Millisecond
 	en.pollInterval = time.Millisecond
@@ -457,6 +462,7 @@ func TestAutoEnrollBlacklistPolicy(t *testing.T) {
 	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
 		func(string) (string, bool) { return "", false },
+		nil,
 	)
 	en.retryDelay = time.Millisecond
 	en.pollInterval = time.Millisecond
@@ -496,6 +502,7 @@ func TestAutoEnrollConcurrentCircuitBreaker(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 
@@ -565,6 +572,7 @@ func TestAutoEnrollStop(t *testing.T) {
 	// getMessage 永远返回"等待"，轮询次数设得很大，任务因此一直挂着。
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = 10 * time.Millisecond
 	en.pollInterval = 20 * time.Millisecond
@@ -611,6 +619,7 @@ func TestAutoEnrollStopKeepsReason(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = 10 * time.Millisecond
 	en.pollInterval = 10 * time.Millisecond
@@ -636,6 +645,7 @@ func TestAutoEnrollStopCountsConsumedNumbers(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = 10 * time.Millisecond
 	en.pollInterval = 20 * time.Millisecond
@@ -681,6 +691,7 @@ func TestPollCountControlsPollingRounds(t *testing.T) {
 		f := newFakeHZM(t)
 		en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 			func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+			nil,
 			nil)
 		en.pollInterval = time.Millisecond
 		en.pollCount = want
@@ -705,6 +716,7 @@ func TestPollCountClampedToMax(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.pollInterval = time.Millisecond
 
@@ -725,6 +737,7 @@ func TestPollCountZeroUsesTimeoutDerivedDefault(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.pollInterval = time.Millisecond
 	en.pollTimeout = 5 * time.Millisecond // 5ms / 1ms = 5 次
@@ -742,6 +755,7 @@ func TestPollCodeReturnsEarlyOnCode(t *testing.T) {
 	f.msgResp.Store(`{"code":"0","msg":"ok","sms":"您的验证码是 654321"}`)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.pollInterval = time.Millisecond
 
@@ -773,6 +787,7 @@ func TestMaxAttemptsOverride(t *testing.T) {
 	f.phoneResp.Store(`{"code":"-1","msg":"没有取到号码，请重新尝试"}`)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 	// 目标 1 个，默认上限是 max(20, 1*12) = 20；放宽到 35 应该真的跑 35 次。
@@ -796,6 +811,7 @@ func TestCircuitBreakerStillCapsRaisedAttempts(t *testing.T) {
 	f.phoneResp.Store(`{"code":"-1","msg":"没有取到号码，请重新尝试"}`)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 	if err := en.AutoRunWith(AutoRunOptions{Want: 1, Workers: 1, MaxAttempts: 500}); err != nil {
@@ -819,6 +835,7 @@ func TestCountersResetBetweenRuns(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 	en.pollInterval = time.Millisecond
@@ -863,6 +880,7 @@ func TestTaskEndReleasesAllNumbers(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 	en.pollInterval = time.Millisecond
@@ -899,6 +917,7 @@ func TestFailedReleaseIsRetriedAtTaskEnd(t *testing.T) {
 	f.releaseFail.Store(1)
 	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 	en.pollInterval = time.Millisecond
@@ -937,6 +956,7 @@ func TestReclaimOrphansOnStartup(t *testing.T) {
 
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.SetLedgerPath(ledger)
 
@@ -967,6 +987,7 @@ func TestLedgerPersistsHeldNumbers(t *testing.T) {
 	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.SetLedgerPath(ledger)
 
@@ -993,6 +1014,7 @@ func TestReclaimOrphansWithoutLedger(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	// 未设置 ledgerPath。
 	if n := en.ReclaimOrphans(); n != 0 {
@@ -1023,6 +1045,7 @@ func TestStuckNumberRetriedAtNextRunStart(t *testing.T) {
 	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
 	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.SetLedgerPath(ledger)
 	en.retryDelay = time.Millisecond
@@ -1064,6 +1087,7 @@ func TestStuckNumberKeptWhenReleaseKeepsFailing(t *testing.T) {
 	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.SetLedgerPath(ledger)
 	// 让释放永远失败（模拟豪猪持续报错）。
@@ -1092,6 +1116,7 @@ func TestGoneNumberCountsAsReclaimed(t *testing.T) {
 	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.SetLedgerPath(ledger)
 	// 豪猪对已失效的号返回"很抱歉,手机号不存在"（实测文案）。
@@ -1127,6 +1152,7 @@ func TestReleaseFailedCountsAsReclaimed(t *testing.T) {
 	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.SetLedgerPath(ledger)
 	if err := os.WriteFile(ledger, []byte(`["17000000001","17000000002"]`), 0o600); err != nil {
@@ -1162,6 +1188,7 @@ func TestReleaseAllHeldViaCancelAllRecv(t *testing.T) {
 	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.SetLedgerPath(ledger)
 	// 模拟账本里有 3 个遗留号。
@@ -1197,6 +1224,7 @@ func TestReleaseAllHeldRejectedWhileRunning(t *testing.T) {
 	f := newFakeHZM(t)
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.retryDelay = time.Millisecond
 
@@ -1228,6 +1256,7 @@ func TestReleaseAllHeldUpstreamError(t *testing.T) {
 	ledger := filepath.Join(t.TempDir(), "autoenroll-held.json")
 	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
 		nil)
 	en.SetLedgerPath(ledger)
 	en.trackHeld("17000000001")
