@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -188,4 +189,97 @@ func doResponsesRequest(h http.Handler, body string) *httptest.ResponseRecorder 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
 	return rec
+}
+
+// TestResponsesStripsConversationIdentityUpstream 保证 Responses→chat 转译后
+// 发往上游的 body 不携带会话标识（conversation_id/prompt_cache_key 等）：
+// Codex 每轮全量重发历史并复用稳定 key，标识进上游会触发 11148。
+// 本地粘性路由在 payload 变换之前提取，不受影响。
+func TestResponsesStripsConversationIdentityUpstream(t *testing.T) {
+	var mu sync.Mutex
+	var seenBodies []string
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		seenBodies = append(seenBodies, string(raw))
+		mu.Unlock()
+		body := "data: {\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+	h := newTestHandler(t, Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	for i := 0; i < 2; i++ {
+		rec := doResponsesRequest(h, `{"model":"glm-5.2","input":"hello","stream":true,"prompt_cache_key":"agent-42","include":["reasoning.encrypted_content"],"store":false}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: code=%d body=%s", i, rec.Code, rec.Body)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenBodies) != 2 {
+		t.Fatalf("upstream saw %d requests, want 2", len(seenBodies))
+	}
+	for i, b := range seenBodies {
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(b), &doc); err != nil {
+			t.Fatalf("request %d: upstream body not JSON: %v (%s)", i, err, b)
+		}
+		for _, key := range []string{"conversation", "conversation_id", "prompt_cache_key", "prompt_cache_retention", "include", "store"} {
+			if _, ok := doc[key]; ok {
+				t.Errorf("request %d: %s leaked upstream: %v", i, key, doc[key])
+			}
+		}
+		if meta, ok := doc["metadata"].(map[string]any); ok {
+			if _, ok := meta["conversation_id"]; ok {
+				t.Errorf("request %d: metadata.conversation_id leaked upstream: %v", i, meta["conversation_id"])
+			}
+		}
+	}
+}
+
+// TestResponsesFunctionCallOutputWithoutCallIDBecomesUser 无 call_id 的
+// function_call_output 必须降级为 user 消息而不是被静默丢弃——丢弃会留下
+// 孤立的 assistant.tool_calls，直接触发上游 11148。
+func TestResponsesFunctionCallOutputWithoutCallIDBecomesUser(t *testing.T) {
+	body, _, err := responsesToChat([]byte(`{
+		"model":"glm-5.2",
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"paired result"},
+			{"type":"function_call_output","output":"orphan result"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("chat body is not JSON: %v", err)
+	}
+	messages := got["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("messages=%d, want 3 (assistant+tool+user): %#v", len(messages), messages)
+	}
+	orphan := messages[2].(map[string]any)
+	if orphan["role"] != "user" {
+		t.Fatalf("orphan output role=%v, want user", orphan["role"])
+	}
+	if orphan["content"] != "orphan result" {
+		t.Fatalf("orphan output content=%v", orphan["content"])
+	}
+	// 有 call_id 的配对不受影响。
+	tool := messages[1].(map[string]any)
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_1" {
+		t.Fatalf("paired output altered: %#v", tool)
+	}
 }

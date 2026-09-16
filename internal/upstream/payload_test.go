@@ -197,3 +197,63 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 		})
 	}
 }
+
+// TestPrepareBodyStripsConversationIdentity 保证会话标识不会发往上游：
+// Codex 等客户端每轮全量重发历史并复用稳定 prompt_cache_key，若该标识
+// 进入上游 body（metadata.conversation_id 等），上游会按会话累积服务端
+// 状态，与重发的历史叠加后触发 11148 tool_call_sequence_broken。
+// 会话标识只允许驱动本地粘性路由（在 handler 层、进入本变换前提取）。
+func TestPrepareBodyStripsConversationIdentity(t *testing.T) {
+	out := mustPrepareBody(t, []byte(`{
+		"model":"glm-5.2",
+		"messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}],
+		"conversation":"conv-1",
+		"conversation_id":"conv-2",
+		"prompt_cache_key":"agent-42",
+		"prompt_cache_retention":"24h",
+		"metadata":{"conversation_id":"conv-3","user_id":"u-9"}
+	}`), false)
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, out)
+	}
+	for _, key := range []string{"conversation", "conversation_id", "prompt_cache_key", "prompt_cache_retention"} {
+		if _, ok := m[key]; ok {
+			t.Errorf("%s leaked into upstream body: %v", key, m[key])
+		}
+	}
+	meta, ok := m["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata dropped entirely (user_id must survive): %v", m["metadata"])
+	}
+	if _, ok := meta["conversation_id"]; ok {
+		t.Errorf("metadata.conversation_id leaked into upstream body: %v", meta["conversation_id"])
+	}
+	if meta["user_id"] != "u-9" {
+		t.Errorf("metadata.user_id lost: %v", meta["user_id"])
+	}
+	// 消息与其余字段原样保留。
+	if msgs, ok := m["messages"].([]any); !ok || len(msgs) != 2 {
+		t.Errorf("messages altered: %v", m["messages"])
+	}
+	if m["stream"] != true {
+		t.Errorf("stream must stay forced true, got %v", m["stream"])
+	}
+}
+
+// TestPrepareBodyDropsEmptyMetadata 剥离后 metadata 只剩会话字段时应整体移除，
+// 不给上游留一个空对象。
+func TestPrepareBodyDropsEmptyMetadata(t *testing.T) {
+	out := mustPrepareBody(t, []byte(`{
+		"model":"glm-5.2",
+		"messages":[{"role":"user","content":"hi"}],
+		"metadata":{"conversation_id":"conv-1"}
+	}`), false)
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := m["metadata"]; ok {
+		t.Errorf("empty metadata should be dropped, got %v", m["metadata"])
+	}
+}

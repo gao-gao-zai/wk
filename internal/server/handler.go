@@ -2516,6 +2516,13 @@ func responsesToChat(raw []byte) ([]byte, bool, error) {
 		switch k {
 		case "input", "instructions", "stream", "max_output_tokens", "conversation", "previous_response_id":
 			continue
+		case "include", "store":
+			// Responses 专属协议字段：include（reasoning.encrypted_content 等）
+			// 与 store 只对原生 Responses 后端有意义，透传进 chat body 属于
+			// 非预期负载。prompt_cache_key/conversation_id 保留——它们驱动本地
+			// 粘性路由（session.ExtractKey 在进入上游前已完成提取，上游 payload
+			// 层负责剥离）。
+			continue
 		}
 		chat[k] = v
 	}
@@ -2638,6 +2645,11 @@ func appendResponseInput(msgs *[]map[string]any, input any) {
 				}
 				if callID != "" {
 					*msgs = append(*msgs, map[string]any{"role": "tool", "tool_call_id": callID, "content": output})
+				} else if output != "" {
+					// 无 call_id 的输出无法配对到任何 tool_call；静默丢弃会让前一条
+					// assistant 的 tool_calls 变成孤立序列，触发上游 11148。降级为
+					// user 消息（对齐参考实现），信息不丢、序列完整。
+					*msgs = append(*msgs, map[string]any{"role": "user", "content": output})
 				}
 				continue
 			}
@@ -3415,6 +3427,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			setRequestError(st, kind.String(), bodyText)
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: bodyText}
 			h.applyErrorPolicy(acct.UID, routeModel, kind, bodyText)
+			if kind == upstream.ErrClient {
+				// 确定性 body 级 4xx（11128 首条须 system、11101 tool_choice 形态、
+				// 11148 工具序列断裂等）：同一 body 换号重发必然复现同样错误，
+				// 还会在上游按会话累积状态的场景下进一步污染会话。直接透传，
+				// 让客户端看到真实原因。账号侧不罚（applyErrorPolicy 对 ErrClient
+				// 本就只换号不喂熔断）。
+				break
+			}
 			fail(acct.UID)
 			continue
 		}

@@ -62,6 +62,7 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	ensureSystemFirstMessage(obj)
 	normalizeToolChoice(obj)
 	normalizeReasoningEffort(obj, efforts)
+	stripConversationIdentity(obj)
 	// Codex 兼容改写放在角色映射之后：developer→system 已完成，system
 	// 消息（含由 developer 映射来的）都会被检查；放在脱敏之前，两层
 	// 改写互不干扰（脱敏管 Claude 指纹，这里管 Codex 身份句）。
@@ -124,6 +125,34 @@ func ensureSystemFirstMessage(obj map[string]any) {
 			"content": "You are a helpful assistant.",
 		},
 	}, messages...)
+}
+
+// stripConversationIdentity removes session-affinity identifiers from the
+// body before it is sent to the WorkBuddy upstream.
+//
+// The upstream keeps server-side conversation state keyed by
+// metadata.conversation_id (and the related top-level fields). Clients like
+// Codex resend the FULL conversation history on every turn while reusing one
+// stable prompt_cache_key / conversation_id, so a stable identifier makes the
+// upstream merge the resent history into its stored state and eventually
+// reject the request with code 11148 ("tool calls and tool results do not
+// match, please start a new conversation"). Session identity is therefore
+// strictly local: it drives sticky account routing in the server layer
+// (session.ExtractKey runs before this transform) and must never leak into
+// the upstream body. Each upstream request is stateless from the proxy's
+// point of view.
+func stripConversationIdentity(obj map[string]any) {
+	delete(obj, "conversation")
+	delete(obj, "conversation_id")
+	delete(obj, "prompt_cache_key")
+	delete(obj, "prompt_cache_retention")
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		delete(meta, "conversation_id")
+		delete(meta, "conversation")
+		if len(meta) == 0 {
+			delete(obj, "metadata")
+		}
+	}
 }
 
 // NormalizeModelID maps provider aliases to the stable public model IDs used

@@ -355,6 +355,55 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	}
 }
 
+// TestChatClientErrorDoesNotRotate 确定性 body 级 4xx（上游 ErrClient，如
+// 11148 tool_call_sequence_broken、11128 首条须 system）不应换号重试：
+// 同一 body 在任何账号上都会复现同样错误，重试只浪费账号并可能在上游
+// 会话状态维度进一步污染。必须首个账号就透传真实状态码与错误体。
+func TestChatClientErrorDoesNotRotate(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 400, `{"code":11148,"msg":"tool calls and tool results do not match, please start a new conversation and retry"}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := newTestHandler(t, Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 400 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "11148") {
+		t.Errorf("upstream error body should pass through, got %s", rec.Body)
+	}
+	if total := calls["Bearer at1"] + calls["Bearer at2"]; total != 1 {
+		t.Errorf("deterministic client error must not rotate accounts, upstream calls=%v", calls)
+	}
+}
+
+// TestChatNonClientErrorStillRotates 对照组：5xx 仍走轮换重试（防雪崩语义不变）。
+func TestChatNonClientErrorStillRotates(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 500, "upstream boom", false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := newTestHandler(t, Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if total := calls["Bearer at1"] + calls["Bearer at2"]; total < 2 {
+		t.Errorf("5xx should still rotate across accounts, upstream calls=%v", calls)
+	}
+}
+
 // TestChatStickyFollowsFinalSuccess 端到端验证 D4：粘性号失败换号成功后，会话绑定收敛到成功号。
 func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 	st := newBindStore()
