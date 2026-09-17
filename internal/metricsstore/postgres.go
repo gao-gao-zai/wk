@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -19,6 +20,7 @@ type PostgresStore struct {
 	db            *sql.DB
 	mu            sync.RWMutex
 	requestWrites int
+	retention     atomic.Pointer[Retention]
 }
 
 // OpenPostgres opens and initializes a PostgreSQL metrics store. The DSN may
@@ -59,7 +61,22 @@ func OpenPostgres(dsn string, maxOpenConns, maxIdleConns int, connMaxLifetime, c
 		db.Close()
 		return nil, err
 	}
-	return &PostgresStore{db: db}, nil
+	s := &PostgresStore{db: db}
+	s.SetRetention(Retention{}) // orDefault → 旧默认 1 万条
+	return s, nil
+}
+
+// SetRetention 更新保留策略（运行时可调）。与 SQLite 版语义一致。
+func (s *PostgresStore) SetRetention(r Retention) {
+	s.retention.Store(&r)
+}
+
+// RetentionPolicy 返回当前策略（回显用）。
+func (s *PostgresStore) RetentionPolicy() Retention {
+	if p := s.retention.Load(); p != nil {
+		return *p
+	}
+	return Retention{}
 }
 
 func initPostgresSchema(ctx context.Context, db *sql.DB) error {
@@ -206,7 +223,7 @@ func (s *PostgresStore) AddCredit(consumed float64, source string) error {
 func (s *PostgresStore) RecordRequest(record RequestRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := insertRequestPostgres(s.db, record, s.requestWrites+1)
+	err := insertRequestPostgres(s.db, record, s.requestWrites+1, s.RetentionPolicy())
 	if err == nil {
 		s.requestWrites++
 	}
@@ -224,7 +241,7 @@ func (s *PostgresStore) RecordCompletion(delta Snapshot, record RequestRecord) e
 	if err = addDeltaPostgres(tx, delta); err != nil {
 		return err
 	}
-	if err = insertRequestPostgres(tx, record, s.requestWrites+1); err != nil {
+	if err = insertRequestPostgres(tx, record, s.requestWrites+1, s.RetentionPolicy()); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err == nil {
@@ -275,7 +292,7 @@ func (s *PostgresStore) ReconcileRequestCredit(id string, credit float64) error 
 	return tx.Commit()
 }
 
-func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int) error {
+func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int, retention Retention) error {
 	_, err := db.Exec(`INSERT INTO request_logs(
 		id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
@@ -287,9 +304,29 @@ func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int
 		record.ToolCalls, record.TTFBMillis, record.LatencyMillis, record.CreditsConsumed, record.CreditSource,
 		record.Passthrough, record.ErrorCode, record.ErrorMessage)
 	if err == nil && writes%100 == 0 {
+		err = trimRequestLogsPostgres(db, retention)
+	}
+	return err
+}
+
+// trimRequestLogsPostgres 与 SQLite 版 trimRequestLogs 同语义：时间与条数
+// 双条件同时生效，任一命中即删。
+func trimRequestLogsPostgres(db postgresExecutor, retention Retention) error {
+	cutoff := retention.cutoffUnix(time.Now())
+	rowsCap := retention.rowsCap()
+	if cutoff == 0 && rowsCap == 0 {
+		return nil
+	}
+	var err error
+	if cutoff > 0 {
+		if _, err = db.Exec(`DELETE FROM request_logs WHERE created_at < $1`, cutoff); err != nil {
+			return err
+		}
+	}
+	if rowsCap > 0 {
 		_, err = db.Exec(`DELETE FROM request_logs WHERE log_id IN (
 			SELECT log_id FROM request_logs ORDER BY created_at DESC, log_id DESC OFFSET $1
-		)`, maxRequestLogs)
+		)`, rowsCap)
 	}
 	return err
 }

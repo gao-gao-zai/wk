@@ -28,6 +28,12 @@ type Config struct {
 	// 绕开基于 IP 的解锁锁定。
 	TrustedProxies []string `json:"trusted_proxies"`
 
+	// RequestLogRetentionDays 请求日志保留天数（时间条件）；0 = 不限时间。
+	// RequestLogRetentionRows 请求日志最大条数；0 = 不限条数。
+	// 两者同时为 0 时退化为旧默认（1 万条）。WebUI 可改（即时生效）。
+	RequestLogRetentionDays int `json:"request_log_retention_days"`
+	RequestLogRetentionRows int `json:"request_log_retention_rows"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。

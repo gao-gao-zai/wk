@@ -180,6 +180,7 @@ function Console() {
         billing: currentConfig.billing || current.billing,
         upstream: currentConfig.upstream || current.upstream,
         sms: currentConfig.sms || current.sms,
+        request_log_retention: currentConfig.request_log_retention || current.request_log_retention,
       }));
     } catch (error) {
       if (error.name === 'AbortError') return;
@@ -340,6 +341,27 @@ function Console() {
       });
       setConfig(current => ({ ...current, sms: { haozhuma: { ...(current.sms?.haozhuma || {}), sid } } }));
       message.success(result?.updated?.haozhuma_sid_restart_required ? '项目 ID 已保存，重启后生效' : '豪猪项目 ID 已切换，新取号立即生效');
+      return result;
+    } catch (error) {
+      message.error(error.message);
+      return null;
+    }
+  };
+
+  // saveRequestLogRetention 保存请求日志保留策略（天数 + 条数双条件）：
+  // 即时生效（下一次修剪按新值执行）。0 = 对应条件不限。
+  const saveRequestLogRetention = async retention => {
+    try {
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          checkin_hours: config.checkin_hours || [9],
+          keepalive_hours: config.keepalive_hours || [22],
+          request_log_retention: retention,
+        }),
+      });
+      setConfig(current => ({ ...current, request_log_retention: retention }));
+      message.success(result?.updated?.request_log_retention_restart_required ? '保留策略已保存，重启后生效' : '保留策略已保存并即时生效');
       return result;
     } catch (error) {
       message.error(error.message);
@@ -718,6 +740,48 @@ function Console() {
                   <InputNumber min={0} max={3600} style={{ width: 130 }} addonAfter="秒" />
                 </Form.Item>
                 <Button type="primary" htmlType="submit">保存超时</Button>
+              </Form>
+            </Card>
+          )}
+          {config.request_log_retention && (
+            <Card title="请求日志保留策略">
+              <Paragraph type="secondary" style={{ margin: '0 0 12px' }}>
+                两个条件**同时**生效，任一命中即删除（超过天数的旧行、超过条数的旧行）。
+                保存后即时生效（下一次修剪按新值执行）。0 = 该条件不限。
+                仪表盘时间窗统计基于这张表——保留量应大于日常统计窗口的请求量。
+              </Paragraph>
+              <Form
+                layout="inline"
+                onFinish={values => saveRequestLogRetention({
+                  days: Number(values.days) || 0,
+                  rows: Number(values.rows) || 0,
+                })}
+                initialValues={{
+                  days: config.request_log_retention?.days ?? 0,
+                  rows: config.request_log_retention?.rows ?? 10000,
+                }}
+              >
+                <Form.Item
+                  name="days"
+                  label={(
+                    <Tooltip title="保留最近 N 天的请求日志（0 = 不限时间，仅按条数）。范围 0-3650。">
+                      <span style={{ borderBottom: '1px dashed #bfbfbf' }}>保留天数</span>
+                    </Tooltip>
+                  )}
+                >
+                  <InputNumber min={0} max={3650} style={{ width: 140 }} addonAfter="天" />
+                </Form.Item>
+                <Form.Item
+                  name="rows"
+                  label={(
+                    <Tooltip title="最多保留的日志条数（0 = 不限条数，仅按时间）。范围 0-1000000。旧默认 1 万条。">
+                      <span style={{ borderBottom: '1px dashed #bfbfbf' }}>最大条数</span>
+                    </Tooltip>
+                  )}
+                >
+                  <InputNumber min={0} max={1000000} style={{ width: 170 }} addonAfter="条" />
+                </Form.Item>
+                <Button type="primary" htmlType="submit">保存策略</Button>
               </Form>
             </Card>
           )}

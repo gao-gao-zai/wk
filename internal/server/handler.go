@@ -64,6 +64,10 @@ type Config struct {
 	// 自动接上（见 NewHandler）；main 无需注入。nil = 自动加号未启用，
 	// WebUI 改 sid 只落盘（重启后生效）。
 	SetHaozhumaSid func(sid string)
+	// SetRequestLogRetention 运行时更新请求日志保留策略（main 注入：推给
+	// metricsstore 的 SetRetention）。nil = 未启用持久化存储，WebUI 改
+	// 保留策略只落盘（重启后生效）。
+	SetRequestLogRetention func(days, rows int)
 	// AutoEnroll 豪猪自动加号（NewHandler 内部组装）。nil = 未启用该端点。
 	AutoEnroll *AutoEnroller
 	// AutoEnrollLedger 号码账本落盘路径。号码取走后会占住豪猪的并发额度，
@@ -777,6 +781,11 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 				Sid string `json:"sid"`
 			} `json:"haozhuma"`
 		} `json:"sms"`
+		// 请求日志保留策略（WebUI 可改，运行时生效）。config.json 里是
+		// 平级的 request_log_retention_days / _rows；对前端组装成嵌套
+		// request_log_retention 对象（与 POST 补丁形状一致）。
+		RetentionDays int `json:"request_log_retention_days"`
+		RetentionRows int `json:"request_log_retention_rows"`
 	}
 	c.Features.ResponsesAPI = true
 	c.Upstream.TimeoutSeconds = 120
@@ -790,7 +799,29 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	if c.Upstream.StreamIdleSeconds < 0 {
 		c.Upstream.StreamIdleSeconds = 0
 	}
-	writeJSON(w, 200, c)
+	// 保留策略：老配置（两个键都不存在）显示旧默认 1 万条，让前端表单
+	// 有明确的初始值；双零（显式配了 0/0）同样按兜底语义回显默认值。
+	if c.RetentionDays == 0 && c.RetentionRows == 0 {
+		c.RetentionRows = 10000
+	}
+	resp := struct {
+		Schedule     any `json:"schedule"`
+		Region       any `json:"region"`
+		Features     any `json:"features"`
+		Billing      any `json:"billing"`
+		Upstream     any `json:"upstream"`
+		SMS          any `json:"sms"`
+		Retention    any `json:"request_log_retention"`
+	}{
+		Schedule:  c.Schedule,
+		Region:    c.Region,
+		Features:  c.Features,
+		Billing:   c.Billing,
+		Upstream:  c.Upstream,
+		SMS:       c.SMS,
+		Retention: map[string]int{"days": c.RetentionDays, "rows": c.RetentionRows},
+	}
+	writeJSON(w, 200, resp)
 }
 
 // featuresPatch / billingPatch 是 POST /admin/config 的可选字段组。
@@ -829,6 +860,13 @@ type smsPatch struct {
 	} `json:"haozhuma"`
 }
 
+// retentionPatch 请求日志保留策略（WebUI「日志保留」卡片）。
+// 指针区分"未提供"与"显式 0"：days=0 或 rows=0 表示对应条件不限。
+type retentionPatch struct {
+	Days *int `json:"days"`
+	Rows *int `json:"rows"`
+}
+
 func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
@@ -839,6 +877,7 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		Billing        *billingPatch  `json:"billing"`
 		Upstream       *upstreamPatch `json:"upstream"`
 		SMS            *smsPatch      `json:"sms"`
+		Retention      *retentionPatch `json:"request_log_retention"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
@@ -891,6 +930,24 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		for _, r := range sid {
 			if r < '0' || r > '9' {
 				writeJSON(w, 400, map[string]string{"error": "豪猪项目 ID 必须是数字（如 52283）"})
+				return
+			}
+		}
+	}
+	// 请求日志保留策略：天数 1-3650（10 年封顶），条数 100-1,000,000。
+	// 0 合法（= 该条件不限）；负数无意义直接拒。双零 = 回到旧默认 1 万条
+	//（metricsstore.Retention 的兜底语义），不需要在这里特判。
+	if req.Retention != nil {
+		for _, pair := range []struct {
+			v   *int
+			ok  func(int) bool
+			msg string
+		}{
+			{req.Retention.Days, func(v int) bool { return v == 0 || (v >= 1 && v <= 3650) }, "retention days 需为 0（不限）或 1-3650 天"},
+			{req.Retention.Rows, func(v int) bool { return v == 0 || (v >= 100 && v <= 1000000) }, "retention rows 需为 0（不限）或 100-1000000 条"},
+		} {
+			if pair.v != nil && !pair.ok(*pair.v) {
+				writeJSON(w, 400, map[string]string{"error": pair.msg})
 				return
 			}
 		}
@@ -981,6 +1038,23 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		sms["haozhuma"] = hz
 		doc["sms"] = sms
 	}
+	if req.Retention != nil && (req.Retention.Days != nil || req.Retention.Rows != nil) {
+		// 未显式给出的字段沿用文件当前值（增量补丁语义，与 features 一致）。
+		cur := struct {
+			Days int `json:"request_log_retention_days"`
+			Rows int `json:"request_log_retention_rows"`
+		}{}
+		_ = json.Unmarshal(raw, &cur)
+		days, rows := cur.Days, cur.Rows
+		if req.Retention.Days != nil {
+			days = *req.Retention.Days
+		}
+		if req.Retention.Rows != nil {
+			rows = *req.Retention.Rows
+		}
+		doc["request_log_retention_days"] = days
+		doc["request_log_retention_rows"] = rows
+	}
 
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
@@ -1003,6 +1077,27 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 			// 已落盘但没注入回调（老部署/测试）：重启后生效，如实告知。
 			updated["haozhuma_sid"] = sid
 			updated["haozhuma_sid_restart_required"] = true
+		}
+	}
+	if req.Retention != nil && (req.Retention.Days != nil || req.Retention.Rows != nil) {
+		cur := struct {
+			Days int `json:"request_log_retention_days"`
+			Rows int `json:"request_log_retention_rows"`
+		}{}
+		_ = json.Unmarshal(raw, &cur)
+		days, rows := cur.Days, cur.Rows
+		if req.Retention.Days != nil {
+			days = *req.Retention.Days
+		}
+		if req.Retention.Rows != nil {
+			rows = *req.Retention.Rows
+		}
+		if h.cfg.SetRequestLogRetention != nil {
+			h.cfg.SetRequestLogRetention(days, rows)
+			updated["request_log_retention"] = map[string]int{"days": days, "rows": rows}
+		} else {
+			updated["request_log_retention"] = map[string]int{"days": days, "rows": rows}
+			updated["request_log_retention_restart_required"] = true
 		}
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "updated": updated})

@@ -216,18 +216,26 @@ func main() {
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
+	// 请求日志保留策略：天数与条数双条件（任一命中即删，详见 Retention）。
+	retention := metricsstore.Retention{
+		MaxRows: cfg.RequestLogRetentionRows,
+		MaxAge:  time.Duration(cfg.RequestLogRetentionDays) * 24 * time.Hour,
+	}.OrDefault()
 	var metricsDB metricsstore.Backend
 	if cfg.Postgres.DSN != "" {
 		metricsDB, err = metricsstore.OpenPostgres(cfg.Postgres.DSN, cfg.Postgres.MaxOpenConns, cfg.Postgres.MaxIdleConns, cfg.PostgresMaxLifetime, cfg.PostgresMaxIdleTime)
+		if ps, ok := metricsDB.(*metricsstore.PostgresStore); ok {
+			ps.SetRetention(retention)
+		}
 		if err != nil && cfg.Postgres.FallbackToSQLite {
 			log.Printf("metrics postgres unavailable: %v; falling back to sqlite", err)
-			metricsDB, err = metricsstore.Open(filepath.Join(filepath.Dir(cfg.StateFile), "metrics.db"))
+			metricsDB, err = metricsstore.Open(filepath.Join(filepath.Dir(cfg.StateFile), "metrics.db"), retention)
 		}
 		if err != nil {
 			log.Printf("metrics postgres unavailable: %v; using in-memory metrics", err)
 		}
 	} else {
-		metricsDB, err = metricsstore.Open(filepath.Join(filepath.Dir(cfg.StateFile), "metrics.db"))
+		metricsDB, err = metricsstore.Open(filepath.Join(filepath.Dir(cfg.StateFile), "metrics.db"), retention)
 		if err != nil {
 			log.Printf("metrics sqlite unavailable: %v; using in-memory metrics", err)
 		}
@@ -379,6 +387,16 @@ func main() {
 		MetricsStore:     persistentMetrics,
 		RequestLogStore:  requestLogs,
 		CompletionStore:  completions,
+		// WebUI 改请求日志保留策略后即时推给 metricsstore（下一次修剪
+		// 每 100 条写入触发——按新值执行）。
+		SetRequestLogRetention: func(days, rows int) {
+			if metricsDB != nil {
+				metricsDB.SetRetention(metricsstore.Retention{
+					MaxRows: rows,
+					MaxAge:  time.Duration(days) * 24 * time.Hour,
+				})
+			}
+		},
 		CreditPolicy: server.CreditPolicy{
 			InputPer1K:       cfg.Billing.InputCreditsPer1KTokens,
 			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,
@@ -551,3 +569,4 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 	}
 	return nil
 }
+

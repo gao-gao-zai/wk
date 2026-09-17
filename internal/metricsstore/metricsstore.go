@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -67,6 +68,7 @@ type Store struct {
 	db            *sql.DB
 	mu            sync.Mutex
 	requestWrites int
+	retention     atomic.Pointer[Retention]
 }
 
 // Backend is the common persistence contract used by the server. Store and
@@ -81,6 +83,10 @@ type Backend interface {
 	QueryRequests(RequestFilter) ([]RequestRecord, error)
 	SummarizeRequests(RequestFilter) (RequestSummary, error)
 	Snapshot() (Snapshot, error)
+	// SetRetention 运行时更新 request_logs 保留策略（WebUI 即时生效）。
+	SetRetention(Retention)
+	// RetentionPolicy 返回当前策略（回显用）。
+	RetentionPolicy() Retention
 	Close() error
 }
 
@@ -122,9 +128,51 @@ type RequestSummary struct {
 	CreditsConsumed  float64 `json:"credits_consumed"`
 }
 
+// maxRequestLogs 是 Retention.MaxRows 为零（不限条数）时的兜底上限。
+// 零值兜底是为了防止"两个条件都没配"时表无限增长；只要显式配置了
+// 任一条件（rows 或 days），兜底不再参与。
 const maxRequestLogs = 10000
 
-func Open(path string) (*Store, error) {
+// Retention 描述 request_logs 的保留策略：两个条件**同时**生效，
+// 满足任一即删除（超过天数的老行、超过条数的旧行）。
+//   - MaxRows：最多保留的行数；0 = 不限条数（仅按时间）。
+//   - MaxAge：最早保留的时间窗；0 = 不限时间（仅按条数）。
+//   - 两者都为 0 时退化为 maxRequestLogs 兜底（与旧行为一致）。
+//
+// 无锁读取：写路径每 N 条修剪一次，用 atomic.Pointer 快照。
+type Retention struct {
+	MaxRows int
+	MaxAge  time.Duration
+}
+
+// cutoffUnix 返回时间条件的最老 created_at（秒）；0 = 无时间条件。
+func (r Retention) cutoffUnix(now time.Time) int64 {
+	if r.MaxAge <= 0 {
+		return 0
+	}
+	return now.Add(-r.MaxAge).Unix()
+}
+
+// rowsCap 返回条数上限；0 = 不按条数删。
+func (r Retention) rowsCap() int {
+	if r.MaxRows < 0 {
+		return 0
+	}
+	if r.MaxRows == 0 && r.MaxAge <= 0 {
+		return maxRequestLogs // 双零兜底，见类型注释
+	}
+	return r.MaxRows
+}
+
+// orDefault 给 Open 时的初值归一：零值 → 旧默认（1 万条）。
+func (r Retention) OrDefault() Retention {
+	if r.MaxRows == 0 && r.MaxAge <= 0 {
+		return Retention{MaxRows: maxRequestLogs}
+	}
+	return r
+}
+
+func Open(path string, retention ...Retention) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create metrics directory: %w", err)
@@ -195,7 +243,13 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	if len(retention) > 0 {
+		s.SetRetention(retention[0])
+	} else {
+		s.SetRetention(Retention{}) // orDefault → 旧默认 1 万条
+	}
+	return s, nil
 }
 
 func migrateRequestLogs(ctx context.Context, db *sql.DB) error {
@@ -334,7 +388,7 @@ func (s *Store) AddCredit(consumed float64, source string) error {
 func (s *Store) RecordRequest(record RequestRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := insertRequest(s.db, record, s.requestWrites+1)
+	err := insertRequest(s.db, record, s.requestWrites+1, s.RetentionPolicy())
 	if err == nil {
 		s.requestWrites++
 	}
@@ -355,7 +409,7 @@ func (s *Store) RecordCompletion(delta Snapshot, record RequestRecord) error {
 	if err = addDelta(tx, delta); err != nil {
 		return err
 	}
-	if err = insertRequest(tx, record, s.requestWrites+1); err != nil {
+	if err = insertRequest(tx, record, s.requestWrites+1, s.RetentionPolicy()); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err == nil {
@@ -407,7 +461,21 @@ func (s *Store) ReconcileRequestCredit(id string, credit float64) error {
 	return tx.Commit()
 }
 
-func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {
+// SetRetention 更新保留策略（运行时可调，WebUI 即时生效）。下一次
+// 修剪（每 100 条写入触发一次）按新值执行；atomic 保证无锁读取。
+func (s *Store) SetRetention(r Retention) {
+	s.retention.Store(&r)
+}
+
+// RetentionPolicy 返回当前策略（观测/回显用）。
+func (s *Store) RetentionPolicy() Retention {
+	if p := s.retention.Load(); p != nil {
+		return *p
+	}
+	return Retention{}
+}
+
+func insertRequest(db metricsExecutor, record RequestRecord, writes int, retention Retention) error {
 	_, err := db.Exec(`INSERT INTO request_logs(
 		id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
@@ -419,12 +487,32 @@ func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {
 		record.ToolCalls, record.TTFBMillis, record.LatencyMillis, record.CreditsConsumed, record.CreditSource,
 		boolInt(record.Passthrough), record.ErrorCode, record.ErrorMessage,
 	)
-	if err == nil {
-		if writes%100 == 0 {
-			_, err = db.Exec(`DELETE FROM request_logs WHERE rowid IN (
-				SELECT rowid FROM request_logs ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
-			)`, maxRequestLogs)
+	if err == nil && writes%100 == 0 {
+		err = trimRequestLogs(db, retention)
+	}
+	return err
+}
+
+// trimRequestLogs 按保留策略删除旧行：时间条件（created_at 早于截止）与
+// 条数条件（按 created_at DESC 保留前 rowsCap 行）同时生效，任一命中即删。
+// 两个条件都为空时什么都不做（但 rowsCap 的双零兜底保证不会走到这里，
+// 除非调用方显式传零值——那也符合"不限"的字面语义，尊重之）。
+func trimRequestLogs(db metricsExecutor, retention Retention) error {
+	cutoff := retention.cutoffUnix(time.Now())
+	rowsCap := retention.rowsCap()
+	if cutoff == 0 && rowsCap == 0 {
+		return nil
+	}
+	var err error
+	if cutoff > 0 {
+		if _, err = db.Exec(`DELETE FROM request_logs WHERE created_at < ?`, cutoff); err != nil {
+			return err
 		}
+	}
+	if rowsCap > 0 {
+		_, err = db.Exec(`DELETE FROM request_logs WHERE rowid IN (
+			SELECT rowid FROM request_logs ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
+		)`, rowsCap)
 	}
 	return err
 }
@@ -589,3 +677,4 @@ func boolInt(value bool) int {
 	}
 	return 0
 }
+
