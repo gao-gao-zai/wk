@@ -62,11 +62,15 @@ func (e *Error) Error() string {
 }
 
 // hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
+//
+// 上游 14018 的实际措辞是"额度已用尽"（多一个"已"字）——它不是"额度用尽"
+// 的子串，历史上因此漏判成 soft_rate，额度耗尽的号只冷却 60s 就被重新捞出，
+// 反复撞 429。这里同时收录两种措辞与数字码 14018 本身（信封 code 通道）。
 var hardMarkers = []string{
 	"insufficient credit", "no credit", "credit exhausted", "out of credit",
 	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
 	"not enough credit",
-	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
+	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "额度已用尽", "没有积分",
 }
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
@@ -74,6 +78,11 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
+		return ErrHardCredit
+	}
+	// 14018 是上游"额度已用尽（需购买加量包）"的确定性数字码：关键词措辞
+	// 可能再变，数字码稳定，放在关键词匹配之前做精确判定。
+	if isHardCredit1418(body) {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
@@ -103,6 +112,19 @@ func Classify(status int, body string) ErrKind {
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
 	return ErrNone
+}
+
+// isHardCredit1418 识别上游信封里的 code=14018（额度已用尽，购买加量包）。
+// 与 isRateLimit6004 同构：正文可能被外层信封包裹（如最终 503 携带原始 JSON），
+// 因此除标准解析外再做一次 "code":14018 的宽松子串匹配。
+func isHardCredit1418(body string) bool {
+	var envelope struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err == nil && envelope.Code == 14018 {
+		return true
+	}
+	return strings.Contains(body, `"code":14018`) || strings.Contains(body, `"code":"14018"`)
 }
 
 func isRateLimit6004(body string) bool {

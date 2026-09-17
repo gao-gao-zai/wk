@@ -25,6 +25,12 @@ func TestClassify(t *testing.T) {
 		{403, `insufficient credits`, ErrHardCredit},
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
+		// 线上 14018 实际形态：措辞是"额度已用尽"（多了"已"字），旧 hardMarkers
+		// 只收录"额度用尽"匹配不上，曾漏判成 soft_rate 反复撞 429。
+		{429, `{"error":{"data":{"code":14018,"msg":"额度已用尽，请访问以下链接，购买加量包以获取更多额度：https://www.codebuddy.cn/profile/usage ","requestId":"714a2bd4"}}}`, ErrHardCredit},
+		{429, `{"code":14018,"msg":"额度已用尽"}`, ErrHardCredit},
+		// 外层信封包裹原始 JSON 的形态（如最终 503 携带上游原文）。
+		{503, `all accounts unavailable: upstream soft_rate (http 429): {"code":14018,"msg":"额度已用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
 		{503, `{"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-09-11 17:58:44 UTC+8 重置"}`, ErrSoftRate},
 		{503, `all accounts unavailable (cooling/disabled): upstream soft_rate (http 429): {"code":6004,"msg":"将在 2026-09-11 17:58:44 UTC+8 重置"}`, ErrSoftRate},
