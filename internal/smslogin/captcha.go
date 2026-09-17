@@ -148,7 +148,18 @@ func (s *TwoCaptchaSolver) httpClient() *http.Client {
 	if s.client != nil {
 		return s.client
 	}
-	return &http.Client{Timeout: 30 * time.Second}
+	// http.DefaultTransport 的 MaxIdleConnsPerHost 只有 2：solver 轮询
+	// 打码平台（每 5s 一次 res.php）在多会话并发时会反复重建连接。
+	// 2captcha 是 HTTPS，每次握手多花几百毫秒，轮询间隔还会被拉长。
+	// 超时交给请求级 context，Transport 只管连接复用。
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 }
 
 func (s *TwoCaptchaSolver) wait(ctx context.Context, d time.Duration) error {

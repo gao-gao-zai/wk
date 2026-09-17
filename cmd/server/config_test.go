@@ -353,3 +353,64 @@ func TestAutoEnrollLedgerPath(t *testing.T) {
 		t.Fatalf("got %q want empty when state_file is unset", got)
 	}
 }
+
+// pprof 默认关闭：生产默认不该多开一个无鉴权端口。
+func TestPprofDisabledByDefault(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pprof.Enabled {
+		t.Error("pprof.enabled want false by default")
+	}
+	if c.PprofAddr != "" {
+		t.Errorf("PprofAddr=%q want empty when disabled", c.PprofAddr)
+	}
+}
+
+// 显式开启后：默认地址是 127.0.0.1:6060，env/文件可覆盖地址。
+func TestPprofEnabledUsesLoopbackDefaultAndOverrides(t *testing.T) {
+	t.Setenv("WB2A_PPROF_ENABLED", "true")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PprofAddr != "127.0.0.1:6060" {
+		t.Fatalf("PprofAddr=%q want 127.0.0.1:6060", c.PprofAddr)
+	}
+
+	t.Setenv("WB2A_PPROF_ADDR", "127.0.0.1:7777")
+	c, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PprofAddr != "127.0.0.1:7777" {
+		t.Fatalf("PprofAddr=%q want 127.0.0.1:7777", c.PprofAddr)
+	}
+}
+
+// pprof 地址必须是显式 host:port 且绑定具体接口：无鉴权端点绑 0.0.0.0 等于
+// 把堆数据（含内存里的密钥）开放给任何能连到该端口的人。":6060" 与空 host 同罪。
+// addr="" 是合法的（= 用默认 127.0.0.1:6060），单独测；其余非法。
+func TestPprofRejectsWildcardOrMissingHost(t *testing.T) {
+	for _, addr := range []string{":6060", "0.0.0.0:6060", "[::]:6060", "6060", "   "} {
+		c := Default()
+		c.Pprof.Enabled = true
+		c.Pprof.Addr = addr
+		if err := c.normalize(); err == nil {
+			t.Errorf("addr=%q want error (wildcard/missing host rejected)", addr)
+		}
+	}
+	// 合法：具体回环/内网地址；空串回落默认地址。
+	for _, addr := range []string{"127.0.0.1:6060", "10.0.0.5:6060", "[::1]:6060", ""} {
+		c := Default()
+		c.Pprof.Enabled = true
+		c.Pprof.Addr = addr
+		if err := c.normalize(); err != nil {
+			t.Errorf("addr=%q unexpected error: %v", addr, err)
+		}
+		if c.PprofAddr == "" {
+			t.Errorf("addr=%q PprofAddr empty after normalize", addr)
+		}
+	}
+}

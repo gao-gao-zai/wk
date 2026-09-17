@@ -47,13 +47,24 @@ type Client struct {
 	ISP string
 }
 
+// newHTTPClient 打码/接码平台的共享 client。DefaultTransport 的
+// MaxIdleConnsPerHost=2 会让轮询（GetPhone/轮询收码）频繁重建连接；
+// 这里克隆 DefaultTransport 并放宽到 8——单账号场景足够，取号轮询的
+// 并发度不会更高。
+func newHTTPClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 8
+	tr.MaxIdleConnsPerHost = 8
+	return &http.Client{Transport: tr}
+}
+
 // New(token) 建客户端。
 func New(token string) *Client {
 	return &Client{
 		Base:    "https://api.haozhuma.com/sms/",
 		Token:   token,
 		Timeout: 15 * time.Second,
-		HTTP:    &http.Client{},
+		HTTP:    newHTTPClient(),
 	}
 }
 
@@ -95,7 +106,7 @@ func Login(user, password string) (*Client, error) {
 	c := &Client{
 		Base:    "https://api.haozhuma.com/sms/",
 		Timeout: 15 * time.Second,
-		HTTP:    &http.Client{},
+		HTTP:    newHTTPClient(),
 	}
 	raw, err := c.call(context.Background(), "login", url.Values{
 		"user": {user}, "pass": {password},

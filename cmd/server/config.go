@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -33,6 +34,15 @@ type Config struct {
 	// 两者同时为 0 时退化为旧默认（1 万条）。WebUI 可改（即时生效）。
 	RequestLogRetentionDays int `json:"request_log_retention_days"`
 	RequestLogRetentionRows int `json:"request_log_retention_rows"`
+
+	// Pprof pprof 性能分析端点（net/http/pprof）。
+	Pprof struct {
+		// Enabled 是否启用；默认 false（生产默认不开）。
+		Enabled bool `json:"enabled"`
+		// Addr 监听地址，默认 "127.0.0.1:6060"。必须是显式地址（host:port），
+		// pprof 无鉴权，绝不能绑定 0.0.0.0（除非前面还有一层带鉴权的反代）。
+		Addr string `json:"addr"`
+	} `json:"pprof"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -178,6 +188,8 @@ type Config struct {
 	StreamTimeoutDur time.Duration `json:"-"`
 	// StreamIdleDur 流式空闲上限；0 = 不检查。
 	StreamIdleDur time.Duration `json:"-"`
+	// PprofAddr 解析后的 pprof 监听地址；Enabled=false 时为空。
+	PprofAddr string `json:"-"`
 }
 
 // Default 默认配置。
@@ -218,6 +230,7 @@ func Default() *Config {
 	c.Postgres.MaxIdleConns = 8
 	c.Postgres.ConnMaxLifetime = "30m"
 	c.Postgres.ConnMaxIdleTime = "5m"
+	c.Pprof.Addr = "127.0.0.1:6060"
 	return c
 }
 
@@ -327,6 +340,14 @@ func applyEnv(c *Config) {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.Passthrough = b
 		}
+	}
+	if v := os.Getenv("WB2A_PPROF_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Pprof.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_PPROF_ADDR"); v != "" {
+		c.Pprof.Addr = v
 	}
 	if v := os.Getenv("WB2A_CODEX_COMPAT"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -442,6 +463,25 @@ func (c *Config) normalize() error {
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	// pprof：只有显式开启才生效。地址默认 127.0.0.1:6060；显式给 ":port"
+	// 或 0.0.0.0 拒绝——pprof 端点无鉴权，暴露出去等于把堆内存/goroutine
+	// 全量数据（通常含密钥）送给任何能连到该端口的人。
+	if c.Pprof.Enabled {
+		addr := strings.TrimSpace(c.Pprof.Addr)
+		if addr == "" {
+			addr = "127.0.0.1:6060"
+		}
+		// 配置文件里显式写了空串 = 想要默认地址之外的错误写法，直接报错
+		// 提示正确写法，而不是静默落到默认值（静默会让 ":6060" 看起来"能用"）。
+		if strings.TrimSpace(c.Pprof.Addr) == "" && c.Pprof.Addr != "" {
+			return fmt.Errorf("pprof.addr must be an explicit host:port (e.g. 127.0.0.1:6060), got %q", c.Pprof.Addr)
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil || host == "" || host == "0.0.0.0" || host == "::" {
+			return fmt.Errorf("pprof.addr must be an explicit host:port bound to a specific interface (e.g. 127.0.0.1:6060), got %q", c.Pprof.Addr)
+		}
+		c.PprofAddr = addr
 	}
 	return nil
 }
