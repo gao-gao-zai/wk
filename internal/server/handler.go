@@ -75,6 +75,10 @@ type Config struct {
 	// 容器被 SIGKILL 重启也能在下次启动时补释放（见 ReclaimOrphans）。
 	// 空 = 不落盘（只用内存账本，任务收尾仍会兜底释放）。
 	AutoEnrollLedger string
+	// SMSDebugPath SMS 诊断日志路径（state.json 同目录；空 = 关闭）。
+	// 记录完整手机号与短信原文，只落本机文件不回传控制台，1 MiB 上限
+	// 自动轮转。见 AutoEnroller.smsDebug。
+	SMSDebugPath string
 	UpdateSchedule   func(checkinHours, keepaliveHours []int)
 	MaxRotate        int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
@@ -281,6 +285,7 @@ func NewHandler(cfg Config) *Handler {
 			},
 		)
 		h.cfg.AutoEnroll.SetLedgerPath(cfg.AutoEnrollLedger)
+		h.cfg.AutoEnroll.SetSMSDebugPath(cfg.SMSDebugPath)
 		// WebUI 运行时切换项目 ID 直接推给 AutoEnroll（组装在 NewHandler
 		// 内部，main 拿不到指针，这里自接回调最省事）。
 		h.cfg.SetHaozhumaSid = h.cfg.AutoEnroll.SetSid

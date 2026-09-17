@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -102,6 +103,10 @@ type AutoEnroller struct {
 	// 内存里的账本直接消失，号就永远留在豪猪那边占额度。启动时读回来
 	// 补释放一次（见 ReclaimOrphans）。
 	ledgerPath string
+	// smsDebugPath SMS 诊断日志路径（空 = 关闭）。记录完整手机号与短信
+	// 原文（不脱敏），只落服务器本机文件（data/ 卷，0600），不回传控制台。
+	// 上限 1 MiB 自动轮转。见 smsDebug。
+	smsDebugPath string
 }
 
 // 并发默认值与上限。并发加号靠代理池撑：每个号一个独立出口 IP
@@ -833,6 +838,70 @@ func (a *AutoEnroller) SetLedgerPath(path string) {
 	a.mu.Unlock()
 }
 
+// smsDebug 写一条 SMS 诊断日志（完整手机号 + 完整短信原文）。
+//
+// 与 logf 的区别：logf 进控制台回显、强制脱敏；smsDebug 只落服务器本机
+// 文件（data/ 卷，权限 0600），不回传任何 HTTP 接口——用于"验证码错误"
+// 类问题的离线归因（收到的是通知短信还是真码、旧短信还是新短信）。
+//
+// 文件上限 maxSMSDebugBytes：超限时丢掉前一半（保留最近记录），从完整
+// 行边界开始。写失败静默忽略——诊断日志不能影响加号主流程。
+//
+// 并发：多 worker 同时收码时会并发调用。轮转用"读-改-写"整个文件，
+// 竞争窗口内最多丢一条诊断行或轮转多做一次，无碍；不值得为此加锁。
+func (a *AutoEnroller) smsDebug(format string, args ...any) {
+	a.mu.Lock()
+	path := a.smsDebugPath
+	a.mu.Unlock()
+	if path == "" {
+		return
+	}
+	line := time.Now().Format("2006-01-02 15:04:05 ") + fmt.Sprintf(format, args...) + "\n"
+	_ = smsDebugWrite(path, line)
+}
+
+// smsDebugWrite 追加一行，超上限先轮转。
+func smsDebugWrite(path, line string) error {
+	if fi, err := os.Stat(path); err == nil && fi.Size()+int64(len(line)) > maxSMSDebugBytes {
+		if err := rotateSMSDebug(path); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(line)
+	return err
+}
+
+// rotateSMSDebug 丢掉文件前一半内容，保留从完整行开始的后一半。
+func rotateSMSDebug(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return err
+	}
+	keep := data[len(data)/2:]
+	// 从第一个换行后开始（丢掉被切成两半的首行）。
+	if idx := bytes.IndexByte(keep, '\n'); idx >= 0 && idx < len(keep)-1 {
+		keep = keep[idx+1:]
+	}
+	return os.WriteFile(path, keep, 0600)
+}
+
+// maxSMSDebugBytes SMS 诊断日志的单文件上限（1 MiB）。手机号+短信原文
+// 每条约 200 字节，1 MiB ≈ 5000 条记录，足够覆盖一次大规模加号任务。
+const maxSMSDebugBytes = 1 << 20
+
+// SetSMSDebugPath 设置 SMS 诊断日志路径（空 = 关闭）。由 main 注入，
+// 放在 data/ 卷（与账本同目录）。
+func (a *AutoEnroller) SetSMSDebugPath(path string) {
+	a.mu.Lock()
+	a.smsDebugPath = path
+	a.mu.Unlock()
+}
+
 // ReleaseAllHeld 一键释放豪猪名下所有占用号码（cancelAllRecv）。
 //
 // 与逐号兜底（releaseAllHeld）的区别：cancelAllRecv 是平台侧全量操作，
@@ -1047,6 +1116,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 				return false, true, perr
 			}
 			// 接码成功：只释放不拉黑（对齐豪猪官方 SDK next_code 语义）。
+			a.smsDebug("[%s] 验码成功 phone=%s code=%s uid=%s", sid, phone, code, creds.UID)
 			// 分组登记失败只告警不影响加号结果：账号已落盘可用，分组是
 			// 归属元数据，用户可以在账号列表里事后补设。
 			a.mu.Lock()
@@ -1060,12 +1130,16 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 			return true, true, nil
 		}
 		a.logf("号 %s 验码失败: %v", phone, verr)
+		// 诊断日志：验码失败的号 + 提交的码 + 上游错误全文——结合
+		// pollCode 记的短信原文即可归因（码从哪条短信来、上游为何拒绝）。
+		a.smsDebug("[%s] 验码失败 phone=%s code=%s err=%v", sid, phone, code, verr)
 		finish(true)
 		return false, true, verr
 	}
 
 	// 等不到码：拉黑 + 释放，换下一个号。
 	a.logf("号 %s 未收到验证码: %v（已拉黑）", phone, waitErr)
+	a.smsDebug("[%s] 收码超时 phone=%s err=%v", sid, phone, waitErr)
 	finish(true)
 	return false, true, waitErr
 }
@@ -1122,7 +1196,15 @@ func (a *AutoEnroller) pollCode(ctx context.Context, sid, phone string, count in
 		}
 		polls++
 		if code := haozhuma.ExtractCode(sms); code != "" {
+			// 诊断日志（本机文件，不脱敏）：完整短信原文 + 提取到的码，
+			// 用于"验证码错误"归因（通知短信混入 / 旧短信 / 真码过期）。
+			a.smsDebug("[%s] 轮 %d 收到短信 phone=%s code=%s sms=%q", a.currentSid(), polls, phone, code, sms)
 			return code, nil
+		}
+		// 等待期间收到过非验证码短信也记一条（ExtractCode 没抠出码的原文），
+		// 排查"通知短信抢先到达"时能看到它长什么样。
+		if strings.TrimSpace(sms) != "" {
+			a.smsDebug("[%s] 轮 %d 无码短信 phone=%s sms=%q", a.currentSid(), polls, phone, sms)
 		}
 		// 最后一轮之后不用再等：没有下一次查询了。
 		if polls >= count {

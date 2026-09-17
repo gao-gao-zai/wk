@@ -273,8 +273,9 @@ Disabled ←────┘ (session 死亡，永久)
 
 每个 Chat Completions 和 Responses 请求结束后都会写入配置的指标存储：默认是 `state_file` 同目录的
 `metrics.db`，配置 PostgreSQL DSN 后则写入 PostgreSQL。记录只包含模型、路由、状态、账号 UID、token、耗时、积分来源和错误码，
-不会保存提示词或模型输出，但会保存最多 1,024 字符的错误详情。数据库保留最近 10,000 条，`GET /requests?limit=50`
-可查询最近记录，控制台也会展示同一份数据。
+不会保存提示词或模型输出，但会保存最多 1,024 字符的错误详情。保留策略为**天数+条数双条件**（`request_log_retention_days` /
+`request_log_retention_rows`，任一命中即删；0 = 对应条件不限，双零退化为默认 1 万条），控制台「管理设置」可改、即时生效。
+`GET /requests?limit=50` 可查询最近记录，控制台也会展示同一份数据。
 控制台“请求日志”菜单支持按模型、端点、账号、错误、流式/同步/透传和成功状态筛选，并可展开查看缓存 token、工具调用与完整错误详情。
 
 stdout 同时保留一行便于排查的表格日志：

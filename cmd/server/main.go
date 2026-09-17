@@ -7,6 +7,9 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	// 注册 pprof handler 到 http.DefaultServeMux（上面 ListenAndServe 用的是
+	// nil handler = DefaultServeMux）。主服务 handler 是显式传入的 h，不受影响。
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -379,6 +382,8 @@ func main() {
 		HaozhumaSid:    strings.TrimSpace(cfg.SMS.Haozhuma.Sid),
 		// 号码账本放在 state.json 同目录（部署时该目录已挂载为卷）。
 		AutoEnrollLedger: autoEnrollLedgerPath(cfg),
+		// SMS 诊断日志同目录（data/ 卷内）：完整手机号+短信原文，本机排障用。
+		SMSDebugPath: smsDebugLogPath(cfg),
 		UpdateSchedule:   sch.UpdateSchedule,
 		Session:          sessRouter,
 		StickyCount:      sessCount,
@@ -433,6 +438,18 @@ func main() {
 	go sch.RunCreditRefreshNow()
 	go sch.RunRequestCreditRefreshNow()
 	go sch.Run(ctx)
+
+	// pprof 性能分析端点（默认关，见 config.Pprof 注释：无鉴权，只允许绑回环）。
+	// CPU profile 会带来 ~几% 开销，heap/goroutine 基本零成本——平时不开，
+	// 需要抓瓶颈时再 WB2A_PPROF_ENABLED=true。
+	if cfg.PprofAddr != "" {
+		go func() {
+			log.Printf("pprof listening on http://%s/debug/pprof/", cfg.PprofAddr)
+			if err := http.ListenAndServe(cfg.PprofAddr, nil); err != nil {
+				log.Printf("pprof: %v", err)
+			}
+		}()
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -497,6 +514,16 @@ func autoEnrollLedgerPath(cfg *Config) string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(sf), "autoenroll-held.json")
+}
+
+// smsDebugLogPath SMS 诊断日志路径：与号码账本同目录（data/ 卷，容器重建
+// 不丢；0600 权限在 smsDebug 的 OpenFile 里设置）。StateFile 为空 = 关闭。
+func smsDebugLogPath(cfg *Config) string {
+	sf := strings.TrimSpace(cfg.StateFile)
+	if sf == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(sf), "sms-debug.log")
 }
 
 // groupsStoreDir 分组/密钥存储目录：与 state.json 同目录（同 autoEnrollLedgerPath
