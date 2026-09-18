@@ -117,6 +117,23 @@ func (j *growthJob) finishItem(item growthJobItem) {
 	j.mu.Unlock()
 }
 
+// accountDone all 模式：一个账号处理完（进度 +1，不动 results）。
+// 与 finishItem 分开：账号粒度的 done/total 才是稳定分母（启动即知账号数），
+// 任务项明细用 appendResult 只进 results。
+func (j *growthJob) accountDone() {
+	j.mu.Lock()
+	j.done++
+	j.current = ""
+	j.mu.Unlock()
+}
+
+// appendResult 追加结果明细不动进度计数（all 模式的任务项）。
+func (j *growthJob) appendResult(item growthJobItem) {
+	j.mu.Lock()
+	j.results = append(j.results, item)
+	j.mu.Unlock()
+}
+
 func (j *growthJob) finish(phase, errMsg string) {
 	j.mu.Lock()
 	j.phase = phase
@@ -299,6 +316,7 @@ func (h *Handler) ResumeGrowthJobsAfterRestart() {
 		pending = append(pending, aj.uid)
 	}
 	job := h.growthJobs.newJob("", "all")
+	job.setTotal(len(accounts)) // 进度 = 账号粒度（启动即知分母）
 	// 延迟几秒再开跑：让服务先把监听/健康检查立起来，部署脚本不误判启动失败。
 	go func() {
 		time.Sleep(5 * time.Second)

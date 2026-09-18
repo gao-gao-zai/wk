@@ -827,6 +827,10 @@ func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request)
 		pending = append(pending, aj.uid)
 	}
 	job := h.growthJobs.newJob("", "all")
+	// 进度分母 = 账号总数（启动即知），分子 = 已完成账号数。任务项明细进
+	// results 但不参与 done/total——否则 total 只能逐账号累加，进度条全程
+	// 显示 0/? 或追赶态，用户看不出"85 个账号跑到第几个"。
+	job.setTotal(len(accounts))
 	go h.runAllAccountsPipeline(job, accounts, pending)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok": true, "job_id": job.ID, "total_accounts": len(accounts),
@@ -843,8 +847,8 @@ func (h *Handler) runAllAccountsPipeline(job *growthJob, accounts []accountJobTy
 	for _, aj := range accounts {
 		job.noteCurrent("账号 " + aj.uid)
 		if !h.growthLocks.tryLock(aj.uid) {
-			job.addTotal(1)
 			job.finishItem(growthJobItem{UID: aj.uid, OK: false, Message: "该账号有任务动作正在执行中，跳过"})
+			job.accountDone()
 		} else {
 			h.runGrowthAllForJobAll(aj.a, job)
 			h.growthLocks.unlock(aj.uid)
@@ -863,21 +867,22 @@ func (h *Handler) runAllAccountsPipeline(job *growthJob, accounts []accountJobTy
 }
 
 // runGrowthAllForJobAll 单账号全量流水线，结果逐项合入 all 模式的 job
-// （进度按任务项推进，明细条目带 uid 区分账号；列表拉取失败记一条错误后继续下个账号）。
+// （进度按账号粒度推进：本函数结束 = done+1；任务项明细进 results 但
+// 不计入 done/total，明细条目带 uid 区分账号）。
 func (h *Handler) runGrowthAllForJobAll(a *auth.Auth, job *growthJob) {
 	uid := a.Snapshot().UID
 	items, ok := h.runGrowthAllCollect(a, func(code, desc string) {
 		job.noteCurrent(uid + "｜" + code)
 	})
-	job.addTotal(len(items))
 	if !ok {
 		job.finishItem(growthJobItem{UID: uid, OK: false, Message: "任务列表拉取失败"})
-		return
+	} else {
+		for _, item := range items {
+			item.UID = uid
+			job.appendResult(item)
+		}
 	}
-	for _, item := range items {
-		item.UID = uid
-		job.finishItem(item)
-	}
+	job.accountDone()
 }
 
 // runGrowthAllCollect 带逐项回调的全量流水线（all 模式复用；onStart 在每项

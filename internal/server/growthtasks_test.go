@@ -351,6 +351,10 @@ func TestAllAccountsAutoAllJob(t *testing.T) {
 	if snap["phase"] != "done" {
 		t.Fatalf("phase = %v, want done (snap=%v)", snap["phase"], snap)
 	}
+	// 进度 = 账号粒度：2 个账号全部完成。
+	if snap["done"].(float64) != 2 || snap["total"].(float64) != 2 {
+		t.Fatalf("done/total = %v/%v, want 2/2 (account granularity)", snap["done"], snap["total"])
+	}
 	// 每账号 2 项任务（chat_5 + first_buddy）× 2 账号 = 4（all 模式无报名条目）。
 	results, _ := snap["results"].([]any)
 	if len(results) != 4 {
