@@ -335,7 +335,16 @@ func main() {
 		Upstream:       up,
 		RequestCredits: metricsDB,
 		CheckinHours:   cfg.Schedule.CheckinHours,
+		TravelHours:    cfg.Schedule.TravelHours,
+		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		BlackcatHours:  cfg.Schedule.BlackcatHours,
+
+		CheckinDisabled:   !cfg.ScheduleEnabled.Checkin,
+		TravelDisabled:    !cfg.ScheduleEnabled.Travel,
+		ActivityDisabled:  !cfg.ScheduleEnabled.Activity,
+		KeepaliveDisabled: !cfg.ScheduleEnabled.Keepalive,
+		BlackcatDisabled:  !cfg.ScheduleEnabled.Blackcat,
 	})
 
 	// SMSLogin 与 AutoEnroll 必须共享同一个管理器：代理池冷却是全局状态，
@@ -384,8 +393,24 @@ func main() {
 		AutoEnrollLedger: autoEnrollLedgerPath(cfg),
 		// SMS 诊断日志同目录（data/ 卷内）：完整手机号+短信原文，本机排障用。
 		SMSDebugPath: smsDebugLogPath(cfg),
-		UpdateSchedule:   sch.UpdateSchedule,
-		Session:          sessRouter,
+		UpdateSchedule: func(checkinHours, keepaliveHours []int) {
+			// 老签名适配：只改签到/保活时点，其余排程参数不动（完整热改走 Reconfigure）。
+			sch.Reconfigure(checkinHours, nil, nil, keepaliveHours, nil,
+				!cfg.ScheduleEnabled.Checkin, !cfg.ScheduleEnabled.Travel,
+				!cfg.ScheduleEnabled.Activity, !cfg.ScheduleEnabled.Keepalive,
+				!cfg.ScheduleEnabled.Blackcat)
+		},
+		ReconfigureSchedule: func(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
+			checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled bool) {
+			sch.Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours,
+				checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled)
+		},
+		TravelNow:   sch.RunTravelNow,
+		ActivityNow: func() { go sch.RunActivityNow(context.Background()) },
+		ScheduleEnabled: struct{ AutoenrollGrowthTasks bool }{
+			AutoenrollGrowthTasks: cfg.ScheduleEnabled.AutoenrollGrowthTasks,
+		},
+		Session:     sessRouter,
 		StickyCount:      sessCount,
 		RedisMode:        redisMode,
 		ResponseStore:    responseStore,

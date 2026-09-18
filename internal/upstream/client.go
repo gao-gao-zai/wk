@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -175,6 +176,9 @@ type Client struct {
 	BillingBaseCN   string
 	ChatBaseGlobal  string
 	BillingBaseGlob string
+	// WebBaseCN Web 域（任务领奖）。零值回落默认常量（webBase()），
+	// 字段化便于测试注入。
+	WebBaseCN string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -801,6 +805,26 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 	BillingHeaders(req, a)
 	_, err = c.doJSON(req)
 	return err
+}
+
+// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
+// 如 code=10001/14001）。幂等成功而非失败，调度日志不应刷 error 行。
+var alreadyCheckinMarkers = []string{"已签到", "already"}
+
+// IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
+// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
+// 否则签到遇抖动会误记为 already，账号当天实际未签到却被判定正常。
+func IsAlreadyCheckin(err error) bool {
+	var ue *Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	for _, m := range alreadyCheckinMarkers {
+		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(s string, n int) string {

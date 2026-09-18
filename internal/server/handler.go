@@ -80,6 +80,18 @@ type Config struct {
 	// 自动轮转。见 AutoEnroller.smsDebug。
 	SMSDebugPath string
 	UpdateSchedule   func(checkinHours, keepaliveHours []int)
+	// ReconfigureSchedule 完整排程热更新（五类任务时点 + 开关）。控制台保存
+	// schedule 卡片时调用；nil = 走 UpdateSchedule（老部署语义）。
+	ReconfigureSchedule func(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
+		checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled bool)
+	// TravelNow / ActivityNow 手动触发猫猫旅行巡检 / 活跃上报（控制台按钮）。
+	TravelNow  func()
+	ActivityNow func()
+	// ScheduleEnabled 解析后的排程开关（main 从 config 传入；零值 = 全关，
+	// 与 scheduler.Config 的 *Disabled 语义互补）。
+	ScheduleEnabled struct {
+		AutoenrollGrowthTasks bool
+	}
 	MaxRotate        int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
@@ -156,6 +168,9 @@ type Handler struct {
 		setSanitize func(bool)
 		setCodex    func(bool)
 	}
+
+	// growthLocks 成长任务 per-account 互斥（growthtasks.go）。
+	growthLocks growthTaskLocks
 }
 
 type unlockAttempt struct {
@@ -262,6 +277,17 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/account/{uid}/checkin", h.withFrontend(h.checkinAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/keepalive", h.withFrontend(h.keepaliveAccount))
 	h.mux.HandleFunc("DELETE /admin/account/{uid}", h.withFrontend(h.deleteAccount))
+	// 成长任务中心：任务列表 / 接受 / 领奖 / 一键完成（单任务/全量/全部账号）。
+	h.mux.HandleFunc("GET /admin/account/{uid}/tasks", h.withFrontend(h.accountTasks))
+	h.mux.HandleFunc("POST /admin/account/{uid}/tasks/accept", h.withFrontend(h.accountTaskAccept))
+	h.mux.HandleFunc("POST /admin/account/{uid}/tasks/accept_all", h.withFrontend(h.accountTaskAcceptAll))
+	h.mux.HandleFunc("POST /admin/account/{uid}/tasks/claim", h.withFrontend(h.accountTaskClaim))
+	h.mux.HandleFunc("POST /admin/account/{uid}/tasks/auto", h.withFrontend(h.accountTaskAuto))
+	h.mux.HandleFunc("POST /admin/account/{uid}/tasks/auto_all", h.withFrontend(h.accountTaskAutoAll))
+	h.mux.HandleFunc("POST /admin/tasks/auto_all", h.withFrontend(h.allAccountsTaskAutoAll))
+	// 手动触发猫猫旅行巡检 / 活跃上报。
+	h.mux.HandleFunc("POST /admin/travel", h.withFrontend(h.runTravel))
+	h.mux.HandleFunc("POST /admin/activity", h.withFrontend(h.runActivity))
 	// 自动加号：豪猪取号→短信直登→落盘。persist/find 回调指向本 handler，
 	// 必须在 NewHandler 里组装（main 那边拿不到方法值）。
 	if cfg.HaozhumaClient != nil && cfg.SMSLogin != nil && cfg.HaozhumaSid != "" {
@@ -286,6 +312,31 @@ func NewHandler(cfg Config) *Handler {
 		)
 		h.cfg.AutoEnroll.SetLedgerPath(cfg.AutoEnrollLedger)
 		h.cfg.AutoEnroll.SetSMSDebugPath(cfg.SMSDebugPath)
+		// 成长任务联动：schedule.autoenroll_growth_tasks 开启时，加号成功
+		// 即自动跑一遍 17 项任务自动化。默认关（任务链含真实短对话）。
+		if cfg.ScheduleEnabled.AutoenrollGrowthTasks {
+			h.cfg.AutoEnroll.SetOnAccountEnrolled(func(uid string) {
+				a := h.cfg.Pool.AuthByUID(uid)
+				if a == nil || a.Region() == "global" {
+					return
+				}
+				log.Printf("auto-enroll: 新号 %s 自动执行成长任务（autoenroll_growth_tasks=on）", uid)
+				if !h.growthLocks.tryLock(uid) {
+					return
+				}
+				defer h.growthLocks.unlock(uid)
+				results := h.runGrowthAll(a)
+				okCount := 0
+				for _, res := range results {
+					if skipped, _ := res["skipped"].(bool); skipped {
+						okCount++
+					} else if ok, _ := res["ok"].(bool); ok {
+						okCount++
+					}
+				}
+				log.Printf("auto-enroll: 新号 %s 成长任务完成 %d/%d 项", uid, okCount, len(results))
+			})
+		}
 		// WebUI 运行时切换项目 ID 直接推给 AutoEnroll（组装在 NewHandler
 		// 内部，main 拿不到指针，这里自接回调最省事）。
 		h.cfg.SetHaozhumaSid = h.cfg.AutoEnroll.SetSid
@@ -757,6 +808,16 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		Schedule struct {
 			CheckinHours   []int `json:"checkin_hours"`
 			KeepaliveHours []int `json:"keepalive_hours"`
+			TravelHours    []int `json:"travel_hours"`
+			ActivityHours  []int `json:"activity_hours"`
+			BlackcatHours  []int `json:"blackcat_hours"`
+			// *Enabled 开关：老配置未写 = 启用，前端表单需要 true 初值。
+			CheckinEnabled   *bool `json:"checkin_enabled"`
+			TravelEnabled    *bool `json:"travel_enabled"`
+			ActivityEnabled  *bool `json:"activity_enabled"`
+			KeepaliveEnabled *bool `json:"keepalive_enabled"`
+			BlackcatEnabled  *bool `json:"blackcat_enabled"`
+			AutoenrollGrowthTasks bool `json:"autoenroll_growth_tasks"`
 		} `json:"schedule"`
 		Region string `json:"region"`
 		// Features/Billing 是 WebUI 可改的运行时开关与费率（第一批：
@@ -795,6 +856,36 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	c.Features.ResponsesAPI = true
 	c.Upstream.TimeoutSeconds = 120
 	c.Upstream.StreamIdleSeconds = 120
+	// schedule 新时点/开关的回显默认：老配置未写时给前端默认值（与 Default() 一致）。
+	if len(c.Schedule.TravelHours) == 0 {
+		c.Schedule.TravelHours = []int{9, 21}
+	}
+	if len(c.Schedule.ActivityHours) == 0 {
+		c.Schedule.ActivityHours = []int{10}
+	}
+	if len(c.Schedule.BlackcatHours) == 0 {
+		c.Schedule.BlackcatHours = []int{23}
+	}
+	if c.Schedule.CheckinEnabled == nil {
+		on := true
+		c.Schedule.CheckinEnabled = &on
+	}
+	if c.Schedule.TravelEnabled == nil {
+		on := true
+		c.Schedule.TravelEnabled = &on
+	}
+	if c.Schedule.ActivityEnabled == nil {
+		on := true
+		c.Schedule.ActivityEnabled = &on
+	}
+	if c.Schedule.KeepaliveEnabled == nil {
+		on := true
+		c.Schedule.KeepaliveEnabled = &on
+	}
+	if c.Schedule.BlackcatEnabled == nil {
+		on := true
+		c.Schedule.BlackcatEnabled = &on
+	}
 	if json.Unmarshal(raw, &c) != nil {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
@@ -878,6 +969,17 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CheckinHours   []int          `json:"checkin_hours"`
 		KeepaliveHours []int          `json:"keepalive_hours"`
+		// Schedule 完整排程补丁（五类任务时点 + 开关）。指针语义：nil = 未提供
+		// （保留 config.json 现值），给出数组 = 整体替换该时点集。
+		TravelHours    *[]int `json:"travel_hours"`
+		ActivityHours  *[]int `json:"activity_hours"`
+		BlackcatHours  *[]int `json:"blackcat_hours"`
+		CheckinEnabled   *bool `json:"checkin_enabled"`
+		TravelEnabled    *bool `json:"travel_enabled"`
+		ActivityEnabled  *bool `json:"activity_enabled"`
+		KeepaliveEnabled *bool `json:"keepalive_enabled"`
+		BlackcatEnabled  *bool `json:"blackcat_enabled"`
+		AutoenrollGrowthTasks *bool `json:"autoenroll_growth_tasks"`
 		Features       *featuresPatch `json:"features"`
 		Billing        *billingPatch  `json:"billing"`
 		Upstream       *upstreamPatch `json:"upstream"`
@@ -893,6 +995,24 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if !checkinOK || !keepaliveOK {
 		writeJSON(w, 400, map[string]string{"error": "每项至少填写一个 0-23 的整数小时"})
 		return
+	}
+	for _, pair := range []struct {
+		hours *[]int
+		name  string
+	}{
+		{req.TravelHours, "travel_hours"},
+		{req.ActivityHours, "activity_hours"},
+		{req.BlackcatHours, "blackcat_hours"},
+	} {
+		if pair.hours == nil {
+			continue
+		}
+		for _, h := range *pair.hours {
+			if h < 0 || h > 23 {
+				writeJSON(w, 400, map[string]string{"error": pair.name + " 的小时必须在 0-23 之间"})
+				return
+			}
+		}
 	}
 	// 费率只接受非负有限值：负数/Inf/NaN 会污染积分估算与请求日志聚合。
 	if req.Billing != nil {
@@ -967,7 +1087,43 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
 	}
-	schedule := map[string]any{"checkin_hours": checkinHours, "keepalive_hours": keepaliveHours}
+	// schedule 增量合并：只覆盖请求里显式给出的子字段，其余保留 config.json
+	// 现值（老版前端只发 checkin/keepalive 两项时，travel_hours 等不被抹掉）。
+	schedule, _ := doc["schedule"].(map[string]any)
+	if schedule == nil {
+		schedule = map[string]any{}
+	}
+	// 老字段：checkin/keepalive（本端点历史上必填，保持整体替换语义）。
+	schedule["checkin_hours"] = checkinHours
+	schedule["keepalive_hours"] = keepaliveHours
+	// 新字段：显式给出的才写；bool 开关同样指针判空。
+	if req.TravelHours != nil {
+		schedule["travel_hours"] = *req.TravelHours
+	}
+	if req.ActivityHours != nil {
+		schedule["activity_hours"] = *req.ActivityHours
+	}
+	if req.BlackcatHours != nil {
+		schedule["blackcat_hours"] = *req.BlackcatHours
+	}
+	if req.CheckinEnabled != nil {
+		schedule["checkin_enabled"] = *req.CheckinEnabled
+	}
+	if req.TravelEnabled != nil {
+		schedule["travel_enabled"] = *req.TravelEnabled
+	}
+	if req.ActivityEnabled != nil {
+		schedule["activity_enabled"] = *req.ActivityEnabled
+	}
+	if req.KeepaliveEnabled != nil {
+		schedule["keepalive_enabled"] = *req.KeepaliveEnabled
+	}
+	if req.BlackcatEnabled != nil {
+		schedule["blackcat_enabled"] = *req.BlackcatEnabled
+	}
+	if req.AutoenrollGrowthTasks != nil {
+		schedule["autoenroll_growth_tasks"] = *req.AutoenrollGrowthTasks
+	}
 	doc["schedule"] = schedule
 
 	// —— 落盘：只覆盖请求里显式给出的子字段，其余保留原值 ——
@@ -1067,11 +1223,50 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	restartRequired := h.cfg.UpdateSchedule == nil
-	if h.cfg.UpdateSchedule != nil {
+	// 完整排程热更新：新字段（travel/activity/blackcat/开关）齐备时走
+	// ReconfigureSchedule 即时生效；老调用只给 checkin/keepalive 时退回
+	// UpdateSchedule 语义（其余排程维持启动配置）。
+	if h.cfg.ReconfigureSchedule != nil {
+		// 基准 = 落盘后的 schedule（已合并），从中读出最终值。
+		var merged struct {
+			TravelHours    []int `json:"travel_hours"`
+			ActivityHours  []int `json:"activity_hours"`
+			BlackcatHours  []int `json:"blackcat_hours"`
+			CheckinEnabled   *bool `json:"checkin_enabled"`
+			TravelEnabled    *bool `json:"travel_enabled"`
+			ActivityEnabled  *bool `json:"activity_enabled"`
+			KeepaliveEnabled *bool `json:"keepalive_enabled"`
+			BlackcatEnabled  *bool `json:"blackcat_enabled"`
+		}
+		_ = json.Unmarshal(out, &merged)
+		checkinOn, travelOn, activityOn, keepaliveOn, blackcatOn := true, true, true, true, true
+		if merged.CheckinEnabled != nil {
+			checkinOn = *merged.CheckinEnabled
+		}
+		if merged.TravelEnabled != nil {
+			travelOn = *merged.TravelEnabled
+		}
+		if merged.ActivityEnabled != nil {
+			activityOn = *merged.ActivityEnabled
+		}
+		if merged.KeepaliveEnabled != nil {
+			keepaliveOn = *merged.KeepaliveEnabled
+		}
+		if merged.BlackcatEnabled != nil {
+			blackcatOn = *merged.BlackcatEnabled
+		}
+		h.cfg.ReconfigureSchedule(checkinHours, merged.TravelHours, merged.ActivityHours,
+			keepaliveHours, merged.BlackcatHours,
+			!checkinOn, !travelOn, !activityOn, !keepaliveOn, !blackcatOn)
+		restartRequired = false
+	} else if h.cfg.UpdateSchedule != nil {
 		h.cfg.UpdateSchedule(checkinHours, keepaliveHours)
 	}
 	// —— 运行时生效：开关与费率即时更新，不需要重启 ——
 	updated := h.applyRuntimeFeatures(req.Features, req.Billing)
+	if h.cfg.ReconfigureSchedule != nil {
+		updated["schedule"] = schedule
+	}
 	h.applyRuntimeUpstreamTimeouts(req.Upstream, updated)
 	if req.SMS != nil && req.SMS.Haozhuma.Sid != nil {
 		sid := strings.TrimSpace(*req.SMS.Haozhuma.Sid)

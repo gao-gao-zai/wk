@@ -5,8 +5,8 @@ import {
   Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import {
-  ApiOutlined, ApartmentOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined,
-  ReloadOutlined, SendOutlined, SettingOutlined, TeamOutlined,
+  ApiOutlined, ApartmentOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, GiftOutlined,
+  KeyOutlined, ReloadOutlined, SendOutlined, SettingOutlined, TeamOutlined,
   ThunderboltOutlined, CloudServerOutlined, UserAddOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
@@ -17,6 +17,7 @@ import ProxyPoolPage from './pages/ProxyPool';
 import RequestLogsPage from './pages/RequestLogs';
 import AccountSettingsPage from './pages/AccountSettings';
 import AccountListPage from './pages/AccountList';
+import GrowthTasksPage from './pages/GrowthTasks';
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
@@ -43,7 +44,7 @@ const parseHours = value => String(value || '').split(',').map(item => item.trim
 
 // 页面标识。用 hash 路由（#/auto-enroll）而不是给每页单独打包：
 // 刷新能停在原页、地址可收藏转发，且不引入 react-router 依赖。
-const SECTIONS = ['dashboard', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'groups', 'settings'];
+const SECTIONS = ['dashboard', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'groups', 'growth', 'settings'];
 
 // sectionFromHash 读取地址栏里的页面标识；非法/缺失时回落到仪表盘。
 function sectionFromHash() {
@@ -198,6 +199,9 @@ function Console() {
     form.setFieldsValue({
       checkin: (config.checkin_hours || []).join(','),
       keepalive: (config.keepalive_hours || []).join(','),
+      travel: (config.travel_hours || []).join(','),
+      activity: (config.activity_hours || []).join(','),
+      blackcat: (config.blackcat_hours || []).join(','),
     });
   }, [config, form]);
 
@@ -256,13 +260,44 @@ function Console() {
         message.error('每项至少填写一个 0-23 的整数小时');
         return;
       }
+      // 新排程字段（可选填写）：空值不上送，保留 config.json 现值（增量补丁语义）。
+      if (values.travel !== undefined && String(values.travel || '').trim()) nextConfig.travel_hours = parseHours(values.travel);
+      if (values.activity !== undefined && String(values.activity || '').trim()) nextConfig.activity_hours = parseHours(values.activity);
+      if (values.blackcat !== undefined && String(values.blackcat || '').trim()) nextConfig.blackcat_hours = parseHours(values.blackcat);
+      for (const key of ['travel_hours', 'activity_hours', 'blackcat_hours']) {
+        if (nextConfig[key] && (nextConfig[key].some(hour => !Number.isInteger(hour) || hour < 0 || hour > 23))) {
+          message.error('小时必须在 0-23 之间');
+          return;
+        }
+      }
+      // 排程开关（checkbox 不勾 = 不上送，保留现值；勾选状态由 Switch 单独保存）。
       const result = await api('/admin/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextConfig),
       });
       setConfig(current => ({ ...current, ...(result.schedule || nextConfig) }));
-      message.success(result.restart_required ? '配置已保存，重启后生效' : '配置已保存');
+      message.success(result.restart_required ? '配置已保存，重启后生效' : '配置已保存并即时生效');
     } catch (error) {
       message.error(error.message);
+    }
+  };
+
+  // saveScheduleToggle 保存单个排程开关（即时生效）。
+  const saveScheduleToggle = async (key, checked) => {
+    try {
+      const body = {
+        checkin_hours: config.checkin_hours || [9],
+        keepalive_hours: config.keepalive_hours || [22],
+        [key]: checked,
+      };
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      setConfig(current => ({ ...current, ...(result.schedule || { [key]: checked }) }));
+      message.success('排程开关已保存并即时生效');
+      return result;
+    } catch (error) {
+      message.error(error.message);
+      return null;
     }
   };
 
@@ -560,6 +595,7 @@ function Console() {
     'auto-enroll': ['自动加号', '用豪猪接码平台批量添加中国区账号：取号 → 发码 → 收码 → 自动落盘，全程免浏览器。'],
     proxy: ['代理池', '短信直登链路的出口代理：池内容量、冷却状态和后续扩展。'],
     groups: ['分组与密钥', '账号分组与 API 密钥管理：分组密钥只能使用绑定分组的账号；管理员密钥不受限。'],
+    growth: ['成长任务', '猫猫旅行、连登兑换、抽奖与 17 项成长任务自动化：一键完成、批量执行、进度与领奖闭环。'],
     settings: ['管理设置', '配置签到与保活计划，手动触发签到和积分刷新。'],
   };
   const [pageTitle, pageDescription] = pageCopy[activeSection] || pageCopy.dashboard;
@@ -576,6 +612,7 @@ function Console() {
         { key: 'accounts', icon: <KeyOutlined />, label: '账号配置' },
         { key: 'auto-enroll', icon: <ThunderboltOutlined />, label: '自动加号' },
         { key: 'proxy', icon: <CloudServerOutlined />, label: '代理池' },
+        { key: 'growth', icon: <GiftOutlined />, label: '成长任务' },
       ],
     },
     { key: 'groups', icon: <ApartmentOutlined />, label: '分组与密钥' },
@@ -625,19 +662,47 @@ function Console() {
       key: 'admin', label: '管理设置',
       children: (
         <Space direction="vertical" size={16} style={{ width: '100%' }}>
-          <Card title="签到与保活">
+          <Card title="定时任务">
             <Form form={form} layout="inline" onFinish={saveConfig}>
-              <Form.Item name="checkin" label="签到小时"><Input placeholder="9,21" /></Form.Item>
-              <Form.Item name="keepalive" label="保活小时"><Input placeholder="22" /></Form.Item>
+              <Form.Item name="checkin" label="签到小时"><Input placeholder="9,21" style={{ width: 90 }} /></Form.Item>
+              <Form.Item name="travel" label="旅行小时"><Input placeholder="9,21" style={{ width: 90 }} /></Form.Item>
+              <Form.Item name="activity" label="活跃上报小时"><Input placeholder="10" style={{ width: 70 }} /></Form.Item>
+              <Form.Item name="keepalive" label="保活小时"><Input placeholder="22" style={{ width: 70 }} /></Form.Item>
+              <Form.Item name="blackcat" label="夜猫子小时"><Input placeholder="23" style={{ width: 70 }} /></Form.Item>
               <Button type="primary" htmlType="submit">保存</Button>
             </Form>
             <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
-              定时任务按上面的整点触发；需要立刻执行时可点右侧按钮（对全部启用中的账号生效）。
+              定时任务按上面的整点触发（逗号分隔多个时点）；留空的项保持现有配置不变。
+              需要立刻执行时可点右侧按钮（对全部启用中的账号生效）。
+              旅行 = 猫猫旅行巡检（领养/派出/领奖）；活跃上报 = 点亮连登 + 解锁领养前置；夜猫子 = 23:00–08:00 窗口对话补足。
             </Paragraph>
             <Space wrap style={{ marginTop: 8 }}>
-              <Button icon={<CheckCircleOutlined />} loading={checkinRunning} onClick={runCheckinAll}>立即签到（全部账号）</Button>
+              <Button icon={<CheckCircleOutlined />} loading={checkinRunning} onClick={runCheckinAll}>立即签到（含连登兑换/抽奖）</Button>
               <Button icon={<ReloadOutlined />} loading={creditRefreshing} onClick={refreshCredits}>立即刷新积分</Button>
             </Space>
+            <div style={{ marginTop: 16 }}>
+              <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                {[
+                  ['checkin_enabled', '签到', '每日签到 + 余额刷新 + 连登兑换/抽奖闭环'],
+                  ['travel_enabled', '猫猫旅行', '独立排程：无猫领养 / 空闲派出 / 到站领奖'],
+                  ['activity_enabled', '活跃上报', '每日一条 chat_request_send 事件，点亮连登与任务解锁'],
+                  ['keepalive_enabled', 'token 保活', '刷新全部账号 token，session 失效自动禁用'],
+                  ['blackcat_enabled', '夜猫子', '23:00–08:00 窗口内 glm-5.2 对话补足（black_cat 任务）'],
+                  ['autoenroll_growth_tasks', '加号后自动跑任务', '自动加号注册成功即自动执行 17 项成长任务（约 +1950 积分；含数条真实短对话）'],
+                ].map(([key, label, desc]) => (
+                  <div key={key} style={{ display: 'flex', justifyContent: 'space-between', gap: 24, alignItems: 'flex-start' }}>
+                    <div>
+                      <Text strong>{label}</Text>
+                      <Paragraph type="secondary" style={{ margin: '4px 0 0' }}>{desc}</Paragraph>
+                    </div>
+                    <Switch
+                      checked={config[key] !== false}
+                      onChange={checked => saveScheduleToggle(key, checked)}
+                    />
+                  </div>
+                ))}
+              </Space>
+            </div>
           </Card>
           {config.features && (
             <Card title="特性开关">
@@ -890,6 +955,7 @@ function Console() {
             {activeSection === 'auto-enroll' && <AutoEnrollPage api={api} haozhumaSid={config.sms?.haozhuma?.sid || ''} onSaveHaozhumaSid={saveHaozhumaSid} />}
             {activeSection === 'groups' && <GroupsAndKeysPage api={api} />}
             {activeSection === 'proxy' && <ProxyPoolPage api={api} />}
+            {activeSection === 'growth' && <GrowthTasksPage api={api} data={data} refresh={refresh} />}
             {tabItems.find(item => item.key === activeTab)?.children}
           </Content>
         </Layout>

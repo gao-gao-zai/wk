@@ -53,7 +53,20 @@ type Config struct {
 
 	Schedule struct {
 		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
+		TravelHours    []int `json:"travel_hours"`    // [9,21]：猫猫旅行（领养/派出/领奖）
+		ActivityHours  []int `json:"activity_hours"`  // [10]：对话活跃上报（点亮连登+解锁领养）
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
+		BlackcatHours  []int `json:"blackcat_hours"`  // [23]：夜猫子（23:00–08:00 计数窗口）
+		// *Enabled 各排程总开关；false = 真正关闭（hours 原样保留，改回 true 即恢复）。
+		// 注意：空数组/null 的 hours 语义是「未配置 → 回落默认」，不是禁用。
+		CheckinEnabled   bool `json:"checkin_enabled"`   // 缺省 true
+		TravelEnabled    bool `json:"travel_enabled"`    // 缺省 true
+		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true
+		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true
+		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true
+		// AutoenrollGrowthTasks 自动加号注册成功后自动跑一遍成长任务（17 项，约
+		// +1950 积分）。默认 false：任务链含数条真实短对话，用户显式开启。
+		AutoenrollGrowthTasks bool `json:"autoenroll_growth_tasks"`
 	} `json:"schedule"`
 
 	Upstream struct {
@@ -184,6 +197,13 @@ type Config struct {
 	SMSProxyCooldownDur time.Duration `json:"-"`
 	PostgresMaxLifetime time.Duration `json:"-"`
 	PostgresMaxIdleTime time.Duration `json:"-"`
+	// ScheduleEnabled 解析后的排程开关（JSON 里缺省 false，这里归一为「缺省=开」）。
+	ScheduleEnabled struct {
+		Checkin, Travel, Activity, Keepalive, Blackcat bool
+		AutoenrollGrowthTasks                           bool
+	} `json:"-"`
+	// HasScheduleEnabled 区分「配置文件显式写了 false」与「没写」（JSON bool 零值歧义）。
+	HasScheduleEnabled map[string]bool `json:"-"`
 	// StreamTimeoutDur 流式总时长上限；0 = 不限。
 	StreamTimeoutDur time.Duration `json:"-"`
 	// StreamIdleDur 流式空闲上限；0 = 不检查。
@@ -207,7 +227,15 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "60s"
 	c.Schedule.CheckinHours = []int{9, 21}
+	c.Schedule.TravelHours = []int{9, 21}
+	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
+	c.Schedule.BlackcatHours = []int{23}
+	c.Schedule.CheckinEnabled = true
+	c.Schedule.TravelEnabled = true
+	c.Schedule.ActivityEnabled = true
+	c.Schedule.KeepaliveEnabled = true
+	c.Schedule.BlackcatEnabled = true
 	c.Upstream.TimeoutSeconds = 120
 	// 流式默认不限总时长，只守空闲窗口。这正是本次改造的目的：长回答不再被一个
 	// 整请求超时掐断，而上游卡住时仍会在 StreamIdleSeconds 内失败。
@@ -244,6 +272,22 @@ func Load(path string) (*Config, error) {
 		}
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		// 二次探测 schedule.*_enabled 是否显式出现：JSON bool 的零值歧义
+		// （false 既可能是"显式关闭"也可能是"没写"），Default 已把没写的
+		// 补成 true，Unmarshal 后无法区分——必须在原始 JSON 里查 key。
+		var probe struct {
+			Schedule map[string]json.RawMessage `json:"schedule"`
+		}
+		if json.Unmarshal(raw, &probe) == nil && probe.Schedule != nil {
+			c.HasScheduleEnabled = map[string]bool{}
+			for _, key := range []string{"checkin_enabled", "travel_enabled", "activity_enabled", "keepalive_enabled", "blackcat_enabled", "autoenroll_growth_tasks"} {
+				if v, ok := probe.Schedule[key]; ok {
+					var b bool
+					_ = json.Unmarshal(v, &b)
+					c.HasScheduleEnabled[key] = b
+				}
+			}
 		}
 	}
 	applyEnv(c)
@@ -454,6 +498,35 @@ func (c *Config) normalize() error {
 	c.Region = strings.ToLower(strings.TrimSpace(c.Region))
 	if c.Region == "" {
 		c.Region = "cn"
+	}
+	// 排程开关归一：没显式写 false 的项保持启用（Default 已设 true）。
+	c.ScheduleEnabled.Checkin = c.Schedule.CheckinEnabled
+	c.ScheduleEnabled.Travel = c.Schedule.TravelEnabled
+	c.ScheduleEnabled.Activity = c.Schedule.ActivityEnabled
+	c.ScheduleEnabled.Keepalive = c.Schedule.KeepaliveEnabled
+	c.ScheduleEnabled.Blackcat = c.Schedule.BlackcatEnabled
+	c.ScheduleEnabled.AutoenrollGrowthTasks = c.Schedule.AutoenrollGrowthTasks
+	// 小时范围校验：仅对启用中的排程校验（禁用项允许保留非法占位值不报错，
+	// 改回 enabled 时再被校验拦下）。0-23 整点。
+	for _, pair := range []struct {
+		name    string
+		hours   []int
+		enabled bool
+	}{
+		{"schedule.checkin_hours", c.Schedule.CheckinHours, c.ScheduleEnabled.Checkin},
+		{"schedule.travel_hours", c.Schedule.TravelHours, c.ScheduleEnabled.Travel},
+		{"schedule.activity_hours", c.Schedule.ActivityHours, c.ScheduleEnabled.Activity},
+		{"schedule.keepalive_hours", c.Schedule.KeepaliveHours, c.ScheduleEnabled.Keepalive},
+		{"schedule.blackcat_hours", c.Schedule.BlackcatHours, c.ScheduleEnabled.Blackcat},
+	} {
+		if !pair.enabled {
+			continue
+		}
+		for _, h := range pair.hours {
+			if h < 0 || h > 23 {
+				return fmt.Errorf("%s: 小时必须在 0-23 之间（got %d）", pair.name, h)
+			}
+		}
 	}
 	if c.Region == "mixed" {
 		c.Region = "all"

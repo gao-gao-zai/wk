@@ -40,6 +40,9 @@ type AutoEnroller struct {
 	find    func(mobile string) (nickname string, exists bool)
 	// setAccountGroups 分组登记回调（handler 注入）。
 	setAccountGroups func(uid string, groups []string) error
+	// onAccountEnrolled 加号成功后的联动回调（handler 注入；nil = 未启用）。
+	// 用于「注册后自动跑成长任务」：异步执行，不阻塞加号流水线。
+	onAccountEnrolled func(uid string)
 
 	mu      sync.Mutex
 	running bool
@@ -238,8 +241,22 @@ func (a *AutoEnroller) currentSid() string {
 	return a.sid
 }
 
+// SetOnAccountEnrolled 注入加号成功联动回调（成长任务自动化）。
+// nil = 关闭联动。mu 保护（运行期可换）。
+func (a *AutoEnroller) SetOnAccountEnrolled(fn func(uid string)) {
+	a.mu.Lock()
+	a.onAccountEnrolled = fn
+	a.mu.Unlock()
+}
+
+// enrolledCallback 读取联动回调快照（mu 下读，与 SetOnAccountEnrolled 并发安全）。
+func (a *AutoEnroller) enrolledCallback() func(uid string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.onAccountEnrolled
+}
+
 // SetSid 运行时切换豪猪项目 ID（WebUI「豪猪项目」设置）。
-//
 // 对在途任务的影响：已取到的号继续按 tryOne 开头快照的旧 sid 收码/
 // 释放/拉黑（号码归属项目，跨 sid 释放报"手机号不存在"——releaseAllHeld
 // 的失败留账本 + reclaim 的 goneUpstream 判定兜底，无额度泄漏）。
@@ -1124,6 +1141,12 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 			a.mu.Unlock()
 			if err := a.setAccountGroups(creds.UID, runGroups); err != nil {
 				a.logf("号 %s 加号成功但分组登记失败: %v（可在账号列表手动补设）", phone, err)
+			}
+			// 成长任务联动（可选，异步）：注册成功 → 自动跑一遍 17 项任务
+			// 自动化（约 +1950 积分）。回调内自带 per-account 锁与节流，这里
+			// 只负责触发。开关在 handler 侧（schedule.autoenroll_growth_tasks）。
+			if cb := a.enrolledCallback(); cb != nil {
+				go cb(creds.UID)
 			}
 			a.logf("号 %s 加号成功 uid=%s…（已释放）", phone, shortUID(creds.UID))
 			finish(false)
