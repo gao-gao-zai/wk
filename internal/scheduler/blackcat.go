@@ -36,11 +36,12 @@ func (s *Scheduler) RunBlackcatNow() {
 		if need <= 0 {
 			continue
 		}
-		ok, err := cfg.Upstream.RunNightChats(a, int(need))
-		if err != nil {
-			log.Printf("blackcat %s: %d/%d 完成，中断: %v", st.UID, ok, need, err)
+		// 判据：每夜只计 1 次（target=3 = 3 夜累计）。只跑 1 次，
+		// 不足的天数靠后续每晚的排程逐夜补足。
+		if _, err := cfg.Upstream.RunNightChats(a, 1); err != nil {
+			log.Printf("blackcat %s: 夜间对话失败: %v", st.UID, err)
 			continue
 		}
-		log.Printf("blackcat %s: 完成 %d 次夜间对话", st.UID, ok)
+		log.Printf("blackcat %s: 今夜已计 1 次（剩余 %d 夜后续排程补足）", st.UID, need-1)
 	}
 }

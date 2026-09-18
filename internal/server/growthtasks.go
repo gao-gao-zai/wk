@@ -219,9 +219,12 @@ func runAutomationCreate(h *Handler, a *auth.Auth) (string, error) {
 }
 
 // runLibraryRead 完成 Library_read：web 域 library_doc_intro_click。
+// 判据（panel 三账号实测）：pageURL 必须是真实资料库文档地址（/space/d/...），
+// 服务端校验页面路径；用其它 URL 上报 200 但不计分。
 func runLibraryRead(h *Handler, a *auth.Auth) (string, error) {
-	const pageURL = "https://www.workbuddy.cn/knowledge-library"
-	if err := h.cfg.Upstream.ReportWebEvent(a, "library_doc_intro_click", pageURL, "library_doc_intro", "资料库介绍"); err != nil {
+	const pageURL = "https://www.workbuddy.cn/space/d/o0KWYeynteVv06UnAZqIFm"
+	if err := h.cfg.Upstream.ReportWebEvent(a, "web_element_click", pageURL,
+		"library_doc_intro_click", "WorkBuddy资料库介绍"); err != nil {
 		return "", fmt.Errorf("web 事件上报: %w", err)
 	}
 	return "已上报资料库阅读点击事件", nil
@@ -419,6 +422,9 @@ func runExpertLighthouse(h *Handler, a *auth.Auth) (string, error) {
 }
 
 // runBlackCat 完成 black_cat：窗口内对话补足。
+// 判据（panel 实测口径）：**每夜只计 1 次**，target=3 是 3 个夜晚累计——
+// 一晚连发多次只有第一次计分。所以这里只跑 1 次，剩余天数靠每日 23 点的
+// blackcat 排程逐夜补足（漏跑次日窗口自动补）。
 func runBlackCat(h *Handler, a *auth.Auth) (string, error) {
 	if !upstream.InNightWindow(time.Now()) {
 		return "", fmt.Errorf("夜猫子任务需在 23:00–08:00 窗口内完成，当前不在窗口")
@@ -430,11 +436,13 @@ func runBlackCat(h *Handler, a *auth.Auth) (string, error) {
 	if need <= 0 {
 		return "夜猫子任务已达标", nil
 	}
-	ok, err := h.cfg.Upstream.RunNightChats(a, int(need))
-	if err != nil {
-		return "", fmt.Errorf("完成 %d/%d 后中断: %w", ok, need, err)
+	if _, err := h.cfg.Upstream.RunNightChats(a, 1); err != nil {
+		return "", fmt.Errorf("夜间对话失败: %w", err)
 	}
-	return fmt.Sprintf("已完成 %d 次夜间对话", ok), nil
+	if need > 1 {
+		return fmt.Sprintf("今夜已计 1 次（剩余 %d 夜由每日 23 点排程自动补足）", need-1), nil
+	}
+	return "已完成今夜的 1 次夜间对话", nil
 }
 
 // ---------------------------------------------------------------------------
