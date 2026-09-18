@@ -73,6 +73,18 @@ func PrepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]
 	normalizeToolChoice(obj)
 	normalizeReasoningEffort(obj, efforts)
 	stripConversationIdentity(obj)
+	// tool 配对安全网（见 tool_pairing.go）：先 repack 再 cleanup，双侧同口径。
+	// 插在 tool_calls 与结果中间的非 tool 消息（Codex image_resize_notice、
+	// 同轮纯文本 assistant）与孤儿配对都会让上游 400 code=11148 并顶死整条
+	// 会话，必须在出站前修复。无改动时两步均返回原 slice，回写等于零操作；
+	// 任一步改动也必须落到 obj——不能只在「最后一步改动」时回写，否则 repack
+	// 单独生效的结果会被原 slice 覆盖丢失。放在 normalizeMessageRoles 之后：
+	// developer→system 已完成，插入物按最终角色参与重排。
+	if msgs, ok := obj["messages"].([]any); ok {
+		msgs, _ = repackToolResultBlocks(msgs)
+		msgs, _ = cleanupOrphanToolCalls(msgs)
+		obj["messages"] = msgs
+	}
 	// Codex 兼容改写放在角色映射之后：developer→system 已完成，system
 	// 消息（含由 developer 映射来的）都会被检查；放在脱敏之前，两层
 	// 改写互不干扰（脱敏管 Claude 指纹，这里管 Codex 身份句）。
