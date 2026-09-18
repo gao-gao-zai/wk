@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  App, Button, Card, Drawer, Empty, Input, Modal, Popconfirm, Progress,
+  App, Alert, Button, Card, Drawer, Empty, Input, Popconfirm, Progress,
   Space, Spin, Table, Tag, Tooltip, Typography,
 } from 'antd';
 import {
-  CheckCircleOutlined, ClockCircleOutlined, GiftOutlined, LoadingOutlined, ReloadOutlined,
-  RocketOutlined, SendOutlined, ThunderboltOutlined, TrophyOutlined,
+  CheckCircleOutlined, ClockCircleOutlined, DownOutlined, GiftOutlined, LoadingOutlined,
+  ReloadOutlined, RocketOutlined, SendOutlined, ThunderboltOutlined, TrophyOutlined,
+  UpOutlined,
 } from '@ant-design/icons';
 
 const { Text, Paragraph } = Typography;
@@ -40,12 +41,12 @@ function jobItemTag(item) {
 /**
  * GrowthTasks 成长任务中心：
  * - 账号列表（复用 /status 的账号数据，仅 CN 账号可操作）
+ * - 批跑进度：页面常驻卡片（进页面自动恢复显示；执行中实时轮询；完成后折叠为结果摘要）
  * - 单账号任务抽屉：进度、奖励、单任务一键完成（同步，约 10-15s）
- * - 全量/批跑：异步 job + 进度条弹窗（可关页面，重进自动恢复进度）
  * - 顶部手动触发：旅行巡检 / 活跃上报
  */
 export default function GrowthTasks({ api, data, refresh }) {
-  const { message, modal } = App.useApp();
+  const { message } = App.useApp();
   const [tasks, setTasks] = useState(null);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [autoActions, setAutoActions] = useState({});
@@ -54,9 +55,10 @@ export default function GrowthTasks({ api, data, refresh }) {
   const [activityRunning, setActivityRunning] = useState(false);
   const [drawerUid, setDrawerUid] = useState('');
   const [taskBusy, setTaskBusy] = useState(false);
-  // job 进度弹窗：open 由 jobId 非空决定；snap 为最近一次进度快照。
-  const [jobId, setJobId] = useState('');
+  // 常驻进度卡片状态：jobSnap = 最近一次进度快照；dismissed = 用户手动关闭已完成卡片。
   const [jobSnap, setJobSnap] = useState(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
   const pollRef = useRef(null);
 
   // CN 账号（global 无成长任务体系）。
@@ -73,7 +75,8 @@ export default function GrowthTasks({ api, data, refresh }) {
   }, [accounts, search]);
 
   // ---------------------------------------------------------------------------
-  // job 轮询：开始一个 job 的进度跟踪；结束（done/failed）时停轮询 + 刷新数据。
+  // job 轮询：跟踪进行中的任务；结束（done/failed）时停轮询 + 刷新数据。
+  // 与弹窗方案不同：轮询是常开的（进页面即恢复），进度渲染在页面卡片里。
   // ---------------------------------------------------------------------------
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -82,33 +85,33 @@ export default function GrowthTasks({ api, data, refresh }) {
     }
   }, []);
 
-  const watchJob = useCallback(async id => {
+  const watchJob = useCallback(id => {
     stopPolling();
-    setJobId(id);
-    setJobSnap(null);
+    setDismissed(false);
+    let missed = 0;
     const tick = async () => {
       try {
         const snap = await api(`/admin/growth/jobs/${id}`);
-        setJobSnap(snap);
+        setJobSnap({ ...snap, _id: id });
+        missed = 0;
         if (snap.phase && snap.phase !== 'running') {
           stopPolling();
           refresh();
           if (drawerUid) loadTasks(drawerUid);
         }
       } catch (error) {
-        // 查询失败（网络抖动/过期清理）：停轮询但不关弹窗，让用户看到最后状态。
-        stopPolling();
-        message.error(`进度查询失败: ${error.message}`);
+        // 查询失败：连续 3 次才放弃（网络抖动容忍），期间保持最后快照。
+        if (++missed >= 3) {
+          stopPolling();
+          setJobSnap(current => (current ? { ...current, _error: error.message } : null));
+        }
       }
     };
     tick();
     pollRef.current = window.setInterval(tick, 2000);
-  }, [api, message, refresh, stopPolling, drawerUid]);
+  }, [api, refresh, stopPolling, drawerUid]);
 
-  // 卸载清定时器。
-  useEffect(() => () => stopPolling(), [stopPolling]);
-
-  // 页面加载：查活动 job 自动恢复进度弹窗（用户关页面后再进来看得到）。
+  // 进页面：查活动 job，有则自动恢复常驻进度（含重启续跑的任务）。
   useEffect(() => {
     (async () => {
       try {
@@ -119,6 +122,9 @@ export default function GrowthTasks({ api, data, refresh }) {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 卸载清定时器。
+  useEffect(() => () => stopPolling(), [stopPolling]);
 
   // loadTasks 拉取单账号任务列表。
   const loadTasks = useCallback(async uid => {
@@ -201,7 +207,7 @@ export default function GrowthTasks({ api, data, refresh }) {
     }
   };
 
-  // runAutoAll 一键完成该账号全部可自动任务（异步 job：202 立即返回 + 进度弹窗）。
+  // runAutoAll 一键完成该账号全部可自动任务（异步 job：202 立即返回 + 常驻进度卡片）。
   const runAutoAll = async uid => {
     try {
       const result = await api(`/admin/account/${uid}/tasks/auto_all`, { method: 'POST' });
@@ -340,82 +346,95 @@ export default function GrowthTasks({ api, data, refresh }) {
     },
   ];
 
-  // ---- job 进度弹窗内容 ----
+  // ---------------------------------------------------------------------------
+  // 常驻进度卡片：进行中展开显示；完成后折叠为摘要（可关闭）；失败带错误提示。
+  // ---------------------------------------------------------------------------
   const snap = jobSnap;
   const running = snap && snap.phase === 'running';
+  const failed = snap && snap.phase === 'failed';
   const percent = snap && snap.total
     ? Math.min(100, Math.round((snap.done / snap.total) * 100))
-    : (snap ? Math.min(99, Math.round((snap.done / Math.max(snap.done + 1, 1)) * 100)) : 0);
+    : (snap ? 95 : 0);
   const items = (snap?.results) || [];
+  const doneItems = items.filter(item => item.ok);
+  const claimedCount = items.filter(item => item.claimed).length;
+  // 完成且用户没关过 → 显示摘要卡；用户关了（dismissed）→ 不显示。
+  const showCard = snap && (running || failed || !dismissed);
 
-  const jobModal = (
-    <Modal
-      open={!!jobId}
+  const progressCard = showCard ? (
+    <Card
+      size="small"
+      style={{ borderLeft: running ? '3px solid #1677ff' : failed ? '3px solid #ff4d4f' : '3px solid #52c41a' }}
       title={running
-        ? <Space><LoadingOutlined spin /><span>成长任务执行中</span></Space>
-        : <span>{snap?.phase === 'failed' ? '成长任务执行失败' : '成长任务执行完成'}</span>}
-      width={680}
-      onCancel={() => { stopPolling(); setJobId(''); }}
-      footer={running
-        ? [<Button key="hide" onClick={() => { stopPolling(); setJobId(''); }}>后台继续，关闭窗口</Button>]
-        : [
-          <Button key="ok" type="primary" onClick={() => { stopPolling(); setJobId(''); }}>知道了</Button>,
-        ]}
-      closable={!running || true}
+        ? <Space><LoadingOutlined spin /><span>批跑执行中</span><Text type="secondary" style={{ fontWeight: 400 }}>后台运行，可离开本页</Text></Space>
+        : failed ? <span style={{ color: '#cf1322' }}>批跑失败</span> : <Space><CheckCircleOutlined style={{ color: '#52c41a' }} /><span>批跑完成</span></Space>}
+      extra={running ? null : (
+        <Button size="small" type="text" onClick={() => setDismissed(true)}>关闭</Button>
+      )}
     >
-      {!snap ? (
-        <div style={{ textAlign: 'center', padding: 32 }}><Spin /></div>
-      ) : (
-        <Space direction="vertical" size={12} style={{ width: '100%' }}>
-          <div>
-            <Progress
-              percent={percent}
-              status={snap.phase === 'failed' ? 'exception' : (running ? 'active' : 'success')}
-              format={() => `${snap.done}/${snap.total || '?'}`}
-            />
-            <Space wrap style={{ marginTop: 4 }}>
-              <Text type="secondary">
-                {running ? '正在执行：' : '最后执行：'}
-                <Text code>{snap.current || '—'}</Text>
-              </Text>
-              {snap.elapsed && <Text type="secondary">已用时 {snap.elapsed}</Text>}
-              {running && snap.eta && <Text type="secondary">预计剩余 {snap.eta}</Text>}
-            </Space>
-          </div>
-          {snap.error && <Text type="danger">{snap.error}</Text>}
-          {running && (
+      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Progress
+          percent={percent}
+          status={failed ? 'exception' : (running ? 'active' : 'success')}
+          format={() => `${snap.done}/${snap.total || '?'}`}
+        />
+        <Space wrap>
+          {running && snap.current && (
+            <Text type="secondary">正在执行：<Text code>{snap.current}</Text></Text>
+          )}
+          {snap.elapsed && <Text type="secondary">已用时 {snap.elapsed}</Text>}
+          {running && snap.eta && <Text type="secondary">预计剩余 {snap.eta}</Text>}
+          {!running && (
             <Text type="secondary">
-              任务在服务器后台执行，<b>可以关闭本页</b>；重新进入控制台会自动恢复进度。
+              共 {items.length} 项：{doneItems.length} 完成、{claimedCount} 项自动领奖、{items.length - doneItems.length} 失败/跳过
             </Text>
           )}
-          <div style={{ maxHeight: 300, overflow: 'auto' }}>
-            {items.map((item, index) => (
-              <div key={`${item.uid || ''}-${item.task_code}-${index}`} style={{ marginBottom: 6 }}>
-                {item.uid && <Text code>{item.uid}</Text>}{' '}
-                {item.task_code && <Text code>{item.task_code}</Text>}{' '}
-                {jobItemTag(item)}
-                <Text type="secondary">{item.message}</Text>
-              </div>
-            ))}
-          </div>
         </Space>
-      )}
-    </Modal>
-  );
+        {failed && snap.error && <Alert type="error" showIcon message={snap.error} style={{ padding: '4px 12px' }} />}
+        {snap._error && <Alert type="warning" showIcon message={`进度查询中断（${snap._error}），最后状态如下`} style={{ padding: '4px 12px' }} />}
+        {items.length > 0 && (
+          <>
+            <Button
+              size="small" type="link" style={{ padding: 0, height: 'auto' }}
+              onClick={() => setDetailOpen(open => !open)}
+              icon={detailOpen ? <UpOutlined /> : <DownOutlined />}
+            >
+              {detailOpen ? '收起明细' : `展开明细（${items.length} 项）`}
+            </Button>
+            {detailOpen && (
+              <div style={{ maxHeight: 280, overflow: 'auto', background: '#fafafa', padding: '8px 12px', borderRadius: 6 }}>
+                {items.map((item, index) => (
+                  <div key={`${item.uid || ''}-${item.task_code}-${index}`} style={{ marginBottom: 6 }}>
+                    {item.uid && <Text code style={{ fontSize: 12 }}>{item.uid.slice(0, 8)}…</Text>}{' '}
+                    {item.task_code && <Text code style={{ fontSize: 12 }}>{item.task_code}</Text>}{' '}
+                    {jobItemTag(item)}
+                    <Text type="secondary" style={{ fontSize: 12 }}>{item.message}</Text>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </Space>
+    </Card>
+  ) : null;
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      {progressCard}
+
       <Card title="成长任务运营" size="small">
         <Space wrap>
           <Button icon={<SendOutlined />} loading={activityRunning} onClick={runActivity}>立即活跃上报（全部账号）</Button>
           <Button icon={<ClockCircleOutlined />} loading={travelRunning} onClick={runTravel}>立即旅行巡检（全部账号）</Button>
           <Popconfirm
             title="对全部 CN 账号执行一键完成"
-            description="后台异步执行（可离开页面），进度弹窗实时显示当前账号与任务"
+            description="后台异步执行（可离开页面），页面顶部实时显示进度"
             onConfirm={runAllAccounts}
           >
-            <Button type="primary" icon={<RocketOutlined />}>全部账号一键完成</Button>
+            <Button type="primary" icon={<RocketOutlined />} disabled={running}>全部账号一键完成</Button>
           </Popconfirm>
+          {running && <Text type="secondary">批跑进行中，结束后可再次发起</Text>}
           <Text type="secondary">一键完成 ≈ +1950 积分 +78 能量 / 新账号；Expert_Philanthropy（真实捐款）无法自动完成</Text>
         </Space>
       </Card>
@@ -435,8 +454,6 @@ export default function GrowthTasks({ api, data, refresh }) {
         />
       </Card>
 
-      {jobModal}
-
       <Drawer
         title={(
           <Space>
@@ -451,7 +468,7 @@ export default function GrowthTasks({ api, data, refresh }) {
             <Button icon={<ReloadOutlined />} onClick={() => loadTasks(drawerUid)}>刷新</Button>
             <Popconfirm
               title="一键完成全部可自动任务"
-              description="后台异步执行（可离开页面），进度弹窗实时显示"
+              description="后台异步执行（可离开页面），页面顶部实时显示进度"
               onConfirm={() => runAutoAll(drawerUid)}
             >
               <Button type="primary" icon={<RocketOutlined />}>一键完成全部</Button>
