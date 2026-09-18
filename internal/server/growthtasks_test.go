@@ -214,17 +214,145 @@ func TestAccountTaskAutoAllRunsDependencyOrder(t *testing.T) {
 	stub := &growthStub{tasks: growthTasksSample, claimCredit: 50}
 	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "at"})
 	code, out := growthPostAccount(t, h, "u1", "/tasks/auto_all", `{}`)
-	if code != 200 {
-		t.Fatalf("status = %d, want 200", code)
+	if code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (async job)", code)
 	}
-	results, _ := out["results"].([]any)
-	if len(results) != 2 { // chat_5 + first_buddy（Philanthropy 无动作）
-		t.Fatalf("results = %d, want 2 (got %v)", len(results), results)
+	jobID, _ := out["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("job_id missing: %v", out)
 	}
-	// first_buddy（已 claimed）应跳过且不执行动作。
-	first, _ := results[0].(map[string]any)
+	// 轮询等 job 完成（上限 5s；正常 <100ms）。
+	snap := growthWaitJob(t, h, jobID, 5*time.Second)
+	if snap["phase"] != "done" {
+		t.Fatalf("phase = %v, want done (snap=%v)", snap["phase"], snap)
+	}
+	results, _ := snap["results"].([]any)
+	// 报名 1 项 + chat_5 + first_buddy（Philanthropy 无动作）。
+	if len(results) != 3 {
+		t.Fatalf("results = %d, want 3 (got %v)", len(results), results)
+	}
+	// 依赖序：accept → chat_5（first_buddy 已 claimed 排其后跳过）。
+	first, _ := results[1].(map[string]any)
 	if first["task_code"] != "chat_5" {
 		t.Fatalf("first action should be chat_5 (dependency order), got %v", first["task_code"])
+	}
+	// done/total 计数自洽。
+	if snap["done"].(float64) != 3 || snap["total"].(float64) != 3 {
+		t.Fatalf("done/total = %v/%v, want 3/3", snap["done"], snap["total"])
+	}
+}
+
+// growthWaitJob 轮询 job 状态直到非 running 或超时。
+func growthWaitJob(t *testing.T, h *Handler, jobID string, limit time.Duration) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for {
+		req := httptest.NewRequest(http.MethodGet, "/admin/growth/jobs/"+jobID, nil)
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+		rec := httptest.NewRecorder()
+		h.mux.ServeHTTP(rec, req)
+		var snap map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil || rec.Code != 200 {
+			t.Fatalf("job status poll failed: code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if phase, _ := snap["phase"].(string); phase != "running" {
+			return snap
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job %s did not finish within %v (snap=%v)", jobID, limit, snap)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestGrowthJobListShowsActive(t *testing.T) {
+	fastGrowthActions(t)
+	// 慢轮询让 job 短暂处于 running，可查 active 列表。
+	claimPollAttempts, claimPollGap = 3, 80*time.Millisecond
+	t.Cleanup(func() { claimPollAttempts, claimPollGap = 1, 0 })
+	stub := &growthStub{tasks: growthTasksSample}
+	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "at"})
+	code, out := growthPostAccount(t, h, "u1", "/tasks/auto_all", `{}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", code)
+	}
+	jobID, _ := out["job_id"].(string)
+	// 列表端点应包含刚创建的 running job。
+	req := httptest.NewRequest(http.MethodGet, "/admin/growth/jobs", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	var list struct {
+		Jobs []map[string]any `json:"jobs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, j := range list.Jobs {
+		if j["id"] == jobID {
+			found = true
+			if j["phase"] != "running" {
+				t.Fatalf("active job phase = %v, want running", j["phase"])
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("job %s not in active list: %v", jobID, list.Jobs)
+	}
+	growthWaitJob(t, h, jobID, 5*time.Second)
+	// 完成后 active 列表应为空。
+	rec2 := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/admin/growth/jobs", nil))
+	var list2 struct {
+		Jobs []map[string]any `json:"jobs"`
+	}
+	_ = json.Unmarshal(rec2.Body.Bytes(), &list2)
+	if len(list2.Jobs) != 0 {
+		t.Fatalf("active jobs after finish = %d, want 0", len(list2.Jobs))
+	}
+}
+
+func TestGrowthJobStatus404ForUnknown(t *testing.T) {
+	stub := &growthStub{tasks: growthTasksSample}
+	h, _ := newGrowthHandler(t, stub)
+	req := httptest.NewRequest(http.MethodGet, "/admin/growth/jobs/nope", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestAllAccountsAutoAllJob(t *testing.T) {
+	fastGrowthActions(t)
+	stub := &growthStub{tasks: growthTasksSample, claimCredit: 50}
+	h, _ := newGrowthHandler(t, stub,
+		&auth.Auth{UID: "u1", AccessToken: "at"},
+		&auth.Auth{UID: "u2", AccessToken: "at"},
+	)
+	req := httptest.NewRequest(http.MethodPost, "/admin/tasks/auto_all", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body=%v)", rec.Code, out)
+	}
+	jobID, _ := out["job_id"].(string)
+	if out["total_accounts"].(float64) != 2 {
+		t.Fatalf("total_accounts = %v, want 2", out["total_accounts"])
+	}
+	snap := growthWaitJob(t, h, jobID, 5*time.Second)
+	if snap["phase"] != "done" {
+		t.Fatalf("phase = %v, want done (snap=%v)", snap["phase"], snap)
+	}
+	// 每账号 2 项任务（chat_5 + first_buddy）× 2 账号 = 4（all 模式无报名条目）。
+	results, _ := snap["results"].([]any)
+	if len(results) != 4 {
+		t.Fatalf("results = %d, want 4 (got %v)", len(results), results)
 	}
 }
 

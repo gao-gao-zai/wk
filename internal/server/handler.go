@@ -43,7 +43,7 @@ type Config struct {
 	APIKey           string // 管理员密钥（空 = 无管理员密钥；多密钥体系下的全权限密钥）
 	FrontendPassword string // 前端控制台密码；空 = 不启用前端密码
 	// Groups 分组 + 多密钥存储（可选；nil = 分组功能关闭，仅管理员密钥）。
-	Groups *groups.Store
+	Groups           *groups.Store
 	ConfigPath       string // 配置文件路径，供控制台保存签到配置
 	AuthDir          string
 	Region           string
@@ -78,21 +78,21 @@ type Config struct {
 	// SMSDebugPath SMS 诊断日志路径（state.json 同目录；空 = 关闭）。
 	// 记录完整手机号与短信原文，只落本机文件不回传控制台，1 MiB 上限
 	// 自动轮转。见 AutoEnroller.smsDebug。
-	SMSDebugPath string
-	UpdateSchedule   func(checkinHours, keepaliveHours []int)
+	SMSDebugPath   string
+	UpdateSchedule func(checkinHours, keepaliveHours []int)
 	// ReconfigureSchedule 完整排程热更新（五类任务时点 + 开关）。控制台保存
 	// schedule 卡片时调用；nil = 走 UpdateSchedule（老部署语义）。
 	ReconfigureSchedule func(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
 		checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled bool)
 	// TravelNow / ActivityNow 手动触发猫猫旅行巡检 / 活跃上报（控制台按钮）。
-	TravelNow  func()
+	TravelNow   func()
 	ActivityNow func()
 	// ScheduleEnabled 解析后的排程开关（main 从 config 传入；零值 = 全关，
 	// 与 scheduler.Config 的 *Disabled 语义互补）。
 	ScheduleEnabled struct {
 		AutoenrollGrowthTasks bool
 	}
-	MaxRotate        int // 单请求最多换号次数，默认 3
+	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -171,6 +171,8 @@ type Handler struct {
 
 	// growthLocks 成长任务 per-account 互斥（growthtasks.go）。
 	growthLocks growthTaskLocks
+	// growthJobs 一键完成异步任务注册表（growthjobs.go）。
+	growthJobs growthJobRegistry
 }
 
 type unlockAttempt struct {
@@ -288,6 +290,10 @@ func NewHandler(cfg Config) *Handler {
 	// 手动触发猫猫旅行巡检 / 活跃上报。
 	h.mux.HandleFunc("POST /admin/travel", h.withFrontend(h.runTravel))
 	h.mux.HandleFunc("POST /admin/activity", h.withFrontend(h.runActivity))
+	// 成长任务异步 job 进度查询（一键完成的后台任务状态）。
+	h.mux.HandleFunc("GET /admin/growth/jobs", h.withFrontend(h.growthJobList))
+	h.mux.HandleFunc("GET /admin/growth/jobs/{id}", h.withFrontend(h.growthJobStatus))
+	h.startGrowthJobSweeper()
 	// 自动加号：豪猪取号→短信直登→落盘。persist/find 回调指向本 handler，
 	// 必须在 NewHandler 里组装（main 那边拿不到方法值）。
 	if cfg.HaozhumaClient != nil && cfg.SMSLogin != nil && cfg.HaozhumaSid != "" {
@@ -325,16 +331,18 @@ func NewHandler(cfg Config) *Handler {
 					return
 				}
 				defer h.growthLocks.unlock(uid)
-				results := h.runGrowthAll(a)
+				items, ok := h.runGrowthAllCollect(a, nil)
 				okCount := 0
-				for _, res := range results {
-					if skipped, _ := res["skipped"].(bool); skipped {
-						okCount++
-					} else if ok, _ := res["ok"].(bool); ok {
+				for _, item := range items {
+					if item.OK {
 						okCount++
 					}
 				}
-				log.Printf("auto-enroll: 新号 %s 成长任务完成 %d/%d 项", uid, okCount, len(results))
+				if !ok {
+					log.Printf("auto-enroll: 新号 %s 成长任务失败：任务列表拉取失败", uid)
+					return
+				}
+				log.Printf("auto-enroll: 新号 %s 成长任务完成 %d/%d 项", uid, okCount, len(items))
 			})
 		}
 		// WebUI 运行时切换项目 ID 直接推给 AutoEnroll（组装在 NewHandler
@@ -812,12 +820,12 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 			ActivityHours  []int `json:"activity_hours"`
 			BlackcatHours  []int `json:"blackcat_hours"`
 			// *Enabled 开关：老配置未写 = 启用，前端表单需要 true 初值。
-			CheckinEnabled   *bool `json:"checkin_enabled"`
-			TravelEnabled    *bool `json:"travel_enabled"`
-			ActivityEnabled  *bool `json:"activity_enabled"`
-			KeepaliveEnabled *bool `json:"keepalive_enabled"`
-			BlackcatEnabled  *bool `json:"blackcat_enabled"`
-			AutoenrollGrowthTasks bool `json:"autoenroll_growth_tasks"`
+			CheckinEnabled        *bool `json:"checkin_enabled"`
+			TravelEnabled         *bool `json:"travel_enabled"`
+			ActivityEnabled       *bool `json:"activity_enabled"`
+			KeepaliveEnabled      *bool `json:"keepalive_enabled"`
+			BlackcatEnabled       *bool `json:"blackcat_enabled"`
+			AutoenrollGrowthTasks bool  `json:"autoenroll_growth_tasks"`
 		} `json:"schedule"`
 		Region string `json:"region"`
 		// Features/Billing 是 WebUI 可改的运行时开关与费率（第一批：
@@ -901,13 +909,13 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		c.RetentionRows = 10000
 	}
 	resp := struct {
-		Schedule     any `json:"schedule"`
-		Region       any `json:"region"`
-		Features     any `json:"features"`
-		Billing      any `json:"billing"`
-		Upstream     any `json:"upstream"`
-		SMS          any `json:"sms"`
-		Retention    any `json:"request_log_retention"`
+		Schedule  any `json:"schedule"`
+		Region    any `json:"region"`
+		Features  any `json:"features"`
+		Billing   any `json:"billing"`
+		Upstream  any `json:"upstream"`
+		SMS       any `json:"sms"`
+		Retention any `json:"request_log_retention"`
 	}{
 		Schedule:  c.Schedule,
 		Region:    c.Region,
@@ -967,24 +975,24 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
 	var req struct {
-		CheckinHours   []int          `json:"checkin_hours"`
-		KeepaliveHours []int          `json:"keepalive_hours"`
+		CheckinHours   []int `json:"checkin_hours"`
+		KeepaliveHours []int `json:"keepalive_hours"`
 		// Schedule 完整排程补丁（五类任务时点 + 开关）。指针语义：nil = 未提供
 		// （保留 config.json 现值），给出数组 = 整体替换该时点集。
-		TravelHours    *[]int `json:"travel_hours"`
-		ActivityHours  *[]int `json:"activity_hours"`
-		BlackcatHours  *[]int `json:"blackcat_hours"`
-		CheckinEnabled   *bool `json:"checkin_enabled"`
-		TravelEnabled    *bool `json:"travel_enabled"`
-		ActivityEnabled  *bool `json:"activity_enabled"`
-		KeepaliveEnabled *bool `json:"keepalive_enabled"`
-		BlackcatEnabled  *bool `json:"blackcat_enabled"`
-		AutoenrollGrowthTasks *bool `json:"autoenroll_growth_tasks"`
-		Features       *featuresPatch `json:"features"`
-		Billing        *billingPatch  `json:"billing"`
-		Upstream       *upstreamPatch `json:"upstream"`
-		SMS            *smsPatch      `json:"sms"`
-		Retention      *retentionPatch `json:"request_log_retention"`
+		TravelHours           *[]int          `json:"travel_hours"`
+		ActivityHours         *[]int          `json:"activity_hours"`
+		BlackcatHours         *[]int          `json:"blackcat_hours"`
+		CheckinEnabled        *bool           `json:"checkin_enabled"`
+		TravelEnabled         *bool           `json:"travel_enabled"`
+		ActivityEnabled       *bool           `json:"activity_enabled"`
+		KeepaliveEnabled      *bool           `json:"keepalive_enabled"`
+		BlackcatEnabled       *bool           `json:"blackcat_enabled"`
+		AutoenrollGrowthTasks *bool           `json:"autoenroll_growth_tasks"`
+		Features              *featuresPatch  `json:"features"`
+		Billing               *billingPatch   `json:"billing"`
+		Upstream              *upstreamPatch  `json:"upstream"`
+		SMS                   *smsPatch       `json:"sms"`
+		Retention             *retentionPatch `json:"request_log_retention"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
@@ -1229,9 +1237,9 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.ReconfigureSchedule != nil {
 		// 基准 = 落盘后的 schedule（已合并），从中读出最终值。
 		var merged struct {
-			TravelHours    []int `json:"travel_hours"`
-			ActivityHours  []int `json:"activity_hours"`
-			BlackcatHours  []int `json:"blackcat_hours"`
+			TravelHours      []int `json:"travel_hours"`
+			ActivityHours    []int `json:"activity_hours"`
+			BlackcatHours    []int `json:"blackcat_hours"`
 			CheckinEnabled   *bool `json:"checkin_enabled"`
 			TravelEnabled    *bool `json:"travel_enabled"`
 			ActivityEnabled  *bool `json:"activity_enabled"`

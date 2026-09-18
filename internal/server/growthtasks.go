@@ -21,7 +21,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -728,8 +727,9 @@ func (h *Handler) runGrowthAction(a *auth.Auth, act *growthAction) map[string]an
 	return resp
 }
 
-// accountTaskAutoAll 一键完成该账号全部可自动任务（17 项，依赖序执行 + 逐项自动领奖）。
-// HTTP 侧 5 分钟超时，但后台流水线继续跑（锁在 goroutine 内释放）。
+// accountTaskAutoAll 一键完成该账号全部可自动任务（17 项，依赖序 + 逐项自动领奖）。
+// 异步 job 化：立即返回 202 + job_id，进度走 GET /admin/growth/jobs/{id} 轮询。
+// 用户可以关页面——任务在后台跑完，结果保留 2 小时可回看。
 func (h *Handler) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := h.growthAccount(w, uid)
@@ -740,37 +740,136 @@ func (h *Handler) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号有任务动作正在执行中，请等本轮结束后再试"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
-	done := make(chan []map[string]any, 1)
+	job := h.growthJobs.newJob(uid, "account")
 	go func() {
-		defer h.growthLocks.unlock(uid) // 流水线真正结束（而非 HTTP 超时返回）才放锁
-		done <- h.runGrowthAll(a)
+		defer h.growthLocks.unlock(uid) // 流水线真正结束才放锁
+		h.runGrowthAllWithJob(a, job)
 	}()
-	select {
-	case results := <-done:
-		log.Printf("growth: 一键完成可自动任务 uid=%s 共 %d 项", uid, len(results))
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
-	case <-ctx.Done():
-		// HTTP 侧超时返回，但后台流水线仍在跑——锁在流水线 goroutine 内释放，
-		// 期间重复点击会被 409 挡住，不会出现两轮并发。
-		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "执行超时（任务仍在后台继续）"})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok": true, "job_id": job.ID, "message": "任务已开始，可关闭页面",
+	})
+}
+
+// growthJobStatus 查询单个任务进度（幂等，可反复轮询）。
+func (h *Handler) growthJobStatus(w http.ResponseWriter, r *http.Request) {
+	job := h.growthJobs.get(r.PathValue("id"))
+	if job == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "任务不存在（可能已过期清理）"})
+		return
+	}
+	writeJSON(w, http.StatusOK, job.snapshot())
+}
+
+// growthJobList 列出进行中的任务（页面加载时恢复进度条）。
+func (h *Handler) growthJobList(w http.ResponseWriter, r *http.Request) {
+	jobs := h.growthJobs.active()
+	out := make([]map[string]any, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, j.snapshot())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "jobs": out})
+}
+
+// runGrowthAllWithJob 带进度上报的单账号全量流水线（account 模式）。
+// 每项开始时 noteCurrent（当前执行到哪儿）、结束时 finishItem（明细实时可见）。
+func (h *Handler) runGrowthAllWithJob(a *auth.Auth, job *growthJob) {
+	uid := a.Snapshot().UID
+	job.noteCurrent(uid + "｜拉取任务列表")
+	items, ok := h.runGrowthAllCollect(a, func(code, desc string) {
+		job.noteCurrent(uid + "｜" + code)
+	})
+	if !ok {
+		job.finish("failed", "list tasks: 任务列表拉取失败")
+		return
+	}
+	// total = 报名 1 项 + 实际任务项数，让进度条有确定分母。
+	job.setTotal(1 + len(items))
+	job.finishItem(growthJobItem{TaskCode: "accept", Desc: "任务报名", OK: true})
+	for _, item := range items {
+		job.finishItem(item)
+	}
+	job.finish("done", "")
+	log.Printf("growth: 一键完成可自动任务 uid=%s 共 %d 项", uid, len(items))
+}
+
+// allAccountsTaskAutoAll 对全部非禁用 CN 账号串行执行一键完成（批跑）。
+// 同样 job 化：立即返回 202 + job_id；进度 = 账号粒度（当前跑到哪个账号）。
+// 单账号失败不影响后续；账号间共享的 expert 链节流照常生效。
+func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request) {
+	type accountJob struct {
+		uid string
+		a   *auth.Auth
+	}
+	var accounts []accountJob
+	for _, st := range h.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := h.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.Snapshot().AccessToken == "" {
+			continue
+		}
+		if a.Region() == "global" {
+			continue
+		}
+		accounts = append(accounts, accountJob{st.UID, a})
+	}
+	if len(accounts) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "没有可执行的账号"})
+		return
+	}
+	job := h.growthJobs.newJob("", "all")
+	go func() {
+		// 串行逐账号：每账号尝试拿锁（拿不到说明该账号正被单独操作，跳过不阻塞）。
+		for _, aj := range accounts {
+			job.noteCurrent("账号 " + aj.uid)
+			if !h.growthLocks.tryLock(aj.uid) {
+				job.addTotal(1)
+				job.finishItem(growthJobItem{UID: aj.uid, OK: false, Message: "该账号有任务动作正在执行中，跳过"})
+				continue
+			}
+			h.runGrowthAllForJobAll(aj.a, job)
+			h.growthLocks.unlock(aj.uid)
+		}
+		job.finish("done", "")
+		log.Printf("growth: 全部账号一键完成 共 %d 个账号", len(accounts))
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok": true, "job_id": job.ID, "total_accounts": len(accounts),
+		"message": "批跑已开始，可关闭页面",
+	})
+}
+
+// runGrowthAllForJobAll 单账号全量流水线，结果逐项合入 all 模式的 job
+// （进度按任务项推进，明细条目带 uid 区分账号；列表拉取失败记一条错误后继续下个账号）。
+func (h *Handler) runGrowthAllForJobAll(a *auth.Auth, job *growthJob) {
+	uid := a.Snapshot().UID
+	items, ok := h.runGrowthAllCollect(a, func(code, desc string) {
+		job.noteCurrent(uid + "｜" + code)
+	})
+	job.addTotal(len(items))
+	if !ok {
+		job.finishItem(growthJobItem{UID: uid, OK: false, Message: "任务列表拉取失败"})
+		return
+	}
+	for _, item := range items {
+		item.UID = uid
+		job.finishItem(item)
 	}
 }
 
-// runGrowthAll 顺序执行全部可自动任务（按 growthActions 依赖序），返回逐项结果。
-// 调用方必须已持有该账号的 growth 锁。
-func (h *Handler) runGrowthAll(a *auth.Auth) []map[string]any {
+// runGrowthAllCollect 带逐项回调的全量流水线（all 模式复用；onStart 在每项
+// 动作开始前调用一次）。返回 (明细, 列表拉取是否成功)。
+func (h *Handler) runGrowthAllCollect(a *auth.Auth, onStart func(code, desc string)) ([]growthJobItem, bool) {
 	uid := a.Snapshot().UID
 	tasks, err := h.cfg.Upstream.ListTasks(a)
 	if err != nil {
-		return []map[string]any{{"task_code": "-", "ok": false, "error": "list tasks: " + err.Error()}}
+		return nil, false
 	}
 	byCode := make(map[string]*upstream.Task, len(tasks))
 	for i := range tasks {
 		byCode[tasks[i].TaskCode] = &tasks[i]
 	}
-	// 批量报名（accept 不产生进度，但让状态机规范）。
 	var codes []string
 	for _, t := range tasks {
 		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
@@ -784,84 +883,43 @@ func (h *Handler) runGrowthAll(a *auth.Auth) []map[string]any {
 		}
 		time.Sleep(actionStepGap)
 	}
-	var results []map[string]any
+	var items []growthJobItem
 	for i := range growthActions {
 		act := &growthActions[i]
 		t := byCode[act.TaskCode]
 		if t == nil {
-			continue // 该账号任务列表里没有此任务（活动下线等）
+			continue
 		}
 		if t.Claimed {
-			results = append(results, map[string]any{
-				"task_code": act.TaskCode, "ok": true, "skipped": true, "message": "已领取过奖励",
+			items = append(items, growthJobItem{
+				TaskCode: act.TaskCode, Desc: act.Desc, OK: true, Skipped: true, Message: "已领取过奖励",
 			})
 			continue
 		}
+		if onStart != nil {
+			onStart(act.TaskCode, act.Desc)
+		}
 		res := h.runGrowthAction(a, act)
-		res["task_code"] = act.TaskCode
-		res["desc"] = act.Desc
-		results = append(results, res)
+		item := growthJobItem{TaskCode: act.TaskCode, Desc: act.Desc}
+		if ok, _ := res["ok"].(bool); ok {
+			item.OK = true
+			if sk, _ := res["skipped"].(bool); sk {
+				item.Skipped = true
+			}
+			if cl, _ := res["claimed"].(bool); cl {
+				item.Claimed = true
+			}
+		}
+		item.Message, _ = res["message"].(string)
+		if item.Message == "" {
+			if e, _ := res["error"].(string); e != "" {
+				item.Message = e
+			}
+		}
+		items = append(items, item)
 		time.Sleep(actionStepGap)
 	}
-	return results
-}
-
-// allAccountsTaskAutoAll 对全部非禁用 CN 账号串行执行一键完成（批跑）。
-// 每账号独立 growth 锁 + 独立结果；单账号失败不影响后续。HTTP 侧 30 分钟超时
-// （多账号 × 17 任务 × 节流可能很久），超时后后台继续。
-func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request) {
-	type accountJob struct {
-		uid string
-		a   *auth.Auth
-	}
-	var jobs []accountJob
-	for _, st := range h.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
-		a := h.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.Snapshot().AccessToken == "" {
-			continue
-		}
-		if a.Region() == "global" {
-			continue
-		}
-		jobs = append(jobs, accountJob{st.UID, a})
-	}
-	if len(jobs) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "没有可执行的账号", "results": []any{}})
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
-	defer cancel()
-	type accountResult struct {
-		UID     string           `json:"uid"`
-		OK      bool             `json:"ok"`
-		Message string           `json:"message,omitempty"`
-		Results []map[string]any `json:"results,omitempty"`
-		Error   string           `json:"error,omitempty"`
-	}
-	done := make(chan []accountResult, 1)
-	go func() {
-		out := make([]accountResult, 0, len(jobs))
-		for _, job := range jobs {
-			if !h.growthLocks.tryLock(job.uid) {
-				out = append(out, accountResult{UID: job.uid, OK: false, Error: "该账号有任务动作正在执行中，跳过"})
-				continue
-			}
-			res := h.runGrowthAll(job.a)
-			h.growthLocks.unlock(job.uid)
-			out = append(out, accountResult{UID: job.uid, OK: true, Results: res})
-		}
-		done <- out
-	}()
-	select {
-	case results := <-done:
-		log.Printf("growth: 全部账号一键完成 共 %d 个账号", len(results))
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
-	case <-ctx.Done():
-		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "执行超时（任务仍在后台继续）"})
-	}
+	return items, true
 }
 
 // runTravel / runActivity 手动触发旅行巡检 / 活跃上报（异步起跑，立即返回）。

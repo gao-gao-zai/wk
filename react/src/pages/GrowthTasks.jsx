@@ -1,11 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  App, Button, Card, Drawer, Empty, Input, Popconfirm, Progress,
+  App, Button, Card, Drawer, Empty, Input, Modal, Popconfirm, Progress,
   Space, Spin, Table, Tag, Tooltip, Typography,
 } from 'antd';
 import {
-  CheckCircleOutlined, ClockCircleOutlined, GiftOutlined, ReloadOutlined, RocketOutlined,
-  SendOutlined, ThunderboltOutlined, TrophyOutlined,
+  CheckCircleOutlined, ClockCircleOutlined, GiftOutlined, LoadingOutlined, ReloadOutlined,
+  RocketOutlined, SendOutlined, ThunderboltOutlined, TrophyOutlined,
 } from '@ant-design/icons';
 
 const { Text, Paragraph } = Typography;
@@ -29,25 +29,35 @@ function rewardText(task) {
   return parts.join(' ') || '—';
 }
 
+// jobItemTag 单项结果的标签。
+function jobItemTag(item) {
+  if (!item.ok) return <Tag color="red">失败</Tag>;
+  if (item.claimed) return <Tag color="green">已领奖</Tag>;
+  if (item.skipped) return <Tag>跳过</Tag>;
+  return <Tag color="blue">完成</Tag>;
+}
+
 /**
  * GrowthTasks 成长任务中心：
  * - 账号列表（复用 /status 的账号数据，仅 CN 账号可操作）
- * - 单账号任务表格：进度、奖励、一键完成（自动执行动作链 + 异步计分回读 + 自动领奖）
- * - 顶部手动触发：旅行巡检 / 活跃上报 / 全部账号一键完成
+ * - 单账号任务抽屉：进度、奖励、单任务一键完成（同步，约 10-15s）
+ * - 全量/批跑：异步 job + 进度条弹窗（可关页面，重进自动恢复进度）
+ * - 顶部手动触发：旅行巡检 / 活跃上报
  */
 export default function GrowthTasks({ api, data, refresh }) {
   const { message, modal } = App.useApp();
-  const [loadingUid, setLoadingUid] = useState(null);
   const [tasks, setTasks] = useState(null);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [autoActions, setAutoActions] = useState({});
   const [search, setSearch] = useState('');
-  const [autoAllRunning, setAutoAllRunning] = useState(false);
-  const [autoAllResults, setAutoAllResults] = useState(null);
   const [travelRunning, setTravelRunning] = useState(false);
   const [activityRunning, setActivityRunning] = useState(false);
   const [drawerUid, setDrawerUid] = useState('');
-  const tasksUid = () => drawerUid;
+  const [taskBusy, setTaskBusy] = useState(false);
+  // job 进度弹窗：open 由 jobId 非空决定；snap 为最近一次进度快照。
+  const [jobId, setJobId] = useState('');
+  const [jobSnap, setJobSnap] = useState(null);
+  const pollRef = useRef(null);
 
   // CN 账号（global 无成长任务体系）。
   const accounts = useMemo(
@@ -61,6 +71,54 @@ export default function GrowthTasks({ api, data, refresh }) {
       (account.uid || '').toLowerCase().includes(q)
       || (account.nickname || '').toLowerCase().includes(q));
   }, [accounts, search]);
+
+  // ---------------------------------------------------------------------------
+  // job 轮询：开始一个 job 的进度跟踪；结束（done/failed）时停轮询 + 刷新数据。
+  // ---------------------------------------------------------------------------
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  const watchJob = useCallback(async id => {
+    stopPolling();
+    setJobId(id);
+    setJobSnap(null);
+    const tick = async () => {
+      try {
+        const snap = await api(`/admin/growth/jobs/${id}`);
+        setJobSnap(snap);
+        if (snap.phase && snap.phase !== 'running') {
+          stopPolling();
+          refresh();
+          if (drawerUid) loadTasks(drawerUid);
+        }
+      } catch (error) {
+        // 查询失败（网络抖动/过期清理）：停轮询但不关弹窗，让用户看到最后状态。
+        stopPolling();
+        message.error(`进度查询失败: ${error.message}`);
+      }
+    };
+    tick();
+    pollRef.current = window.setInterval(tick, 2000);
+  }, [api, message, refresh, stopPolling, drawerUid]);
+
+  // 卸载清定时器。
+  useEffect(() => () => stopPolling(), [stopPolling]);
+
+  // 页面加载：查活动 job 自动恢复进度弹窗（用户关页面后再进来看得到）。
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await api('/admin/growth/jobs');
+        const jobs = result.jobs || [];
+        if (jobs.length) watchJob(jobs[jobs.length - 1].id);
+      } catch { /* 静默：老后端无此端点 */ }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // loadTasks 拉取单账号任务列表。
   const loadTasks = useCallback(async uid => {
@@ -78,10 +136,10 @@ export default function GrowthTasks({ api, data, refresh }) {
 
   // openTasks 打开某账号的任务面板。
   const openTasks = useCallback(uid => {
-    setLoadingUid(uid);
+    setDrawerUid(uid);
     setTasks(null);
     setAutoActions({});
-    loadTasks(uid).finally(() => setLoadingUid(null));
+    loadTasks(uid);
   }, [loadTasks]);
 
   // acceptAll 接受该账号全部未接受任务。
@@ -113,8 +171,9 @@ export default function GrowthTasks({ api, data, refresh }) {
     }
   };
 
-  // runTaskAuto 一键完成单个任务（含自动领奖，后端有界轮询等异步计分）。
+  // runTaskAuto 一键完成单个任务（同步等 10-15s：动作 + 异步计分回读 + 自动领奖）。
   const runTaskAuto = async (uid, taskCode) => {
+    setTaskBusy(true);
     const hide = message.loading('任务执行中（含异步计分等待，约 10-15 秒）…', 0);
     try {
       const result = await api(`/admin/account/${uid}/tasks/auto`, {
@@ -137,60 +196,36 @@ export default function GrowthTasks({ api, data, refresh }) {
     } catch (error) {
       hide();
       message.error(error.message);
+    } finally {
+      setTaskBusy(false);
     }
   };
 
-  // runAutoAll 一键完成该账号全部可自动任务（长任务，后端 5 分钟超时后台继续）。
+  // runAutoAll 一键完成该账号全部可自动任务（异步 job：202 立即返回 + 进度弹窗）。
   const runAutoAll = async uid => {
-    const hide = message.loading('一键完成全部任务执行中（多任务 × 节流，约 2-4 分钟）…', 0);
     try {
       const result = await api(`/admin/account/${uid}/tasks/auto_all`, { method: 'POST' });
-      hide();
-      const results = result.results || [];
-      const claimed = results.filter(item => item.claimed).length;
-      const done = results.filter(item => item.ok).length;
-      modal.success({
-        title: '一键完成结束',
-        width: 640,
-        content: (
-          <div style={{ maxHeight: 360, overflow: 'auto', marginTop: 12 }}>
-            {results.map(item => (
-              <div key={item.task_code} style={{ marginBottom: 6 }}>
-                <Text code>{item.task_code}</Text>{' '}
-                {item.ok ? <Tag color={item.claimed ? 'green' : 'blue'}>{item.claimed ? '已领奖' : item.skipped ? '跳过' : '完成'}</Tag>
-                  : <Tag color="red">失败</Tag>}
-                <Text type="secondary">{item.message}</Text>
-              </div>
-            ))}
-          </div>
-        ),
-        okText: `完成（${done}/${results.length} 项，${claimed} 项自动领奖）`,
-      });
-      loadTasks(uid);
-      refresh();
+      if (result.job_id) {
+        message.success('任务已开始，后台执行中——可以离开本页');
+        watchJob(result.job_id);
+      }
     } catch (error) {
-      hide();
       message.error(error.message);
     }
   };
 
-  // runAllAccounts 全部账号批跑。
+  // runAllAccounts 全部账号批跑（异步 job，进度按账号×任务项推进）。
   const runAllAccounts = async () => {
-    setAutoAllRunning(true);
-    setAutoAllResults(null);
-    const hide = message.loading('全部账号一键完成执行中（耗时较长，请勿关闭页面）…', 0);
     try {
       const result = await api('/admin/tasks/auto_all', { method: 'POST' });
-      hide();
-      setAutoAllResults(result.results || []);
-      const total = (result.results || []).length;
-      message.success(`已完成 ${total} 个账号的成长任务`);
-      refresh();
+      if (result.job_id) {
+        message.success(`批跑已开始（${result.total_accounts} 个账号），后台执行中——可以离开本页`);
+        watchJob(result.job_id);
+      } else if (result.message) {
+        message.info(result.message);
+      }
     } catch (error) {
-      hide();
       message.error(error.message);
-    } finally {
-      setAutoAllRunning(false);
     }
   };
 
@@ -245,10 +280,10 @@ export default function GrowthTasks({ api, data, refresh }) {
       title: '操作', key: 'actions', width: 220, align: 'center',
       render: (_, record) => (
         <Space>
-          <Button size="small" icon={<GiftOutlined />} onClick={() => { setDrawerUid(record.uid); openTasks(record.uid); }}>任务</Button>
+          <Button size="small" icon={<GiftOutlined />} onClick={() => openTasks(record.uid)}>任务</Button>
           <Popconfirm
             title="一键完成全部可自动任务"
-            description="含 17 项任务动作（数条真实短对话），约 2-4 分钟"
+            description="含 17 项任务动作（数条真实短对话），约 2-4 分钟；后台执行，可离开页面"
             onConfirm={() => runAutoAll(record.uid)}
           >
             <Button size="small" type="primary" icon={<RocketOutlined />}>一键完成</Button>
@@ -293,17 +328,80 @@ export default function GrowthTasks({ api, data, refresh }) {
           {autoActions[task.task_code] && !task.claimed && (
             <Tooltip title={task.claimable ? '进度已达标，直接领取奖励' : '执行行为链并等待计分，达标自动领奖'}>
               {task.claimable
-                ? <Button size="small" type="primary" icon={<TrophyOutlined />} onClick={() => claimTask(tasksUid(), task.task_code)}>领取</Button>
-                : <Button size="small" icon={<ThunderboltOutlined />} onClick={() => runTaskAuto(tasksUid(), task.task_code)}>一键完成</Button>}
+                ? <Button size="small" type="primary" icon={<TrophyOutlined />} disabled={taskBusy} onClick={() => claimTask(drawerUid, task.task_code)}>领取</Button>
+                : <Button size="small" icon={<ThunderboltOutlined />} disabled={taskBusy} onClick={() => runTaskAuto(drawerUid, task.task_code)}>一键完成</Button>}
             </Tooltip>
           )}
           {task.claimable && !autoActions[task.task_code] && (
-            <Button size="small" type="primary" icon={<TrophyOutlined />} onClick={() => claimTask(tasksUid(), task.task_code)}>领取</Button>
+            <Button size="small" type="primary" icon={<TrophyOutlined />} disabled={taskBusy} onClick={() => claimTask(drawerUid, task.task_code)}>领取</Button>
           )}
         </Space>
       ),
     },
   ];
+
+  // ---- job 进度弹窗内容 ----
+  const snap = jobSnap;
+  const running = snap && snap.phase === 'running';
+  const percent = snap && snap.total
+    ? Math.min(100, Math.round((snap.done / snap.total) * 100))
+    : (snap ? Math.min(99, Math.round((snap.done / Math.max(snap.done + 1, 1)) * 100)) : 0);
+  const items = (snap?.results) || [];
+
+  const jobModal = (
+    <Modal
+      open={!!jobId}
+      title={running
+        ? <Space><LoadingOutlined spin /><span>成长任务执行中</span></Space>
+        : <span>{snap?.phase === 'failed' ? '成长任务执行失败' : '成长任务执行完成'}</span>}
+      width={680}
+      onCancel={() => { stopPolling(); setJobId(''); }}
+      footer={running
+        ? [<Button key="hide" onClick={() => { stopPolling(); setJobId(''); }}>后台继续，关闭窗口</Button>]
+        : [
+          <Button key="ok" type="primary" onClick={() => { stopPolling(); setJobId(''); }}>知道了</Button>,
+        ]}
+      closable={!running || true}
+    >
+      {!snap ? (
+        <div style={{ textAlign: 'center', padding: 32 }}><Spin /></div>
+      ) : (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <div>
+            <Progress
+              percent={percent}
+              status={snap.phase === 'failed' ? 'exception' : (running ? 'active' : 'success')}
+              format={() => `${snap.done}/${snap.total || '?'}`}
+            />
+            <Space wrap style={{ marginTop: 4 }}>
+              <Text type="secondary">
+                {running ? '正在执行：' : '最后执行：'}
+                <Text code>{snap.current || '—'}</Text>
+              </Text>
+              {snap.elapsed && <Text type="secondary">已用时 {snap.elapsed}</Text>}
+              {running && snap.eta && <Text type="secondary">预计剩余 {snap.eta}</Text>}
+            </Space>
+          </div>
+          {snap.error && <Text type="danger">{snap.error}</Text>}
+          {running && (
+            <Text type="secondary">
+              任务在服务器后台执行，<b>可以关闭本页</b>；重新进入控制台会自动恢复进度。
+            </Text>
+          )}
+          <div style={{ maxHeight: 300, overflow: 'auto' }}>
+            {items.map((item, index) => (
+              <div key={`${item.uid || ''}-${item.task_code}-${index}`} style={{ marginBottom: 6 }}>
+                {item.uid && <Text code>{item.uid}</Text>}{' '}
+                {item.task_code && <Text code>{item.task_code}</Text>}{' '}
+                {jobItemTag(item)}
+                <Text type="secondary">{item.message}</Text>
+              </div>
+            ))}
+          </div>
+        </Space>
+      )}
+    </Modal>
+  );
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -313,32 +411,14 @@ export default function GrowthTasks({ api, data, refresh }) {
           <Button icon={<ClockCircleOutlined />} loading={travelRunning} onClick={runTravel}>立即旅行巡检（全部账号）</Button>
           <Popconfirm
             title="对全部 CN 账号执行一键完成"
-            description="每账号 17 项任务 × 节流，账号多时耗时很长；后台执行，可稍后刷新"
+            description="后台异步执行（可离开页面），进度弹窗实时显示当前账号与任务"
             onConfirm={runAllAccounts}
           >
-            <Button type="primary" icon={<RocketOutlined />} loading={autoAllRunning}>全部账号一键完成</Button>
+            <Button type="primary" icon={<RocketOutlined />}>全部账号一键完成</Button>
           </Popconfirm>
           <Text type="secondary">一键完成 ≈ +1950 积分 +78 能量 / 新账号；Expert_Philanthropy（真实捐款）无法自动完成</Text>
         </Space>
       </Card>
-
-      {autoAllResults && (
-        <Card title="全部账号执行结果" size="small">
-          <div style={{ maxHeight: 300, overflow: 'auto' }}>
-            {(autoAllResults || []).map(account => (
-              <div key={account.uid} style={{ marginBottom: 8 }}>
-                <Space>
-                  <Text code>{account.uid}</Text>
-                  {account.ok
-                    ? <Tag color="green">{(account.results || []).filter(item => item.ok).length}/{(account.results || []).length} 项完成</Tag>
-                    : <Tag color="red">{account.error}</Tag>}
-                </Space>
-              </div>
-            ))}
-            {!autoAllResults.length && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有可执行的账号" />}
-          </div>
-        </Card>
-      )}
 
       <Card
         title="账号列表（仅中国区）" size="small"
@@ -355,6 +435,8 @@ export default function GrowthTasks({ api, data, refresh }) {
         />
       </Card>
 
+      {jobModal}
+
       <Drawer
         title={(
           <Space>
@@ -369,7 +451,7 @@ export default function GrowthTasks({ api, data, refresh }) {
             <Button icon={<ReloadOutlined />} onClick={() => loadTasks(drawerUid)}>刷新</Button>
             <Popconfirm
               title="一键完成全部可自动任务"
-              description="约 2-4 分钟（含真实短对话）"
+              description="后台异步执行（可离开页面），进度弹窗实时显示"
               onConfirm={() => runAutoAll(drawerUid)}
             >
               <Button type="primary" icon={<RocketOutlined />}>一键完成全部</Button>
@@ -389,7 +471,8 @@ export default function GrowthTasks({ api, data, refresh }) {
         )}
         <Paragraph type="secondary" style={{ marginTop: 16 }}>
           说明：任务计分为上游异步处理，「一键完成」执行后会等待计分落定并自动领奖；
-          个别任务（如需真实客户端交互的 Expert_Philanthropy）无法自动完成，请按任务说明操作。
+          全量任务在后台异步执行，关闭页面不影响；个别任务（如需真实捐款的
+          Expert_Philanthropy）无法自动完成。
         </Paragraph>
       </Drawer>
     </Space>
