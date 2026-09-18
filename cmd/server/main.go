@@ -393,6 +393,8 @@ func main() {
 		AutoEnrollLedger: autoEnrollLedgerPath(cfg),
 		// SMS 诊断日志同目录（data/ 卷内）：完整手机号+短信原文，本机排障用。
 		SMSDebugPath: smsDebugLogPath(cfg),
+		// 批跑恢复标记同目录：重启自动续跑剩余账号（见 ResumeGrowthJobsAfterRestart）。
+		GrowthJobMarkPath: filepath.Join(filepath.Dir(cfg.StateFile), "growth-job.json"),
 		UpdateSchedule: func(checkinHours, keepaliveHours []int) {
 			// 老签名适配：只改签到/保活时点，其余排程参数不动（完整热改走 Reconfigure）。
 			sch.Reconfigure(checkinHours, nil, nil, keepaliveHours, nil,
@@ -410,13 +412,13 @@ func main() {
 		ScheduleEnabled: struct{ AutoenrollGrowthTasks bool }{
 			AutoenrollGrowthTasks: cfg.ScheduleEnabled.AutoenrollGrowthTasks,
 		},
-		Session:     sessRouter,
-		StickyCount:      sessCount,
-		RedisMode:        redisMode,
-		ResponseStore:    responseStore,
-		MetricsStore:     persistentMetrics,
-		RequestLogStore:  requestLogs,
-		CompletionStore:  completions,
+		Session:         sessRouter,
+		StickyCount:     sessCount,
+		RedisMode:       redisMode,
+		ResponseStore:   responseStore,
+		MetricsStore:    persistentMetrics,
+		RequestLogStore: requestLogs,
+		CompletionStore: completions,
 		// WebUI 改请求日志保留策略后即时推给 metricsstore（下一次修剪
 		// 每 100 条写入触发——按新值执行）。
 		SetRequestLogRetention: func(days, rows int) {
@@ -496,6 +498,9 @@ func main() {
 	}()
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
+	// 重启恢复：上次进程死在批跑半路（部署/崩溃）时自动续跑剩余账号。
+	// 动作幂等（已完成的秒级跳过），用户无需手动重新点「一键完成」。
+	h.ResumeGrowthJobsAfterRestart()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
@@ -621,4 +626,3 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 	}
 	return nil
 }
-

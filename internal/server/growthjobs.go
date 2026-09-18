@@ -12,10 +12,15 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"sort"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/auth"
 )
 
 // growthJob 一个异步任务的实时状态。字段按"前端渲染进度条需要什么"设计：
@@ -198,5 +203,105 @@ func (h *Handler) startGrowthJobSweeper() {
 		for range ticker.C {
 			h.growthJobs.sweep(growthJobTTL)
 		}
+	}()
+}
+
+// ---------------------------------------------------------------------------
+// 重启恢复：all 模式批跑的落盘标记
+// ---------------------------------------------------------------------------
+
+// growthJobMark 落盘标记形状。Pending 为剩余待跑账号（启动时写入全量，
+// 每完成一个划掉一个；全部完成删除文件）。
+type growthJobMark struct {
+	Mode    string   `json:"mode"`
+	Pending []string `json:"pending"`
+	Started string   `json:"started"`
+}
+
+// growthJobMarkPath 落盘路径（空 = 功能关闭）。main 从 state.json 同目录注入。
+func (h *Handler) growthJobMarkPath() string { return h.cfg.GrowthJobMarkPath }
+
+// writeGrowthJobMark 原子写标记文件（待跑清单快照）。
+func (h *Handler) writeGrowthJobMark(pending []string) {
+	path := h.growthJobMarkPath()
+	if path == "" {
+		return
+	}
+	mark := growthJobMark{Mode: "all", Pending: pending, Started: time.Now().Format(time.RFC3339)}
+	raw, err := json.MarshalIndent(mark, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = writeFileAtomic(path, append(raw, '\n'), 0600)
+}
+
+// clearGrowthJobMark 批跑全部结束时删除标记。
+func (h *Handler) clearGrowthJobMark() {
+	path := h.growthJobMarkPath()
+	if path == "" {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+// readGrowthJobMark 读启动残留标记（无文件/损坏返回 nil）。
+func (h *Handler) readGrowthJobMark() *growthJobMark {
+	path := h.growthJobMarkPath()
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var mark growthJobMark
+	if json.Unmarshal(raw, &mark) != nil || len(mark.Pending) == 0 {
+		return nil
+	}
+	return &mark
+}
+
+// accountJobType 批跑的单账号条目（端点触发与重启恢复共用）。
+type accountJobType struct {
+	uid string
+	a   *auth.Auth
+}
+
+// ResumeGrowthJobsAfterRestart 重启恢复入口（main 启动完成后调用）。
+// 检测到残留标记（上次进程死在批跑半路）时，重新拉起剩余账号的批跑：
+//   - 账号按标记里的 Pending 顺序重查（禁用/移除/global 的自然过滤）
+//   - 动作幂等：上次已完成的项这次秒级跳过
+//   - 立即清除旧标记并写新标记（Pending = 本轮实际待跑），避免二次重启叠加
+func (h *Handler) ResumeGrowthJobsAfterRestart() {
+	mark := h.readGrowthJobMark()
+	if mark == nil {
+		return
+	}
+	var accounts []accountJobType
+	for _, uid := range mark.Pending {
+		a := h.cfg.Pool.AuthByUID(uid)
+		if a == nil || a.Snapshot().AccessToken == "" {
+			continue // 账号已移除/无凭证
+		}
+		if a.Region() == "global" {
+			continue
+		}
+		accounts = append(accounts, accountJobType{uid, a})
+	}
+	log.Printf("growth: 检测到重启前未完成的批跑标记（%d 个待跑账号），自动恢复", len(mark.Pending))
+	if len(accounts) == 0 {
+		h.clearGrowthJobMark()
+		log.Printf("growth: 待跑账号均已不可用，标记清除")
+		return
+	}
+	pending := make([]string, 0, len(accounts))
+	for _, aj := range accounts {
+		pending = append(pending, aj.uid)
+	}
+	job := h.growthJobs.newJob("", "all")
+	// 延迟几秒再开跑：让服务先把监听/健康检查立起来，部署脚本不误判启动失败。
+	go func() {
+		time.Sleep(5 * time.Second)
+		h.runAllAccountsPipeline(job, accounts, pending)
 	}()
 }

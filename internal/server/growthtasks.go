@@ -804,11 +804,7 @@ func (h *Handler) runGrowthAllWithJob(a *auth.Auth, job *growthJob) {
 // 同样 job 化：立即返回 202 + job_id；进度 = 账号粒度（当前跑到哪个账号）。
 // 单账号失败不影响后续；账号间共享的 expert 链节流照常生效。
 func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request) {
-	type accountJob struct {
-		uid string
-		a   *auth.Auth
-	}
-	var accounts []accountJob
+	var accounts []accountJobType
 	for _, st := range h.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -820,32 +816,50 @@ func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request)
 		if a.Region() == "global" {
 			continue
 		}
-		accounts = append(accounts, accountJob{st.UID, a})
+		accounts = append(accounts, accountJobType{st.UID, a})
 	}
 	if len(accounts) == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "没有可执行的账号"})
 		return
 	}
+	pending := make([]string, 0, len(accounts))
+	for _, aj := range accounts {
+		pending = append(pending, aj.uid)
+	}
 	job := h.growthJobs.newJob("", "all")
-	go func() {
-		// 串行逐账号：每账号尝试拿锁（拿不到说明该账号正被单独操作，跳过不阻塞）。
-		for _, aj := range accounts {
-			job.noteCurrent("账号 " + aj.uid)
-			if !h.growthLocks.tryLock(aj.uid) {
-				job.addTotal(1)
-				job.finishItem(growthJobItem{UID: aj.uid, OK: false, Message: "该账号有任务动作正在执行中，跳过"})
-				continue
-			}
-			h.runGrowthAllForJobAll(aj.a, job)
-			h.growthLocks.unlock(aj.uid)
-		}
-		job.finish("done", "")
-		log.Printf("growth: 全部账号一键完成 共 %d 个账号", len(accounts))
-	}()
+	go h.runAllAccountsPipeline(job, accounts, pending)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok": true, "job_id": job.ID, "total_accounts": len(accounts),
 		"message": "批跑已开始，可关闭页面",
 	})
+}
+
+// runAllAccountsPipeline 批跑主管线（端点触发与重启恢复共用）。
+// accounts 为本轮要跑的账号；pendingUIDs 为落盘标记的待跑清单（每完成一个
+// 划掉一个，全部结束删除标记；nil = 不落盘）。
+func (h *Handler) runAllAccountsPipeline(job *growthJob, accounts []accountJobType, pendingUIDs []string) {
+	pending := pendingUIDs
+	h.writeGrowthJobMark(pending)
+	for _, aj := range accounts {
+		job.noteCurrent("账号 " + aj.uid)
+		if !h.growthLocks.tryLock(aj.uid) {
+			job.addTotal(1)
+			job.finishItem(growthJobItem{UID: aj.uid, OK: false, Message: "该账号有任务动作正在执行中，跳过"})
+		} else {
+			h.runGrowthAllForJobAll(aj.a, job)
+			h.growthLocks.unlock(aj.uid)
+		}
+		// 标记划账：完成的账号从待跑清单移除（重启恢复只重跑剩余的）。
+		if len(pending) > 0 {
+			pending = pending[1:]
+			h.writeGrowthJobMark(pending)
+		}
+	}
+	if len(pending) == 0 {
+		h.clearGrowthJobMark()
+	}
+	job.finish("done", "")
+	log.Printf("growth: 全部账号一键完成 共 %d 个账号", len(accounts))
 }
 
 // runGrowthAllForJobAll 单账号全量流水线，结果逐项合入 all 模式的 job

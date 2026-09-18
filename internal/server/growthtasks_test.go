@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -353,6 +355,77 @@ func TestAllAccountsAutoAllJob(t *testing.T) {
 	results, _ := snap["results"].([]any)
 	if len(results) != 4 {
 		t.Fatalf("results = %d, want 4 (got %v)", len(results), results)
+	}
+}
+
+func TestGrowthJobMarkLifecycleAndResume(t *testing.T) {
+	fastGrowthActions(t)
+	stub := &growthStub{tasks: growthTasksSample, claimCredit: 50}
+	markPath := filepath.Join(t.TempDir(), "growth-job.json")
+	h, _ := newGrowthHandler(t, stub,
+		&auth.Auth{UID: "u1", AccessToken: "at"},
+		&auth.Auth{UID: "u2", AccessToken: "at"},
+	)
+	h.cfg.GrowthJobMarkPath = markPath
+
+	// 1) 正常批跑：跑完标记应被删除。
+	req := httptest.NewRequest(http.MethodPost, "/admin/tasks/auto_all", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	jobID, _ := out["job_id"].(string)
+	growthWaitJob(t, h, jobID, 5*time.Second)
+	if _, err := os.Stat(markPath); !os.IsNotExist(err) {
+		t.Fatalf("mark file should be removed after job done: %v", err)
+	}
+
+	// 2) 模拟中断：手写半路标记（u1 已跑完，剩 u2），重启恢复只跑 u2。
+	mark := `{"mode":"all","pending":["u2"],"started":"2026-09-19T01:00:00+08:00"}`
+	if err := os.WriteFile(markPath, []byte(mark), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h.ResumeGrowthJobsAfterRestart()
+	// 恢复 job 异步起跑（5s 延迟在测试里等不起——轮询窗口放宽）。
+	var snap map[string]any
+	deadline := time.Now().Add(12 * time.Second)
+	for {
+		req := httptest.NewRequest(http.MethodGet, "/admin/growth/jobs", nil)
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+		rec := httptest.NewRecorder()
+		h.mux.ServeHTTP(rec, req)
+		var list struct {
+			Jobs []map[string]any `json:"jobs"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &list)
+		if len(list.Jobs) > 0 {
+			snap = list.Jobs[len(list.Jobs)-1]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resume job did not start within 12s")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// 等 job 跑完：结果只含 u2 的条目，且标记文件被清。
+	resumeID, _ := snap["id"].(string)
+	snap = growthWaitJob(t, h, resumeID, 15*time.Second)
+	if snap["phase"] != "done" {
+		t.Fatalf("resume phase = %v, want done", snap["phase"])
+	}
+	results, _ := snap["results"].([]any)
+	for _, raw := range results {
+		item, _ := raw.(map[string]any)
+		if item["uid"] != "u2" {
+			t.Fatalf("resume job should only run pending u2, got %v", item["uid"])
+		}
+	}
+	if len(results) != 2 { // u2 的 chat_5 + first_buddy
+		t.Fatalf("resume results = %d, want 2", len(results))
+	}
+	if _, err := os.Stat(markPath); !os.IsNotExist(err) {
+		t.Fatal("mark file should be removed after resumed job done")
 	}
 }
 

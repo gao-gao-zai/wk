@@ -78,8 +78,13 @@ type Config struct {
 	// SMSDebugPath SMS 诊断日志路径（state.json 同目录；空 = 关闭）。
 	// 记录完整手机号与短信原文，只落本机文件不回传控制台，1 MiB 上限
 	// 自动轮转。见 AutoEnroller.smsDebug。
-	SMSDebugPath   string
-	UpdateSchedule func(checkinHours, keepaliveHours []int)
+	SMSDebugPath string
+	// GrowthJobMarkPath 批跑恢复标记落盘路径（state.json 同目录；空 = 不落盘）。
+	// 全部账号批跑（all 模式）开始时写入待跑账号清单，逐账号完成即划掉，
+	// 全部跑完删除。进程重启后 main 检测到标记自动重新拉起剩余账号
+	//（动作幂等：已完成的秒级跳过）。
+	GrowthJobMarkPath string
+	UpdateSchedule    func(checkinHours, keepaliveHours []int)
 	// ReconfigureSchedule 完整排程热更新（五类任务时点 + 开关）。控制台保存
 	// schedule 卡片时调用；nil = 走 UpdateSchedule（老部署语义）。
 	ReconfigureSchedule func(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
