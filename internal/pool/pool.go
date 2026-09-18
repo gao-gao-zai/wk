@@ -307,9 +307,17 @@ type Pool struct {
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
 
-	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
-	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
+	// persistFails 本地 state.json 连续落盘失败计数（仅 persistSnapshot 在
+	// persistMu 下读写，无需 atomic）。用于落盘失败的日志节流：首败/每 N 次
+	// 提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
+
+	// persistMu 串行化落盘的快照→序列化→写盘→镜像整段流程，与 p.mu 正交。
+	// 见 persistSnapshot：持 p.mu 做 JSON 序列化（46 账号实测 ~150µs）与
+	// 磁盘 I/O（慢盘毫秒级）会每 5s 阻塞全部 Pick/Release/NoteSuccess 一次，
+	// 延迟毛刺正落在 p99 上。persistMu 在快照**之前**获取，保证快照顺序与
+	// 写盘顺序一致——先取的旧快照不可能后写覆盖新快照。
+	persistMu sync.Mutex
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -481,7 +489,7 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.randInt64N = fn
 }
 
-// startFlusher 每 flushInterval 检查 dirty 标志，有变更则 saveLocked 落盘。
+// startFlusher 每 flushInterval 检查 dirty 标志，有变更则落盘。
 func (p *Pool) startFlusher() {
 	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
 	go func() {
@@ -489,10 +497,12 @@ func (p *Pool) startFlusher() {
 		defer t.Stop()
 		for range t.C {
 			p.mu.Lock()
-			if p.dirty.Swap(false) {
+			dirty := p.dirty.Swap(false)
+			if dirty {
 				p.saveLocked()
+			} else {
+				p.mu.Unlock()
 			}
-			p.mu.Unlock()
 		}
 	}()
 }
@@ -501,9 +511,10 @@ func (p *Pool) startFlusher() {
 func (p *Pool) Flush() {
 	p.mu.Lock()
 	if p.dirty.Swap(false) {
-		p.saveLocked()
+		p.saveLocked() // 内部释放 p.mu 后再落盘
+	} else {
+		p.mu.Unlock()
 	}
-	p.mu.Unlock()
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
@@ -517,7 +528,6 @@ func (p *Pool) Add(a *auth.Auth) {
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
@@ -531,7 +541,9 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 		}
 	}
 	if changed {
-		p.saveLocked()
+		p.saveLocked() // 内部释放 p.mu 后再落盘
+	} else {
+		p.mu.Unlock()
 	}
 }
 
@@ -1517,35 +1529,52 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.applyAccountsLocked(s.Accounts)
 }
 
+// saveLocked 把内存状态落盘（本地 state.json + Redis 快照镜像）。
+// 锁纪律：调用方持有 p.mu，本方法只做 O(n) 的内存快照（微秒级），
+// 然后释放 p.mu 再做序列化/写盘/镜像（见 persistSnapshot）——磁盘 I/O
+// 不能发生在池锁内，否则每 5s 的 flusher 会把所有选号请求卡一个磁盘延迟。
+// 快照顺序由 persistMu 保证先序：持 p.mu 期间若发现已有更新的落盘在进行中，
+// 本次跳过并保持 dirty（下一次 flush 周期会带上最新状态重试）。
 func (p *Pool) saveLocked() {
-	if p.stateFp == "" {
-		return
-	}
+	p.persistMu.Lock()
 	sf := p.stateOverviewLocked()
-	raw, err := json.MarshalIndent(sf, "", "  ")
-	if err != nil {
-		p.notePersistFail(err)
-		return
-	}
-	if dir := filepath.Dir(p.stateFp); dir != "" {
-		_ = os.MkdirAll(dir, 0o755)
-	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		p.notePersistFail(err)
-		return
-	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
-		p.notePersistFail(err)
-		return
-	}
-	if p.persistFails > 0 {
-		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
-		log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
-		p.persistFails = 0
+	p.mu.Unlock()
+	p.persistSnapshot(sf)
+	p.persistMu.Unlock()
+}
+
+// persistSnapshot 序列化快照、写本地 state.json（临时文件 + rename 原子替换）、
+// 同步镜像一份带 savedAt 的快照到 Redis（fire-and-forget）。
+// 调用方必须已持有 persistMu 且**不再持有 p.mu**（写盘慢盘毫秒级，不能阻塞选号）。
+// 落盘失败按 notePersistFail 节流打日志；stateFp 为空时跳过本地写（镜像仍执行）。
+func (p *Pool) persistSnapshot(sf stateFile) {
+	if p.stateFp != "" {
+		raw, err := json.MarshalIndent(sf, "", "  ")
+		if err != nil {
+			p.notePersistFail(err)
+			return
+		}
+		if dir := filepath.Dir(p.stateFp); dir != "" {
+			_ = os.MkdirAll(dir, 0o755)
+		}
+		tmp := p.stateFp + ".tmp"
+		if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+			p.notePersistFail(err)
+			return
+		}
+		if err := os.Rename(tmp, p.stateFp); err != nil {
+			p.notePersistFail(err)
+			return
+		}
+		if p.persistFails > 0 {
+			// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
+			log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
+			p.persistFails = 0
+		}
 	}
 
 	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
+	// 复用同一份 sf；savedAt 取当前时刻（镜像语义 = "此刻的状态"）。
 	if p.store != nil {
 		snapRaw, err := json.Marshal(snapshot{stateFile: sf, SavedAt: time.Now()})
 		if err == nil {

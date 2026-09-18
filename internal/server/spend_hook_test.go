@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,7 +16,8 @@ import (
 // 且费用已知**时触发；失败请求（上游没扣费）不能扣。
 func TestSpendHookFiresOnSuccess(t *testing.T) {
 	// 直接驱动 chatStat：finalize 逻辑是纯函数式的（不依赖 handler 内部）。
-	st := newChatStatWithOptions(time.Now(), []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`), false, nil, nil, CreditPolicy{InputPer1K: 0.01, OutputPer1K: 0.05}, false, "/v1/chat/completions")
+	doc := decodeTestBody(t, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	st := newChatStatWithOptions(time.Now(), doc, false, nil, nil, CreditPolicy{InputPer1K: 0.01, OutputPer1K: 0.05}, false, "/v1/chat/completions")
 	var spent atomic.Int64
 	var spentUID atomic.Pointer[string]
 	st.spendHook = func(uid string, amount float64) {
@@ -32,7 +34,8 @@ func TestSpendHookFiresOnSuccess(t *testing.T) {
 	}
 
 	// 成功请求（200）且上游费用已知：触发，金额 = 上游 usage.credit。
-	st2 := newChatStatWithOptions(time.Now(), []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`), false, nil, nil, CreditPolicy{InputPer1K: 0.01, OutputPer1K: 0.05}, false, "/v1/chat/completions")
+	doc2 := decodeTestBody(t, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	st2 := newChatStatWithOptions(time.Now(), doc2, false, nil, nil, CreditPolicy{InputPer1K: 0.01, OutputPer1K: 0.05}, false, "/v1/chat/completions")
 	st2.spendHook = st.spendHook
 	st2.uid = "u2"
 	st2.status = 200
@@ -50,7 +53,8 @@ func TestSpendHookFiresOnSuccess(t *testing.T) {
 // TestSpendHookSkipsUnknownCredits 费用未知（unknown）的成功请求不扣：
 // 宁可不均衡也不错扣。
 func TestSpendHookSkipsUnknownCredits(t *testing.T) {
-	st := newChatStatWithOptions(time.Now(), []byte(`{}`), false, nil, nil, CreditPolicy{}, false, "/v1/chat/completions")
+	doc := decodeTestBody(t, `{}`)
+	st := newChatStatWithOptions(time.Now(), doc, false, nil, nil, CreditPolicy{}, false, "/v1/chat/completions")
 	var fired atomic.Bool
 	st.spendHook = func(string, float64) { fired.Store(true) }
 	st.uid = "u"
@@ -87,4 +91,14 @@ func TestSpendWiringInChatCompletions(t *testing.T) {
 	if rec.Code < 500 {
 		t.Fatalf("expected upstream-failure 5xx, got %d: %s", rec.Code, rec.Body.String())
 	}
+}
+
+// decodeTestBody 模拟 handler 入口的一次性解码，供直接构造 chatStat 的测试用。
+func decodeTestBody(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(body), &doc); err != nil || doc == nil {
+		t.Fatalf("test body must decode to a JSON object: %v", err)
+	}
+	return doc
 }

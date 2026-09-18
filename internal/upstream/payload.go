@@ -48,6 +48,16 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	if err := json.Unmarshal(src, &obj); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnprocessableBody, err)
 	}
+	return PrepareBodyFromMap(obj, sanitize, efforts)
+}
+
+// PrepareBodyFromMap 是 PrepareBodyOptWithEfforts 的免解码入口：调用方
+// （server 层）已经在入口做过一次全量 JSON 解码用于校验/统计/路由，把
+// 同一份 map 传进来可以省掉热路径上对大请求体的第二次 map[string]any
+// 解码（map 解码 + 数百个 interface box 分配比 typed struct 贵 3~5 倍）。
+// obj 为 nil（字面量 null 解码成功的结果）会得到与解码失败一致的
+// fail-closed 错误，语义与 PrepareBodyOptWithEffirts 对齐。
+func PrepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]string) ([]byte, error) {
 	// json.Unmarshal 对字面量 null 会**成功**并把 obj 留成 nil map，
 	// 随后 obj["stream"] = true 会直接 panic（assignment to entry in nil map）。
 	// 一个 `null` 请求体就足以打挂一个请求，所以必须显式挡掉。

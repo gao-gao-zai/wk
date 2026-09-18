@@ -369,6 +369,16 @@ func ExtractKey(body []byte) string {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
+	return ExtractKeyFromValue(obj)
+}
+
+// ExtractKeyFromValue 是 ExtractKey 的免解码入口：调用方（server 层）在
+// 请求入口已经做过一次全量 map 解码，传进来可省掉第二次解码。键的优先级
+// 与 ExtractKey 完全一致。
+func ExtractKeyFromValue(obj map[string]any) string {
+	if obj == nil {
+		return ""
+	}
 	if meta, ok := obj["metadata"].(map[string]any); ok {
 		if v := strOrEmpty(meta["conversation_id"]); v != "" {
 			return v

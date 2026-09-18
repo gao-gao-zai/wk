@@ -1,0 +1,30 @@
+goos: windows
+goarch: amd64
+pkg: workbuddy2api/internal/upstream
+cpu: Intel(R) Core(TM) i5-9300H CPU @ 2.40GHz
+BenchmarkSanitizeTextClean-8         	 9722952	       124.3 ns/op	 434.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	 9931916	       121.5 ns/op	 444.35 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	 9207268	       145.9 ns/op	 370.22 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	 8890770	       134.1 ns/op	 402.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	 9267318	       138.6 ns/op	 389.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	 9341457	       132.8 ns/op	 406.64 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  694872	      1665 ns/op	  45.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  606241	      1681 ns/op	  44.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  715197	      1960 ns/op	  38.26 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  714200	      1721 ns/op	  43.57 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  708265	      1750 ns/op	  42.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  612386	      1672 ns/op	  44.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	   77228	     15924 ns/op	1412.99 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	   77485	     16363 ns/op	1375.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	   76664	     15488 ns/op	1452.75 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	   77697	     17764 ns/op	1266.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	   75975	     15692 ns/op	1433.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	   74113	     16109 ns/op	1396.73 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	   66361	     16393 ns/op	1372.55 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	   75817	     16095 ns/op	1397.97 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	   77592	     15707 ns/op	1432.49 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	   78458	     15803 ns/op	1423.76 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	   79318	     17387 ns/op	1294.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	   70194	     15461 ns/op	1455.31 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	workbuddy2api/internal/upstream	35.571s

@@ -2369,24 +2369,23 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	chatBody, stream, err := responsesToChat(body)
+	chatBody, stream, err, requestDoc := responsesToChat(body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	var requestDoc map[string]any
 	var chatDoc map[string]any
 	// nil 检查与 chat 路径同理：`null` 会解码成功但留下 nil map，
 	// 后续 map 写入会 panic（"assignment to entry in nil map"）。
-	if json.Unmarshal(body, &requestDoc) != nil || requestDoc == nil ||
-		json.Unmarshal(chatBody, &chatDoc) != nil || chatDoc == nil {
+	// requestDoc 复用 responsesToChat 内部的解码结果，不再重复解码 body。
+	if requestDoc == nil || json.Unmarshal(chatBody, &chatDoc) != nil || chatDoc == nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid request body")
 		return
 	}
 	currentMessages, _ := chatDoc["messages"].([]any)
 	turnMessages := responseMessages(currentMessages)
 	messages := turnMessages
-	routeKey := session.ExtractKey(body)
+	routeKey := session.ExtractKeyFromValue(requestDoc)
 	previousID, _ := requestDoc["previous_response_id"].(string)
 	if previousID != "" {
 		previousMessages, previousRouteKey, ok := h.loadResponseHistory(previousID)
@@ -2606,10 +2605,13 @@ func (h *Handler) deleteResponseLocked(id string) {
 	}
 }
 
-func responsesToChat(raw []byte) ([]byte, bool, error) {
+// responsesToChat 把 Responses API 请求转成 chat 请求体。返回值额外带出
+// 已解码的 in（调用方本来就要再解码一次读 previous_response_id 等字段，
+// 共享这份 map 省掉一次全量解码）。
+func responsesToChat(raw []byte) ([]byte, bool, error, map[string]any) {
 	var in map[string]any
 	if err := json.Unmarshal(raw, &in); err != nil {
-		return nil, false, err
+		return nil, false, err, nil
 	}
 	chat := make(map[string]any, len(in))
 	for k, v := range in {
@@ -2665,7 +2667,7 @@ func responsesToChat(raw []byte) ([]byte, bool, error) {
 		chat["tools"] = tools
 	}
 	if model, ok := in["model"].(string); !ok || strings.TrimSpace(model) == "" {
-		return nil, false, fmt.Errorf("model is required")
+		return nil, false, fmt.Errorf("model is required"), in
 	}
 	msgs := make([]map[string]any, 0, 4)
 	if s, ok := in["instructions"].(string); ok && strings.TrimSpace(s) != "" {
@@ -2675,12 +2677,12 @@ func responsesToChat(raw []byte) ([]byte, bool, error) {
 		appendResponseInput(&msgs, input)
 	}
 	if len(msgs) == 0 {
-		return nil, false, fmt.Errorf("input is required")
+		return nil, false, fmt.Errorf("input is required"), in
 	}
 	chat["messages"] = msgs
 	// Carry a stable Responses conversation/cache key into the existing chat
 	// routing path without sending Responses-only conversation fields upstream.
-	if key := session.ExtractKey(raw); key != "" {
+	if key := session.ExtractKeyFromValue(in); key != "" {
 		meta, _ := chat["metadata"].(map[string]any)
 		if meta == nil {
 			meta = make(map[string]any)
@@ -2696,7 +2698,7 @@ func responsesToChat(raw []byte) ([]byte, bool, error) {
 		chat["max_tokens"] = n
 	}
 	out, err := json.Marshal(chat)
-	return out, stream, err
+	return out, stream, err, in
 }
 
 func appendResponseInput(msgs *[]map[string]any, input any) {
@@ -3371,32 +3373,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
-	if err := validateImageParts(body); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_image", err.Error())
-		return
-	}
-	// 请求体必须能解码成 JSON 对象。上游 client 在 prepareBody 里会返回
-	// upstream.ErrUnprocessableBody（fail-closed，避免脱敏被畸形 body 绕过），
-	// 但那个错误发生在选号之后的循环里，会被当成传输层错误逐号重试。
-	// 在这里提前拒掉，既给出正确的 400，也不浪费号池与熔断计数。
-	// 用 map 而不是 json.Valid：后者会放行 [1,2,3] 这类合法但非对象的 JSON，
-	// 而那正是 prepareBody 会拒绝的输入。
-	// 还必须显式检查 nil map：json.Unmarshal([]byte("null"), &doc) 返回
-	// err == nil 且 doc == nil，只看 err 会漏掉 `null` 这个 4 字节的请求体，
-	// 让它一路走到 prepareBody 才失败（并被误判成 503 no_healthy_account）。
+	// 请求体只做一次全量 JSON 解码，后续所有消费方（image part 校验、stream
+	// 探测、统计元数据、会话键提取、上游改写）共享同一份 map。此前这里是
+	// 5 次独立解码（其中 3 次是最贵的 map[string]any），成本随请求体大小
+	// 与 RPS 双重放大。map 而非 json.Valid 的原因不变：必须放行对象、拒绝
+	// 数组与 null。nil map 检查同理——`null` 解码成功但留下 nil。
 	var bodyDoc map[string]any
 	if err := json.Unmarshal(body, &bodyDoc); err != nil || bodyDoc == nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "request body must be a JSON object")
 		return
 	}
-	var peek struct {
-		Stream bool `json:"stream"`
+	if err := validateImagePartsDoc(bodyDoc); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_image", err.Error())
+		return
 	}
-	_ = json.Unmarshal(body, &peek)
+	stream, _ := bodyDoc["stream"].(bool)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	passthrough := h.requestPassthrough(r)
-	st := newChatStatWithOptions(time.Now(), body, peek.Stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.currentCreditPolicy(), passthrough, r.URL.Path)
+	st := newChatStatWithOptions(time.Now(), bodyDoc, stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.currentCreditPolicy(), passthrough, r.URL.Path)
 	st.completionStore = h.cfg.CompletionStore
 	// 影子扣减：成功请求的真实费用（upstream usage.credit 或费率估算）
 	// 实时回写账号池，weightOf 的有效余额因子据此均衡组内消耗。
@@ -3417,7 +3412,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	sessKey := ""
 	stickyUID := ""
 	if h.cfg.Session != nil {
-		sessKey = session.ExtractKey(body)
+		sessKey = session.ExtractKeyFromValue(bodyDoc)
 		if sessKey != "" {
 			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
 				stickyUID = uid
@@ -3503,8 +3498,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 时长策略按请求类型分流：流式走 Stream（默认不限总时长 + 守空闲），
 		// 非流式仍用整个请求的上限。二者语义不同，不能共用一个超时。
-		policy := h.cfg.Upstream.RequestPolicy(peek.Stream)
-		rc, status, respBody, upstreamHeaders, terr := h.cfg.Upstream.ChatStreamWithPolicy(r.Context(), acct, body, policy)
+		policy := h.cfg.Upstream.RequestPolicy(stream)
+		rc, status, respBody, upstreamHeaders, terr := h.cfg.Upstream.ChatStreamWithPolicyObj(r.Context(), acct, bodyDoc, policy)
 		upstream.CopyResponseIDHeaders(w.Header(), upstreamHeaders)
 		upstreamHeaderID := upstream.ResponseIDFromHeader(upstreamHeaders)
 		if upstreamHeaderID != "" {
@@ -3538,7 +3533,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fail(acct.UID)
 			continue
 		}
-		if peek.Stream {
+		if stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
@@ -3630,7 +3625,24 @@ func validateImageParts(body []byte) error {
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil // preserve the existing upstream handling for generic JSON errors
 	}
-	for mi, message := range doc.Messages {
+	return validateImagePartsMessages(doc.Messages)
+}
+
+// validateImagePartsDoc 是 validateImageParts 的免解码入口：直接消费请求
+// 入口已解码好的 body map（messages 字段）。
+func validateImagePartsDoc(doc map[string]any) error {
+	messages, _ := doc["messages"].([]any)
+	var msgs []map[string]any
+	for _, raw := range messages {
+		if m, ok := raw.(map[string]any); ok {
+			msgs = append(msgs, m)
+		}
+	}
+	return validateImagePartsMessages(msgs)
+}
+
+func validateImagePartsMessages(doc []map[string]any) error {
+	for mi, message := range doc {
 		parts, ok := message["content"].([]any)
 		if !ok {
 			continue

@@ -26,6 +26,19 @@ func ResponseID(obj map[string]any) string {
 	return ""
 }
 
+// ResponseIDFromStats is the typed-struct companion of ResponseID for callers
+// that decode SSE frames into typed structs (no map at hand). Arguments follow
+// the same precedence as responseIDFields (request IDs, then record IDs, then
+// the generic id, camelCase variants included). Empty strings are skipped.
+func ResponseIDFromStats(ids ...string) string {
+	for _, v := range ids {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // ResponseIDFromHeader returns the first WorkBuddy request/record identifier
 // found in the upstream response headers, preserving its value verbatim.
 func ResponseIDFromHeader(header http.Header) string {

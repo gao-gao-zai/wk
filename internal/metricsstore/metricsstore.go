@@ -186,7 +186,11 @@ func Open(path string, retention ...Retention) (*Store, error) {
 	db.SetMaxIdleConns(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`); err != nil {
+	// synchronous=NORMAL：WAL 下只对 checkpoint 落盘做 fsync，事务提交不等
+	// fsync。掉电最多丢最后几个事务（指标/请求日志，非账务数据），不会损坏
+	// 库；换来的是每个请求出口的 RecordCompletion 不再卡在磁盘 fsync 上——
+	// 450 并发流式请求同时收尾时，这正是 p99 尾延迟的来源之一。
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;`); err != nil {
 		db.Close()
 		return nil, err
 	}

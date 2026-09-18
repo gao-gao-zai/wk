@@ -14,7 +14,7 @@ import (
 )
 
 func TestResponsesPreservesPromptCacheFields(t *testing.T) {
-	body, stream, err := responsesToChat([]byte(`{
+	body, stream, err, _ := responsesToChat([]byte(`{
 		"model":"glm-5.2",
 		"input":"hello",
 		"instructions":"be concise",
@@ -41,7 +41,7 @@ func TestResponsesPreservesPromptCacheFields(t *testing.T) {
 }
 
 func TestResponsesInputImageConvertsToChatImageURL(t *testing.T) {
-	body, _, err := responsesToChat([]byte(`{
+	body, _, err, _ := responsesToChat([]byte(`{
 		"model":"glm-5.2",
 		"input":[{"role":"user","content":[
 			{"type":"input_text","text":"describe this"},
@@ -71,7 +71,7 @@ func TestResponsesInputImageConvertsToChatImageURL(t *testing.T) {
 }
 
 func TestResponsesMalformedInputImageIsRejected(t *testing.T) {
-	body, _, err := responsesToChat([]byte(`{
+	body, _, err, _ := responsesToChat([]byte(`{
 		"model":"glm-5.2",
 		"input":[{"role":"user","content":[{"type":"input_image","image_url":{}}]}]
 	}`))
@@ -251,7 +251,7 @@ func TestResponsesStripsConversationIdentityUpstream(t *testing.T) {
 // function_call_output 必须降级为 user 消息而不是被静默丢弃——丢弃会留下
 // 孤立的 assistant.tool_calls，直接触发上游 11148。
 func TestResponsesFunctionCallOutputWithoutCallIDBecomesUser(t *testing.T) {
-	body, _, err := responsesToChat([]byte(`{
+	body, _, err, _ := responsesToChat([]byte(`{
 		"model":"glm-5.2",
 		"input":[
 			{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}"},

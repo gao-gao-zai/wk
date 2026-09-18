@@ -181,9 +181,14 @@ type Client struct {
 func New() *Client {
 	// Keep the standard dial/TLS timeouts and HTTP/2 negotiation. A larger idle
 	// pool avoids repeating handshakes after concurrent streaming bursts.
+	// PerHost must cover the deployment's full serving capacity (accounts ×
+	// max-in-flight): the upstream is a single host, and every connection
+	// beyond the idle cap is torn down after one use and pays a fresh public-
+	// internet TLS handshake (~1-2 RTT) on the next request. 512 leaves room
+	// for the load-test default of 100×3 plus admin/control-plane traffic.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.MaxIdleConns = 256
-	tr.MaxIdleConnsPerHost = 128
+	tr.MaxIdleConns = 1024
+	tr.MaxIdleConnsPerHost = 512
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		SanitizeFingerprints: true,
@@ -209,6 +214,13 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // 否则内容脱敏会被一个畸形 body 绕过（见 ErrUnprocessableBody）。
 func (c *Client) prepareBody(body []byte) ([]byte, error) {
 	return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), c.effortsSnapshot())
+}
+
+// prepareBodyFromObj 是 prepareBody 的免解码入口：server 层在请求入口已经
+// 做过一次全量 map 解码（校验/统计/路由共用），传进来可省掉对大请求体的
+// 第二次 map[string]any 解码。fail-closed 语义与 prepareBody 完全一致。
+func (c *Client) prepareBodyFromObj(obj map[string]any) ([]byte, error) {
+	return PrepareBodyFromMap(obj, c.sanitizeEnabled(), c.effortsSnapshot())
 }
 
 // sanitizeEnabled 读取脱敏开关的并发安全快照。
@@ -417,12 +429,27 @@ func (p StreamPolicy) headerWait() time.Duration {
 // 复制是安全的——http.Client 不含任何锁；Transport 仍是同一个指针，因此测试里
 // 替换 up.HTTP.Transport 的做法照旧生效。
 func (c *Client) ChatStreamWithPolicy(ctx context.Context, a *auth.Auth, body []byte, policy StreamPolicy) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
-	url := c.chatBase(a) + "/v2/chat/completions"
 	outBody, err := c.prepareBody(body)
 	if err != nil {
 		return nil, 0, nil, nil, err
 	}
+	return c.chatStreamPrepared(ctx, a, outBody, policy)
+}
 
+// ChatStreamWithPolicyObj 是 ChatStreamWithPolicy 的免解码入口：调用方把
+// 请求入口已解码好的 body map 传入，省掉第二次 map[string]any 全量解码。
+// 其余语义（时长策略、看门狗、错误分类）与 ChatStreamWithPolicy 完全一致。
+func (c *Client) ChatStreamWithPolicyObj(ctx context.Context, a *auth.Auth, obj map[string]any, policy StreamPolicy) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
+	outBody, err := c.prepareBodyFromObj(obj)
+	if err != nil {
+		return nil, 0, nil, nil, err
+	}
+	return c.chatStreamPrepared(ctx, a, outBody, policy)
+}
+
+// chatStreamPrepared 发送已改写完毕的出站请求体并处理响应。
+func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody []byte, policy StreamPolicy) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
+	url := c.chatBase(a) + "/v2/chat/completions"
 	// Total（可为 0=不限）覆盖全程：等响应头 + 读响应体。
 	reqCtx, cancel := context.WithCancel(ctx)
 	if policy.Total > 0 {

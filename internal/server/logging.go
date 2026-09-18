@@ -170,21 +170,12 @@ type MetricsStore interface {
 	SnapshotMetrics() map[string]any
 }
 
-// newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
-func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
-	return newChatStatWithStore(now, body, stream, nil)
-}
-
-func newChatStatWithStore(now time.Time, body []byte, stream bool, store MetricsStore) *chatStat {
-	return newChatStatWithOptions(now, body, stream, store, nil, CreditPolicy{}, false, "")
-}
-
-func newChatStatWithOptions(now time.Time, body []byte, stream bool, metricsStore MetricsStore, requestLogStore RequestLogStore, creditPolicy CreditPolicy, passthrough bool, route string) *chatStat {
+func newChatStatWithOptions(now time.Time, doc map[string]any, stream bool, metricsStore MetricsStore, requestLogStore RequestLogStore, creditPolicy CreditPolicy, passthrough bool, route string) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	model, requestedOutputTokens := parseRequestMetadata(body)
+	model, requestedOutputTokens := parseRequestMetadataDoc(doc)
 	return &chatStat{
 		id:                    fmt.Sprintf("req_%d_%d", now.UnixNano(), requestIDSeq.Add(1)),
 		start:                 now,
@@ -217,6 +208,23 @@ func parseRequestMetadata(body []byte) (string, int) {
 		model = "-"
 	}
 	return model, maxInts(obj.MaxCompletionTokens, obj.MaxOutputTokens, obj.MaxTokens)
+}
+
+// parseRequestMetadataDoc 是 parseRequestMetadata 的免解码入口：直接从请求
+// 入口已解码好的 body map 读 model 与 max_tokens 字段（typed struct 解码
+// 在这里已无必要——map 就在手边）。字段优先级与 parseRequestMetadata 一致。
+func parseRequestMetadataDoc(obj map[string]any) (string, int) {
+	model, _ := obj["model"].(string)
+	if model == "" {
+		model = "-"
+	}
+	tokens := 0
+	for _, key := range []string{"max_completion_tokens", "max_output_tokens", "max_tokens"} {
+		if v, ok := obj[key].(float64); ok {
+			tokens = maxInts(tokens, int(v))
+		}
+	}
+	return model, tokens
 }
 
 // done 幂等落一行表格日志。
@@ -430,32 +438,33 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			s.ttfb = time.Nanosecond
 		}
 	}
-	// Decode each SSE payload once. The previous implementation unmarshaled
-	// every chunk three times (map, tool-call struct, usage struct), which was a
-	// measurable CPU and allocation cost for token-heavy streams.
-	var rawChunk map[string]any
-	if json.Unmarshal([]byte(payload), &rawChunk) != nil {
+	// Decode each SSE payload once with a typed struct. The map-based decode
+	// allocated hundreds of interface boxes per frame for token-heavy streams;
+	// the struct decode keeps the same field precedence without any boxing.
+	// usage 的别名很多（prompt/input、completion/output、各家 cache 命名），
+	// 全部列入同一个 struct，缺字段解码为零值，语义与旧 map 版一致
+	// （各口径仍取 max）。json.RawMessage 不需要的字段直接不解码。
+	var chunk sseStatsChunk
+	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return
 	}
 	if s.responseID == "" {
-		s.responseID = upstream.ResponseID(rawChunk)
+		s.responseID = upstream.ResponseIDFromStats(
+			chunk.RequestID, chunk.RequestIDCamel, chunk.RequestIDUpper,
+			chunk.RecordID, chunk.RecordIDCamel, chunk.RecordIDUpper,
+			chunk.ID)
 	}
-	if credits, ok := extractCreditUsage(rawChunk); ok {
+	if credits, ok := chunk.creditUsage(); ok {
 		s.credits = credits
 		s.hasCredits = true
 	}
-	if choices, ok := rawChunk["choices"].([]any); ok {
+	if len(chunk.Choices) > 0 {
 		if s.toolCallIDs == nil {
 			s.toolCallIDs = make(map[string]struct{})
 		}
-		for _, choice := range choices {
-			cm, _ := choice.(map[string]any)
-			delta, _ := cm["delta"].(map[string]any)
-			calls, _ := delta["tool_calls"].([]any)
-			for _, call := range calls {
-				callMap, _ := call.(map[string]any)
-				index, _ := usageInt(callMap["index"])
-				key := fmt.Sprintf("index:%d", index)
+		for _, choice := range chunk.Choices {
+			for _, call := range choice.Delta.ToolCalls {
+				key := fmt.Sprintf("index:%d", call.Index)
 				if _, seen := s.toolCallIDs[key]; !seen {
 					s.toolCallIDs[key] = struct{}{}
 					s.toolCalls++
@@ -463,39 +472,115 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			}
 		}
 	}
-	usage, ok := rawChunk["usage"].(map[string]any)
-	if !ok {
+	usage := chunk.Usage
+	if usage.empty() {
 		return
 	}
 	s.hasUsage = true
-	prompt, _ := usageInt(usage["prompt_tokens"])
-	input, _ := usageInt(usage["input_tokens"])
-	completion, _ := usageInt(usage["completion_tokens"])
-	output, _ := usageInt(usage["output_tokens"])
-	s.tokens = maxInts(completion, output)
-	s.inputTokens = maxInts(prompt, input)
-	total, _ := usageInt(usage["total_tokens"])
+	s.tokens = maxInts(usage.CompletionTokens, usage.OutputTokens)
+	s.inputTokens = maxInts(usage.PromptTokens, usage.InputTokens)
+	total := usage.TotalTokens
+	if total == 0 && (s.inputTokens > 0 || s.tokens > 0) {
+		total = s.inputTokens + s.tokens
+	}
 	s.totalTokens = total
-	if s.totalTokens == 0 && (s.inputTokens > 0 || s.tokens > 0) {
-		s.totalTokens = s.inputTokens + s.tokens
+	cacheRead := maxInts(usage.PromptCacheHitTokens, usage.CacheReadInputTokens, usage.PromptTokensDetails.CachedTokens, usage.InputTokensDetails.CachedTokens)
+	cacheWrite := maxInts(usage.PromptCacheMissTokens, usage.CacheCreationInputTokens, usage.InputTokensDetails.CacheCreationInputTokens, usage.InputTokensDetails.CacheWriteTokens)
+	s.cacheRead = cacheRead
+	s.cacheWrite = cacheWrite
+}
+
+// sseStatsChunk 是统计层对单帧 SSE payload 的 typed 解码目标。只列统计
+// 需要的字段；未知字段忽略（与旧 map 版一致——旧版只按已知键取值）。
+// ID 字段的驼峰变体（requestId/requestID/recordId/recordID）与 snake_case
+// 并存，全部列入以保持与 map 版 ResponseID 相同的命中率。
+type sseStatsChunk struct {
+	RequestID      string `json:"request_id"`
+	RequestIDCamel string `json:"requestId"`
+	RequestIDUpper string `json:"requestID"`
+	RecordID       string `json:"record_id"`
+	RecordIDCamel  string `json:"recordId"`
+	RecordIDUpper  string `json:"recordID"`
+	ID             string `json:"id"`
+	Choices        []struct {
+		Delta struct {
+			ToolCalls []struct {
+				Index int `json:"index"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Usage sseStatsUsage `json:"usage"`
+}
+
+// sseStatsUsage 覆盖上游/兼容层用过的全部 token 计数字段命名。
+// nested details 与平级字段并存时取 max（对齐旧 map 实现的 maxInts 口径）。
+type sseStatsUsage struct {
+	PromptTokens    int `json:"prompt_tokens"`
+	InputTokens     int `json:"input_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	OutputTokens    int `json:"output_tokens"`
+	TotalTokens     int `json:"total_tokens"`
+
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+	CacheReadInputTokens  int `json:"cache_read_input_tokens"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	InputTokensDetails struct {
+		CachedTokens          int `json:"cached_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheWriteTokens      int `json:"cache_write_tokens"`
+	} `json:"input_tokens_details"`
+
+	// credit 裸名优先（WorkBuddy 真实字段），长名兜底（兼容层/参考实现）。
+	// 用 *float64 而非裸 float64：credit=0 是合法观测（费用舍入到 0），
+	// 必须与"字段缺失"（nil）区分，语义对齐 map 版 extractCreditUsage 的
+	// 键序契约（见 credit_field_test.go）。
+	Credit            *float64 `json:"credit"`
+	CreditsConsumed   *float64 `json:"credits_consumed"`
+	CreditConsumed    *float64 `json:"credit_consumed"`
+	CreditsUsed       *float64 `json:"credits_used"`
+	CreditUsed        *float64 `json:"credit_used"`
+	UsedCredits       *float64 `json:"used_credits"`
+	ConsumedCredits   *float64 `json:"consumed_credits"`
+	CostCredits       *float64 `json:"cost_credits"`
+	BillableCredits   *float64 `json:"billable_credits"`
+	CreditCost        *float64 `json:"credit_cost"`
+	CreditsConsumedC  *float64 `json:"creditsConsumed"`
+	CreditConsumedC   *float64 `json:"creditConsumed"`
+	CreditsUsedC      *float64 `json:"creditsUsed"`
+	CreditUsedC       *float64 `json:"creditUsed"`
+	UsedCreditsC      *float64 `json:"usedCredits"`
+	ConsumedCreditsC  *float64 `json:"consumedCredits"`
+	CostCreditsC      *float64 `json:"costCredits"`
+	BillableCreditsC  *float64 `json:"billableCredits"`
+	CreditCostC       *float64 `json:"creditCost"`
+}
+
+func (u sseStatsUsage) empty() bool {
+	return u == sseStatsUsage{}
+}
+
+// creditUsage 提取本帧携带的真实费用，键序与 map 版 extractCreditUsage 的
+// 契约一致：裸名 "credit" 最优先，其后长名（snake/camel 同序）；nil（字段
+// 缺失）与负值/非法值一律跳过继续向后。credit=0 合法（ok=true）。
+func (c sseStatsChunk) creditUsage() (float64, bool) {
+	u := c.Usage
+	for _, p := range []*float64{
+		u.Credit,
+		u.CreditsConsumed, u.CreditConsumed, u.CreditsUsed, u.CreditUsed,
+		u.UsedCredits, u.ConsumedCredits, u.CostCredits, u.BillableCredits, u.CreditCost,
+		u.CreditsConsumedC, u.CreditConsumedC, u.CreditsUsedC, u.CreditUsedC,
+		u.UsedCreditsC, u.ConsumedCreditsC, u.CostCreditsC, u.BillableCreditsC, u.CreditCostC,
+	} {
+		if p != nil && validCreditValue(*p) {
+			return *p, true
+		}
 	}
-	cacheRead, _ := usageInt(usage["prompt_cache_hit_tokens"])
-	cacheRead2, _ := usageInt(usage["cache_read_input_tokens"])
-	cacheWrite, _ := usageInt(usage["prompt_cache_miss_tokens"])
-	cacheWrite2, _ := usageInt(usage["cache_creation_input_tokens"])
-	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
-		v, _ := usageInt(details["cached_tokens"])
-		cacheRead = maxInts(cacheRead, v)
-	}
-	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
-		cached, _ := usageInt(details["cached_tokens"])
-		created, _ := usageInt(details["cache_creation_input_tokens"])
-		written, _ := usageInt(details["cache_write_tokens"])
-		cacheRead = maxInts(cacheRead, cached)
-		cacheWrite2 = maxInts(cacheWrite2, created, written)
-	}
-	s.cacheRead = maxInts(cacheRead, cacheRead2)
-	s.cacheWrite = maxInts(cacheWrite, cacheWrite2)
+	return 0, false
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。

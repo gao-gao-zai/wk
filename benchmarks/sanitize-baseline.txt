@@ -1,0 +1,30 @@
+goos: windows
+goarch: amd64
+pkg: workbuddy2api/internal/upstream
+cpu: Intel(R) Core(TM) i5-9300H CPU @ 2.40GHz
+BenchmarkSanitizeTextClean-8         	 1072952	      1100 ns/op	  49.07 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	 1000000	      1348 ns/op	  40.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	  943813	      1206 ns/op	  44.78 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	  893761	      1294 ns/op	  41.73 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	 1000000	      1203 ns/op	  44.87 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextClean-8         	  911839	      1323 ns/op	  40.80 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  713917	      1773 ns/op	  42.30 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  653089	      1653 ns/op	  45.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  753261	      1972 ns/op	  38.04 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  751036	      1995 ns/op	  37.59 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  572388	      2370 ns/op	  31.65 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextIdentity-8      	  615302	      1747 ns/op	  42.92 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	    1726	    622643 ns/op	  36.14 MB/s	       4 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	    1993	    593356 ns/op	  37.92 MB/s	       3 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	    1957	    612375 ns/op	  36.74 MB/s	       6 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	    1936	    633776 ns/op	  35.50 MB/s	       3 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	    2002	    648732 ns/op	  34.68 MB/s	       3 B/op	       0 allocs/op
+BenchmarkSanitizeTextLongClean-8     	    2002	    686542 ns/op	  32.77 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	    1885	    629250 ns/op	  35.76 MB/s	       3 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	    1808	    654287 ns/op	  34.39 MB/s	       3 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	    1934	    599644 ns/op	  37.52 MB/s	       3 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	    1994	    693710 ns/op	  32.43 MB/s	       3 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	    2127	    617900 ns/op	  36.41 MB/s	       3 B/op	       0 allocs/op
+BenchmarkHasFingerprintLongClean-8   	    1851	    623391 ns/op	  36.09 MB/s	       7 B/op	       0 allocs/op
+PASS
+ok  	workbuddy2api/internal/upstream	42.191s
