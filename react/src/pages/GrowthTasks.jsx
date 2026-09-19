@@ -60,6 +60,9 @@ export default function GrowthTasks({ api, data, refresh }) {
   const [detailOpen, setDetailOpen] = useState(false);
   const [dismissed, setDismissed] = useState(false);
   const pollRef = useRef(null);
+  // 一次性任务台账：三态统计 + 每账号领取明细。
+  const [ledger, setLedger] = useState(null);
+  const [ledgerLoading, setLedgerLoading] = useState(false);
 
   // CN 账号（global 无成长任务体系）。
   const accounts = useMemo(
@@ -125,6 +128,21 @@ export default function GrowthTasks({ api, data, refresh }) {
 
   // 卸载清定时器。
   useEffect(() => () => stopPolling(), [stopPolling]);
+
+  // loadLedger 拉取一次性任务台账（三态统计 + 明细）。
+  const loadLedger = useCallback(async () => {
+    setLedgerLoading(true);
+    try {
+      setLedger(await api('/admin/growth/ledger'));
+    } catch { /* 老后端无此端点：静默 */ }
+    finally { setLedgerLoading(false); }
+  }, [api]);
+
+  // 进页面 + job 结束时刷新台账。
+  useEffect(() => { loadLedger(); }, [loadLedger]);
+  useEffect(() => {
+    if (jobSnap && jobSnap.phase && jobSnap.phase !== 'running') loadLedger();
+  }, [jobSnap?.phase]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // loadTasks 拉取单账号任务列表。
   const loadTasks = useCallback(async uid => {
@@ -360,6 +378,14 @@ export default function GrowthTasks({ api, data, refresh }) {
   const claimedCount = items.filter(item => item.claimed).length;
   // 完成且用户没关过 → 显示摘要卡；用户关了（dismissed）→ 不显示。
   const showCard = snap && (running || failed || !dismissed);
+  // 进度文案按模式区分：all = 账号粒度（N/M 个账号）；account = 任务项粒度。
+  const isAllMode = snap?.mode === 'all';
+  const progressLabel = snap && snap.total
+    ? (isAllMode ? `${snap.done}/${snap.total} 个账号` : `${snap.done}/${snap.total} 项`)
+    : `${snap?.done ?? 0}/…`;
+  const summaryText = isAllMode
+    ? `共 ${snap.total} 个账号：${items.length} 项结果（${doneItems.length} 完成、${claimedCount} 项自动领奖、${items.length - doneItems.length} 失败/跳过）`
+    : `共 ${items.length} 项：${doneItems.length} 完成、${claimedCount} 项自动领奖、${items.length - doneItems.length} 失败/跳过`;
 
   const progressCard = showCard ? (
     <Card
@@ -376,7 +402,7 @@ export default function GrowthTasks({ api, data, refresh }) {
         <Progress
           percent={percent}
           status={failed ? 'exception' : (running ? 'active' : 'success')}
-          format={() => `${snap.done}/${snap.total || '?'}`}
+          format={() => progressLabel}
         />
         <Space wrap>
           {running && snap.current && (
@@ -385,9 +411,7 @@ export default function GrowthTasks({ api, data, refresh }) {
           {snap.elapsed && <Text type="secondary">已用时 {snap.elapsed}</Text>}
           {running && snap.eta && <Text type="secondary">预计剩余 {snap.eta}</Text>}
           {!running && (
-            <Text type="secondary">
-              共 {items.length} 项：{doneItems.length} 完成、{claimedCount} 项自动领奖、{items.length - doneItems.length} 失败/跳过
-            </Text>
+            <Text type="secondary">{summaryText}</Text>
           )}
         </Space>
         {failed && snap.error && <Alert type="error" showIcon message={snap.error} style={{ padding: '4px 12px' }} />}
@@ -419,9 +443,92 @@ export default function GrowthTasks({ api, data, refresh }) {
     </Card>
   ) : null;
 
+  // ---------------------------------------------------------------------------
+  // 一次性任务台账卡片：三态统计（完成/部分/未开始）+ 积分收益 + 明细表。
+  // ---------------------------------------------------------------------------
+  const statusTag = status => ({
+    done: <Tag color="green">已完成</Tag>,
+    partial: <Tag color="orange">部分完成</Tag>,
+    not_started: <Tag color="default">未开始</Tag>,
+  }[status] || <Tag>{status}</Tag>);
+
+  const ledgerColumns = [
+    {
+      title: '账号', key: 'uid', ellipsis: true,
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Text code>{record.uid}</Text>
+          <Text type="secondary">{record.nickname || '-'}</Text>
+        </Space>
+      ),
+    },
+    {
+      title: '一次性任务', key: 'status', width: 120,
+      render: (_, record) => statusTag(record.status),
+    },
+    {
+      title: '进度', key: 'progress', width: 170,
+      render: (_, record) => (
+        <Space direction="vertical" size={0} style={{ width: '100%' }}>
+          <Progress percent={record.total_count ? Math.round((record.done_count / record.total_count) * 100) : 0} size="small" showInfo={false} />
+          <Text type="secondary">{record.done_count}/{record.total_count} 项</Text>
+        </Space>
+      ),
+    },
+    {
+      title: '任务积分收益', dataIndex: 'credit', key: 'credit', width: 130, align: 'right',
+      render: value => <Text type={value > 0 ? 'success' : undefined}>{value > 0 ? `+${value} 分` : '—'}</Text>,
+    },
+    {
+      title: '能量收益', dataIndex: 'energy', key: 'energy', width: 100, align: 'right',
+      render: value => value > 0 ? <Text>+{value} 能</Text> : <Text type="secondary">—</Text>,
+    },
+    {
+      title: '最近领取', dataIndex: 'last_at', key: 'last_at', width: 160,
+      render: value => value ? <Text type="secondary">{value.replace('T', ' ').slice(0, 19)}</Text> : <Text type="secondary">—</Text>,
+    },
+  ];
+
+  const ledgerCard = ledger ? (
+    <Card
+      title="一次性任务台账" size="small"
+      extra={<Button size="small" icon={<ReloadOutlined />} loading={ledgerLoading} onClick={loadLedger}>刷新</Button>}
+    >
+      <Space wrap style={{ marginBottom: 12 }}>
+        <Tag color="green">已完成 {ledger.done_accounts}</Tag>
+        <Tag color="orange">部分完成 {ledger.partial_accounts}</Tag>
+        <Tag>未开始 {ledger.not_started}</Tag>
+        <Tag color="blue">共 {ledger.total_accounts} 个账号</Tag>
+        <Text strong style={{ color: '#389e0d' }}>任务总收益 +{ledger.total_credit} 积分</Text>
+        <Text type="secondary">+{ledger.total_energy} 能量</Text>
+      </Space>
+      <Table
+        rowKey="uid" size="small" columns={ledgerColumns} dataSource={ledger.accounts}
+        pagination={{ pageSize: 10, showTotal: total => `共 ${total} 个账号` }}
+        expandable={{
+          rowExpandable: record => (record.tasks || []).length > 0,
+          expandedRowRender: record => (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {(record.tasks || []).map(task => (
+                <Tooltip key={task.task_code} title={task.at ? `${task.at.replace('T', ' ').slice(0, 19)} 领取${task.credit ? ` +${task.credit}分` : ''}${task.energy ? ` +${task.energy}能` : ''}` : '本网关部署前/手动完成（无时间记录）'}>
+                  <Tag color={task.at ? 'green' : 'default'}>{task.task_code}{task.credit ? ` +${task.credit}` : ''}</Tag>
+                </Tooltip>
+              ))}
+            </div>
+          ),
+        }}
+      />
+      <Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+        台账记录本网关自动领取的任务奖励（含领取时间与积分）；「部分完成/未开始」的判定实时对账上游任务状态。
+        任务积分收益只统计经本网关领取的部分，此前手动完成的按 0 计。
+      </Paragraph>
+    </Card>
+  ) : null;
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {progressCard}
+      {ledgerCard}
 
       <Card title="成长任务运营" size="small">
         <Space wrap>

@@ -395,6 +395,8 @@ func main() {
 		SMSDebugPath: smsDebugLogPath(cfg),
 		// 批跑恢复标记同目录：重启自动续跑剩余账号（见 ResumeGrowthJobsAfterRestart）。
 		GrowthJobMarkPath: filepath.Join(filepath.Dir(cfg.StateFile), "growth-job.json"),
+		// 一次性任务台账同目录：领取记录 + 积分收益持久化（前端三态展示）。
+		GrowthLedgerPath: filepath.Join(filepath.Dir(cfg.StateFile), "growth-ledger.json"),
 		UpdateSchedule: func(checkinHours, keepaliveHours []int) {
 			// 老签名适配：只改签到/保活时点，其余排程参数不动（完整热改走 Reconfigure）。
 			sch.Reconfigure(checkinHours, nil, nil, keepaliveHours, nil,

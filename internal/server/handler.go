@@ -84,6 +84,10 @@ type Config struct {
 	// 全部跑完删除。进程重启后 main 检测到标记自动重新拉起剩余账号
 	//（动作幂等：已完成的秒级跳过）。
 	GrowthJobMarkPath string
+	// GrowthLedgerPath 一次性任务台账落盘路径（state.json 同目录；空 = 纯内存）。
+	// 记录每账号每任务的领取时间与积分/能量收益，重启不丢；查询端点合并
+	// 上游 claimed 对账产出三态视图（完成/部分/未开始）。
+	GrowthLedgerPath string
 	UpdateSchedule    func(checkinHours, keepaliveHours []int)
 	// ReconfigureSchedule 完整排程热更新（五类任务时点 + 开关）。控制台保存
 	// schedule 卡片时调用；nil = 走 UpdateSchedule（老部署语义）。
@@ -178,6 +182,9 @@ type Handler struct {
 	growthLocks growthTaskLocks
 	// growthJobs 一键完成异步任务注册表（growthjobs.go）。
 	growthJobs growthJobRegistry
+	// growthLedger 一次性任务持久台账（growthledger.go）：领取记录 + 积分收益。
+	// nil = 不落盘（测试里可能不初始化，record 前判空）。
+	growthLedger *growthLedger
 }
 
 type unlockAttempt struct {
@@ -226,6 +233,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
+	h.growthLedger = newGrowthLedger(cfg.GrowthLedgerPath)
 	// 运行时特性开关/费率从启动配置拷贝一份；WebUI 保存时经 updateFeatures
 	// 同时改这里和 upstream Client（见 saveAdminConfig）。sanitizeHooks 为 nil
 	// 时（单测直接构造 Handler）只更新本地副本。
@@ -298,6 +306,8 @@ func NewHandler(cfg Config) *Handler {
 	// 成长任务异步 job 进度查询（一键完成的后台任务状态）。
 	h.mux.HandleFunc("GET /admin/growth/jobs", h.withFrontend(h.growthJobList))
 	h.mux.HandleFunc("GET /admin/growth/jobs/{id}", h.withFrontend(h.growthJobStatus))
+	// 成长任务持久台账：一次性任务完成情况 + 积分收益（三态统计）。
+	h.mux.HandleFunc("GET /admin/growth/ledger", h.withFrontend(h.growthLedgerOverview))
 	h.startGrowthJobSweeper()
 	// 自动加号：豪猪取号→短信直登→落盘。persist/find 回调指向本 handler，
 	// 必须在 NewHandler 里组装（main 那边拿不到方法值）。

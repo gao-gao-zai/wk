@@ -83,6 +83,7 @@ func (s *growthStub) handler() http.Handler {
 }
 
 // newGrowthHandler 构造接好 pool/upstream 的 handler（growth 域全指向 stub）。
+// 台账落盘到 t.TempDir()（验证持久化语义）。
 func newGrowthHandler(t *testing.T, stub *growthStub, accounts ...*auth.Auth) (*Handler, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(stub.handler())
@@ -99,7 +100,8 @@ func newGrowthHandler(t *testing.T, stub *growthStub, accounts ...*auth.Auth) (*
 		BillingBaseGlob: srv.URL,
 		WebBaseCN:       srv.URL,
 	}
-	h := newTestHandler(t, Config{Pool: p, Upstream: up})
+	h := newTestHandler(t, Config{Pool: p, Upstream: up,
+		GrowthLedgerPath: filepath.Join(t.TempDir(), "growth-ledger.json")})
 	return h.Handler, srv
 }
 
@@ -359,6 +361,89 @@ func TestAllAccountsAutoAllJob(t *testing.T) {
 	results, _ := snap["results"].([]any)
 	if len(results) != 4 {
 		t.Fatalf("results = %d, want 4 (got %v)", len(results), results)
+	}
+}
+
+func TestGrowthLedgerRecordsClaimsAndOverview(t *testing.T) {
+	fastGrowthActions(t)
+	// chat_5 上报后达标（claim +50 分）；first_buddy 上游已领（对账补全）。
+	stub := &growthStub{tasks: growthTasksSample, claimCredit: 50, claimEnergy: 5, reportProgress: true}
+	h, _ := newGrowthHandler(t, stub,
+		&auth.Auth{UID: "u1", AccessToken: "at"},
+		&auth.Auth{UID: "u2", AccessToken: "at"}, // u2 不跑任何动作
+	)
+	// u1 跑单任务 chat_5：台账记 1 条（+50 分 +5 能）。
+	code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"chat_5"}`)
+	if code != http.StatusOK || out["claimed"] != true {
+		t.Fatalf("auto chat_5: code=%d out=%v", code, out)
+	}
+	// 查台账总览（并发预取 + 合并对账）。
+	req := httptest.NewRequest(http.MethodGet, "/admin/growth/ledger", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	var ov struct {
+		TotalAccounts  int `json:"total_accounts"`
+		DoneAccounts   int `json:"done_accounts"`
+		PartialAccounts int `json:"partial_accounts"`
+		NotStarted     int `json:"not_started"`
+		TotalCredit    int64 `json:"total_credit"`
+		TotalEnergy    int64 `json:"total_energy"`
+		Accounts       []struct {
+			UID       string `json:"uid"`
+			Status    string `json:"status"`
+			DoneCount int    `json:"done_count"`
+			Credit    int64  `json:"credit"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &ov); err != nil {
+		t.Fatalf("ledger overview: %v (body=%s)", err, rec.Body.String())
+	}
+	if ov.TotalAccounts != 2 || ov.PartialAccounts != 2 {
+		t.Fatalf("accounts = %d partial = %d, want 2/2 (stub 列表对两号都含 first_buddy claimed → 都 partial)", ov.TotalAccounts, ov.PartialAccounts)
+	}
+	// u1 = 2/17（chat_5 台账 + first_buddy 对账）；u2 = 1/17（仅对账）。
+	byUID := map[string]int{}
+	creditByUID := map[string]int64{}
+	for _, acc := range ov.Accounts {
+		byUID[acc.UID] = acc.DoneCount
+		creditByUID[acc.UID] = acc.Credit
+	}
+	if byUID["u1"] != 2 || byUID["u2"] != 1 {
+		t.Fatalf("done_count u1=%d u2=%d, want 2/1", byUID["u1"], byUID["u2"])
+	}
+	// 积分收益只有台账条目计入：u1 +50（chat_5），u2 0（first_buddy 无台账）。
+	if creditByUID["u1"] != 50 || creditByUID["u2"] != 0 {
+		t.Fatalf("credit u1=%d u2=%d, want 50/0", creditByUID["u1"], creditByUID["u2"])
+	}
+	if ov.TotalCredit != 50 || ov.TotalEnergy != 5 {
+		t.Fatalf("total credit/energy = %d/%d, want 50/5", ov.TotalCredit, ov.TotalEnergy)
+	}
+	// 落盘验证：文件含 u1 的 chat_5 条目（时间 + 分值）。
+	raw, err := os.ReadFile(h.growthLedger.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored struct {
+		Accounts []struct {
+			UID    string `json:"uid"`
+			Claims []struct {
+				TaskCode string `json:"task_code"`
+				Credit   int64  `json:"credit"`
+				At       string `json:"at"`
+			} `json:"claims"`
+		} `json:"accounts"`
+	}
+	if json.Unmarshal(raw, &stored) != nil || len(stored.Accounts) != 1 {
+		t.Fatalf("ledger file = %s", raw)
+	}
+	c0 := stored.Accounts[0]
+	if c0.UID != "u1" || len(c0.Claims) != 1 {
+		t.Fatalf("ledger accounts = %+v", stored.Accounts)
+	}
+	cl := c0.Claims[0]
+	if cl.TaskCode != "chat_5" || cl.Credit != 50 || cl.At == "" {
+		t.Fatalf("ledger claims = %+v", c0.Claims)
 	}
 }
 
