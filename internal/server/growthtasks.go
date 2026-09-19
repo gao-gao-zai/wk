@@ -724,6 +724,8 @@ func (h *Handler) runGrowthAction(a *auth.Auth, act *growthAction) map[string]an
 			// 都汇聚到这一处，记一次即可全局覆盖。
 			creds := a.Snapshot()
 			h.growthLedger.record(creds.UID, creds.Nickname, act.TaskCode, credit, energy)
+			// 领奖改变了上游 claimed 状态 → 失效对账缓存，下次查询立即反映。
+			h.ledgerReconCache.invalidate()
 			if credit > 0 || energy > 0 {
 				resp["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
 			} else {

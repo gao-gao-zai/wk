@@ -185,6 +185,9 @@ type Handler struct {
 	// growthRunner 成长任务执行池（growthrunner.go）：所有触发源共用的
 	// 单队列串行执行器。
 	growthRunner growthRunner
+	// ledgerReconCache 台账上游对账结果缓存（growthledger.go）：领奖时
+	// 主动失效，TTL 10 分钟兜上游侧手动领奖的窗口。
+	ledgerReconCache ledgerCache
 	// growthJobs 一键完成异步任务注册表（growthjobs.go）。
 	growthJobs growthJobRegistry
 	// growthLedger 一次性任务持久台账（growthledger.go）：领取记录 + 积分收益。

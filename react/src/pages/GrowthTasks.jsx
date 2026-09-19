@@ -136,10 +136,13 @@ export default function GrowthTasks({ api, data, refresh }) {
   useEffect(() => () => stopPolling(), [stopPolling]);
 
   // loadLedger 拉取一次性任务台账（三态统计 + 明细）。
-  const loadLedger = useCallback(async () => {
+  // force=true 时带 refresh=1 绕过后端对账缓存（「刷新」按钮用）；
+  // 普通加载（进页面/批跑结束）走缓存——对账是低频慢变数据，不必每次
+  // 都打 85 号上游列表。
+  const loadLedger = useCallback(async (force = false) => {
     setLedgerLoading(true);
     try {
-      setLedger(await api('/admin/growth/ledger'));
+      setLedger(await api(`/admin/growth/ledger${force ? '?refresh=1' : ''}`));
     } catch { /* 老后端无此端点：静默 */ }
     finally { setLedgerLoading(false); }
   }, [api]);
@@ -537,7 +540,7 @@ export default function GrowthTasks({ api, data, refresh }) {
               {ledgerOpen ? '收起明细' : '展开明细'}
             </Button>
           )}
-          <Button size="small" icon={<ReloadOutlined />} loading={ledgerLoading} onClick={loadLedger}>刷新</Button>
+          <Button size="small" icon={<ReloadOutlined />} loading={ledgerLoading} onClick={() => loadLedger(true)}>刷新</Button>
         </Space>
       )}
     >

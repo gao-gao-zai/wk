@@ -77,6 +77,7 @@ func newGrowthLedger(path string) *growthLedger {
 // record 记一条领取（credit/energy 来自 ClaimReward 的返回值；为 0 也记
 // —— 有些任务奖励是 buddy/道具，账面分值为 0 但"完成"事实要留痕）。
 // receiver 为 nil 时静默跳过（handler 未初始化台账的路径）。
+// 记录后由调用方失效对账缓存（见 growthLedgerOverview 的 ledgerReconCache）。
 func (l *growthLedger) record(uid, nickname, taskCode string, credit, energy int64) {
 	if l == nil || uid == "" || taskCode == "" {
 		return
@@ -149,9 +150,65 @@ type ledgerOverview struct {
 	Accounts      []ledgerSummary `json:"accounts"`
 }
 
+// ledgerCacheTTL 上游对账结果的缓存时长。三态判定是低频慢变数据：
+// claimed 只在领奖时变，而领奖都经本网关（写台账 + 主动失效缓存）。
+// TTL 只兜「上游侧手动领奖」的窗口（面板上点过「领取」之类）。
+const ledgerCacheTTL = 10 * time.Minute
+
+// ledgerCache 上游 ListTasks 对账结果的 TTL 缓存（账号集 + 结果快照）。
+// key = 账号 uid 列表（池变化 = 不同 key，自动失效）。
+type ledgerCache struct {
+	mu       sync.Mutex
+	key      string   // 参与对账的 uid 逗号串（签名）
+	fetched  time.Time
+	results  [][]upstream.Task
+}
+
+// signature 账号集签名（uid 顺序拼接）。
+func ledgerCacheKey(accounts []*auth.Auth) string {
+	var b []byte
+	for _, a := range accounts {
+		b = append(b, a.Snapshot().UID...)
+		b = append(b, ',')
+	}
+	return string(b)
+}
+
+// get 命中返回缓存结果（TTL 内且账号集一致）。
+func (c *ledgerCache) get(accounts []*auth.Auth) ([][]upstream.Task, bool) {
+	key := ledgerCacheKey(accounts)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// fetched 零值 = 从未填充（invalidate 也会清零），key 匹配 + 未过期才命中。
+	if c.key == "" || c.key != key || time.Since(c.fetched) > ledgerCacheTTL {
+		return nil, false
+	}
+	return c.results, true
+}
+
+// set 写入缓存（深拷贝不需要：ListTasks 每次新分配，读方只读）。
+func (c *ledgerCache) set(accounts []*auth.Auth, results [][]upstream.Task) {
+	key := ledgerCacheKey(accounts)
+	c.mu.Lock()
+	c.key, c.results, c.fetched = key, results, time.Now()
+	c.mu.Unlock()
+}
+
+// invalidate 主动失效（领奖成功后调用：上游 claimed 变了，缓存即过期）。
+// key 清空 + fetched 归零：get 的双条件都挡（空 key 恒不命中，防止
+// 「无账号集」与「已失效」共享空串 key 的边界）。
+func (c *ledgerCache) invalidate() {
+	c.mu.Lock()
+	c.key = ""
+	c.fetched = time.Time{}
+	c.mu.Unlock()
+}
+
 // growthLedgerOverview GET /admin/growth/ledger：一次性任务三态总览。
-// 逐账号现查上游 claimed 对账：并发拉取（上限 8）避免 85 号串行往返；
-// 只读列表端点，上不了风控面。
+// 上游对账结果带 TTL 缓存（10 分钟 + 领奖主动失效）：对账是低频慢变数据，
+// 每次页面加载都打 85 号 ListTasks 既慢又白费；领奖都经本网关 → record
+// 即失效，TTL 只兜上游侧手动领奖的窗口。
+// ?refresh=1 强制绕过缓存（对账怀疑不准时的手动出口）。
 func (h *Handler) growthLedgerOverview(w http.ResponseWriter, r *http.Request) {
 	var accounts []*auth.Auth
 	for _, st := range h.cfg.Pool.List() {
@@ -164,23 +221,33 @@ func (h *Handler) growthLedgerOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		accounts = append(accounts, a)
 	}
-	// 并发预取任务列表（results 与 accounts 下标对齐；失败 = nil，跳过对账）。
-	results := make([][]upstream.Task, len(accounts))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8)
-	for i, a := range accounts {
-		wg.Add(1)
-		go func(i int, a *auth.Auth) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			ts, err := h.cfg.Upstream.ListTasks(a)
-			if err == nil {
-				results[i] = ts
-			}
-		}(i, a)
+	var results [][]upstream.Task
+	force := r.URL.Query().Get("refresh") == "1"
+	if !force {
+		if cached, ok := h.ledgerReconCache.get(accounts); ok {
+			results = cached
+		}
 	}
-	wg.Wait()
+	if results == nil {
+		// 并发预取任务列表（results 与 accounts 下标对齐；失败 = nil，跳过对账）。
+		results = make([][]upstream.Task, len(accounts))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		for i, a := range accounts {
+			wg.Add(1)
+			go func(i int, a *auth.Auth) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				ts, err := h.cfg.Upstream.ListTasks(a)
+				if err == nil {
+					results[i] = ts
+				}
+			}(i, a)
+		}
+		wg.Wait()
+		h.ledgerReconCache.set(accounts, results)
+	}
 	writeJSON(w, http.StatusOK, h.buildLedgerOverview(accounts, results))
 }
 

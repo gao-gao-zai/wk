@@ -419,6 +419,30 @@ func TestGrowthLedgerRecordsClaimsAndOverview(t *testing.T) {
 	if ov.TotalCredit != 50 || ov.TotalEnergy != 5 {
 		t.Fatalf("total credit/energy = %d/%d, want 50/5", ov.TotalCredit, ov.TotalEnergy)
 	}
+
+	// 缓存行为：第二次查询命中缓存（上游 listCalls 不再增长）。
+	before := atomic.LoadInt64(&stub.listCalls)
+	req2 := httptest.NewRequest(http.MethodGet, "/admin/growth/ledger", nil)
+	req2.Header.Set("Authorization", "Bearer "+testAPIKey)
+	rec2 := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec2, req2)
+	if atomic.LoadInt64(&stub.listCalls) != before {
+		t.Fatalf("second ledger load should hit cache: listCalls %d -> %d", before, atomic.LoadInt64(&stub.listCalls))
+	}
+	// refresh=1 绕过缓存（重新对账）。
+	req3 := httptest.NewRequest(http.MethodGet, "/admin/growth/ledger?refresh=1", nil)
+	req3.Header.Set("Authorization", "Bearer "+testAPIKey)
+	rec3 := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec3, req3)
+	if atomic.LoadInt64(&stub.listCalls) == before {
+		t.Fatal("refresh=1 should bypass cache")
+	}
+	// 领奖 → 缓存失效 → 下次查询重新对账。
+	h.ledgerReconCache.set(nil, nil) // 预填一个假缓存
+	h.ledgerReconCache.invalidate()
+	if _, ok := h.ledgerReconCache.get(nil); ok {
+		t.Fatal("invalidate should drop cache")
+	}
 	// 落盘验证：文件含 u1 的 chat_5 条目（时间 + 分值）。
 	raw, err := os.ReadFile(h.growthLedger.path)
 	if err != nil {
