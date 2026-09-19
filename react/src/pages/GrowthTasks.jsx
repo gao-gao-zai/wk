@@ -60,9 +60,10 @@ export default function GrowthTasks({ api, data, refresh }) {
   const [detailOpen, setDetailOpen] = useState(false);
   const [dismissed, setDismissed] = useState(false);
   const pollRef = useRef(null);
-  // 一次性任务台账：三态统计 + 每账号领取明细。
+  // 一次性任务台账：默认收起（只显示汇总进度条），点击展开看账号明细。
   const [ledger, setLedger] = useState(null);
   const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [ledgerOpen, setLedgerOpen] = useState(false);
 
   // CN 账号（global 无成长任务体系）。
   const accounts = useMemo(
@@ -444,7 +445,7 @@ export default function GrowthTasks({ api, data, refresh }) {
   ) : null;
 
   // ---------------------------------------------------------------------------
-  // 一次性任务台账卡片：三态统计（完成/部分/未开始）+ 积分收益 + 明细表。
+  // 一次性任务台账卡片：默认一行汇总进度条；点击展开账号明细表。
   // ---------------------------------------------------------------------------
   const statusTag = status => ({
     done: <Tag color="green">已完成</Tag>,
@@ -489,39 +490,67 @@ export default function GrowthTasks({ api, data, refresh }) {
     },
   ];
 
+  // 汇总进度：全池一次性任务的总完成度（已完成任务数 / 账号数×17）。
+  const ledgerTotalItems = ledger ? ledger.total_accounts * (ledger.accounts[0]?.total_count || 17) : 0;
+  const ledgerDoneItems = ledger
+    ? ledger.accounts.reduce((sum, account) => sum + account.done_count, 0)
+    : 0;
+  const ledgerPercent = ledgerTotalItems
+    ? Math.round((ledgerDoneItems / ledgerTotalItems) * 100)
+    : 0;
+
   const ledgerCard = ledger ? (
     <Card
-      title="一次性任务台账" size="small"
-      extra={<Button size="small" icon={<ReloadOutlined />} loading={ledgerLoading} onClick={loadLedger}>刷新</Button>}
+      size="small" title="一次性任务台账"
+      extra={(
+        <Space>
+          <Button size="small" type="text" onClick={() => setLedgerOpen(open => !open)} icon={ledgerOpen ? <UpOutlined /> : <DownOutlined />}>
+            {ledgerOpen ? '收起明细' : '展开明细'}
+          </Button>
+          <Button size="small" icon={<ReloadOutlined />} loading={ledgerLoading} onClick={loadLedger}>刷新</Button>
+        </Space>
+      )}
     >
-      <Space wrap style={{ marginBottom: 12 }}>
-        <Tag color="green">已完成 {ledger.done_accounts}</Tag>
-        <Tag color="orange">部分完成 {ledger.partial_accounts}</Tag>
-        <Tag>未开始 {ledger.not_started}</Tag>
-        <Tag color="blue">共 {ledger.total_accounts} 个账号</Tag>
-        <Text strong style={{ color: '#389e0d' }}>任务总收益 +{ledger.total_credit} 积分</Text>
-        <Text type="secondary">+{ledger.total_energy} 能量</Text>
+      {/* 默认态：一条汇总进度条 + 三态计数 + 总收益，一眼看全貌 */}
+      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+        <Progress
+          percent={ledgerPercent}
+          format={() => `${ledgerDoneItems}/${ledgerTotalItems} 项（${ledgerPercent}%）`}
+        />
+        <Space wrap>
+          <Tag color="green">已完成 {ledger.done_accounts}</Tag>
+          <Tag color="orange">部分完成 {ledger.partial_accounts}</Tag>
+          <Tag>未开始 {ledger.not_started}</Tag>
+          <Tag color="blue">共 {ledger.total_accounts} 个账号</Tag>
+          <Text strong style={{ color: '#389e0d' }}>任务总收益 +{ledger.total_credit} 积分</Text>
+          <Text type="secondary">+{ledger.total_energy} 能量</Text>
+        </Space>
       </Space>
-      <Table
-        rowKey="uid" size="small" columns={ledgerColumns} dataSource={ledger.accounts}
-        pagination={{ pageSize: 10, showTotal: total => `共 ${total} 个账号` }}
-        expandable={{
-          rowExpandable: record => (record.tasks || []).length > 0,
-          expandedRowRender: record => (
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {(record.tasks || []).map(task => (
-                <Tooltip key={task.task_code} title={task.at ? `${task.at.replace('T', ' ').slice(0, 19)} 领取${task.credit ? ` +${task.credit}分` : ''}${task.energy ? ` +${task.energy}能` : ''}` : '本网关部署前/手动完成（无时间记录）'}>
-                  <Tag color={task.at ? 'green' : 'default'}>{task.task_code}{task.credit ? ` +${task.credit}` : ''}</Tag>
-                </Tooltip>
-              ))}
-            </div>
-          ),
-        }}
-      />
-      <Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-        台账记录本网关自动领取的任务奖励（含领取时间与积分）；「部分完成/未开始」的判定实时对账上游任务状态。
-        任务积分收益只统计经本网关领取的部分，此前手动完成的按 0 计。
-      </Paragraph>
+      {ledgerOpen && (
+        <>
+          <Table
+            style={{ marginTop: 12 }}
+            rowKey="uid" size="small" columns={ledgerColumns} dataSource={ledger.accounts}
+            pagination={{ pageSize: 10, showTotal: total => `共 ${total} 个账号` }}
+            expandable={{
+              rowExpandable: record => (record.tasks || []).length > 0,
+              expandedRowRender: record => (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {(record.tasks || []).map(task => (
+                    <Tooltip key={task.task_code} title={task.at ? `${task.at.replace('T', ' ').slice(0, 19)} 领取${task.credit ? ` +${task.credit}分` : ''}${task.energy ? ` +${task.energy}能` : ''}` : '本网关部署前/手动完成（无时间记录）'}>
+                      <Tag color={task.at ? 'green' : 'default'}>{task.task_code}{task.credit ? ` +${task.credit}` : ''}</Tag>
+                    </Tooltip>
+                  ))}
+                </div>
+              ),
+            }}
+          />
+          <Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+            台账记录本网关自动领取的任务奖励（含领取时间与积分）；「部分完成/未开始」的判定实时对账上游任务状态。
+            任务积分收益只统计经本网关领取的部分，此前手动完成的按 0 计。
+          </Paragraph>
+        </>
+      )}
     </Card>
   ) : null;
 
