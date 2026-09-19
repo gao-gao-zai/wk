@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   App, Alert, Button, Card, Drawer, Empty, Input, Popconfirm, Progress,
-  Space, Spin, Table, Tag, Tooltip, Typography,
+  Skeleton, Space, Spin, Table, Tag, Tooltip, Typography,
 } from 'antd';
 import {
   CheckCircleOutlined, ClockCircleOutlined, DownOutlined, GiftOutlined, LoadingOutlined,
@@ -527,34 +527,44 @@ export default function GrowthTasks({ api, data, refresh }) {
     ? Math.round((ledgerDoneItems / ledgerTotalItems) * 100)
     : 0;
 
-  const ledgerCard = ledger ? (
+  const ledgerCard = (
     <Card
       size="small" title="一次性任务台账"
       extra={(
         <Space>
-          <Button size="small" type="text" onClick={() => setLedgerOpen(open => !open)} icon={ledgerOpen ? <UpOutlined /> : <DownOutlined />}>
-            {ledgerOpen ? '收起明细' : '展开明细'}
-          </Button>
+          {ledger && (
+            <Button size="small" type="text" onClick={() => setLedgerOpen(open => !open)} icon={ledgerOpen ? <UpOutlined /> : <DownOutlined />}>
+              {ledgerOpen ? '收起明细' : '展开明细'}
+            </Button>
+          )}
           <Button size="small" icon={<ReloadOutlined />} loading={ledgerLoading} onClick={loadLedger}>刷新</Button>
         </Space>
       )}
     >
-      {/* 默认态：一条汇总进度条 + 三态计数 + 总收益，一眼看全貌 */}
-      <Space direction="vertical" size={6} style={{ width: '100%' }}>
-        <Progress
-          percent={ledgerPercent}
-          format={() => `${ledgerDoneItems}/${ledgerTotalItems} 项（${ledgerPercent}%）`}
-        />
-        <Space wrap>
-          <Tag color="green">已完成 {ledger.done_accounts}</Tag>
-          <Tag color="orange">部分完成 {ledger.partial_accounts}</Tag>
-          <Tag>未开始 {ledger.not_started}</Tag>
-          <Tag color="blue">共 {ledger.total_accounts} 个账号</Tag>
-          <Text strong style={{ color: '#389e0d' }}>任务总收益 +{ledger.total_credit} 积分</Text>
-          <Text type="secondary">+{ledger.total_energy} 能量</Text>
+      {/* 加载态：骨架占位（对账要拉全部账号任务列表，秒级），避免空白/跳变 */}
+      {!ledger ? (
+        <Space direction="vertical" size={8} style={{ width: '100%' }}>
+          <Skeleton active paragraph={{ rows: 1 }} title={false} />
+          <Skeleton.Button active block size="small" shape="round" />
         </Space>
-      </Space>
-      {ledgerOpen && (
+      ) : (
+        <>
+          {/* 默认态：一条汇总进度条 + 三态计数 + 总收益，一眼看全貌 */}
+          <Space direction="vertical" size={6} style={{ width: '100%' }}>
+            <Progress
+              percent={ledgerPercent}
+              format={() => `${ledgerDoneItems}/${ledgerTotalItems} 项（${ledgerPercent}%）`}
+            />
+            <Space wrap>
+              <Tag color="green">已完成 {ledger.done_accounts}</Tag>
+              <Tag color="orange">部分完成 {ledger.partial_accounts}</Tag>
+              <Tag>未开始 {ledger.not_started}</Tag>
+              <Tag color="blue">共 {ledger.total_accounts} 个账号</Tag>
+              <Text strong style={{ color: '#389e0d' }}>任务总收益 +{ledger.total_credit} 积分</Text>
+              <Text type="secondary">+{ledger.total_energy} 能量</Text>
+            </Space>
+          </Space>
+          {ledgerOpen && (
         <>
           <Table
             style={{ marginTop: 12 }}
@@ -578,9 +588,11 @@ export default function GrowthTasks({ api, data, refresh }) {
             任务积分收益只统计经本网关领取的部分，此前手动完成的按 0 计。
           </Paragraph>
         </>
+          )}
+        </>
       )}
     </Card>
-  ) : null;
+  );
 
   // 筛选后的总余额（搜索命中哪些账号就统计哪些）。
   const filteredCredits = filtered.reduce((sum, account) => sum + Number(account.credits || 0), 0);
@@ -599,9 +611,16 @@ export default function GrowthTasks({ api, data, refresh }) {
     pending: <Tag color="default">未开始</Tag>,
   }[st] || <Tag>{st}</Tag>);
   const totalVouchers = (school?.accounts || []).reduce((sum, acc) => sum + (acc.vouchers?.length || 0), 0);
-  const showSchoolCard = school && school.in_period_accounts > 0;
 
-  const schoolCard = showSchoolCard ? (
+  const schoolCard = !school ? (
+    // 加载骨架：状态卡要并发拉全部账号的任务矩阵 + 抽奖余额 + 券码。
+    <Card size="small" style={{ borderLeft: '3px solid #eb2f96' }} title="🎒 开学季活动（至 09-24）">
+      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Skeleton active paragraph={{ rows: 1 }} title={false} />
+        <Skeleton.Button active block size="small" shape="round" />
+      </Space>
+    </Card>
+  ) : school.in_period_accounts > 0 ? (
     <Card
       size="small"
       style={{ borderLeft: '3px solid #eb2f96' }}
@@ -671,7 +690,7 @@ export default function GrowthTasks({ api, data, refresh }) {
         />
       )}
     </Card>
-  ) : null;
+  ) : null; // 活动期外（in_period_accounts=0）：不显示卡片
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
