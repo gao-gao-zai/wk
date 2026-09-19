@@ -583,6 +583,8 @@ function Console() {
     ['输出 token', statSource.output_tokens, '#b37feb'], ['总 token', statSource.total_tokens, '#9254de'],
     ['缓存读取', statSource.cache_read_tokens, '#36cfc9'], ['缓存创建', statSource.cache_write_tokens, '#13c2c2'],
     ['工具调用', statSource.tool_calls, '#ffc53d'], ['积分消耗', statSource.credits_consumed, '#fa8c16', fmtCredits],
+    // 剩余总余额：全池账号可用积分之和（非时间窗指标，实时快照）。
+    ['剩余总余额', (data.accounts || []).reduce((sum, account) => sum + Number(account.credits || 0), 0), '#1677ff', fmtCredits],
   ];
   const activeTab = activeSection === 'settings' ? 'admin' : activeSection;
   const pageCopy = {

@@ -469,15 +469,25 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
     },
   ];
 
+  // 统计卡与筛选同步：对 filteredAccounts 实时计算（而非全池 data.*），
+  // 筛选变化即时反映；全池口径在副标题保留对照。
+  const filteredTotal = filteredAccounts.length;
+  const filteredHealthy = filteredAccounts.filter(r => !r.disabled && !coolingPortrait(r).untilActive
+    && !coolingPortrait(r).breakerActive && Object.keys(r.model_cooldowns || {}).length === 0).length;
+  const filteredCooling = filteredAccounts.filter(r => !r.disabled && (coolingPortrait(r).untilActive || coolingPortrait(r).breakerActive)).length;
+  const filteredDisabled = filteredAccounts.filter(r => !!r.disabled).length;
+  const filteredCredits = filteredAccounts.reduce((sum, r) => sum + Number(r.credits || 0), 0);
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 12 }}>
-        <Card><Statistic title="账号总数" value={data.total || 0} /></Card>
-        <Card><Statistic title="可用" value={data.healthy || 0} valueStyle={{ color: '#389e0d' }} /></Card>
-        <Card><Statistic title="冷却中" value={data.cooling || 0} valueStyle={{ color: '#d46b08' }} /></Card>
-        <Card><Statistic title="已禁用" value={data.disabled || 0} valueStyle={{ color: '#cf1322' }} /></Card>
+        <Card><Statistic title={`账号总数${filteredTotal !== (data.total || 0) ? `（筛选后）` : ''}`} value={filteredTotal} suffix={filteredTotal !== (data.total || 0) ? <Text type="secondary" style={{ fontSize: 14 }}>/ {data.total || 0}</Text> : undefined} /></Card>
+        <Card><Statistic title={`可用${filteredHealthy !== (data.healthy || 0) ? '（筛选后）' : ''}`} value={filteredHealthy} valueStyle={{ color: '#389e0d' }} /></Card>
+        <Card><Statistic title={`冷却中${filteredCooling !== (data.cooling || 0) ? '（筛选后）' : ''}`} value={filteredCooling} valueStyle={{ color: '#d46b08' }} /></Card>
+        <Card><Statistic title={`已禁用${filteredDisabled !== (data.disabled || 0) ? '（筛选后）' : ''}`} value={filteredDisabled} valueStyle={{ color: '#cf1322' }} /></Card>
         <Card><Statistic title="在途占满" value={data.in_flight_full || 0} /></Card>
         <Card><Statistic title="粘性会话" value={data.sticky_sessions || 0} /></Card>
+        <Card><Statistic title={`剩余总余额${filteredTotal !== (data.total || 0) ? '（筛选后）' : ''}`} value={fmt(filteredCredits)} valueStyle={{ color: '#1677ff' }} /></Card>
       </div>
       <Card title="账号筛选">
         <Space wrap style={{ width: '100%' }}>
@@ -506,6 +516,9 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
         extra={(
           <Space>
             <Text type="secondary">显示 {filteredAccounts.length} / {data.total || 0} 个账号</Text>
+            {filteredTotal !== (data.total || 0) && (
+              <Text type="secondary">筛选后剩余余额 {fmt(filteredCredits)}</Text>
+            )}
             <Button size="small" icon={<ReloadOutlined />} loading={creditRefreshing} onClick={refreshCredits}>刷新上游积分</Button>
           </Space>
         )}

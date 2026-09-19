@@ -554,6 +554,9 @@ export default function GrowthTasks({ api, data, refresh }) {
     </Card>
   ) : null;
 
+  // 筛选后的总余额（搜索命中哪些账号就统计哪些）。
+  const filteredCredits = filtered.reduce((sum, account) => sum + Number(account.credits || 0), 0);
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {progressCard}
@@ -576,10 +579,11 @@ export default function GrowthTasks({ api, data, refresh }) {
       </Card>
 
       <Card
-        title="账号列表（仅中国区）" size="small"
+        title={`账号列表（仅中国区，筛选后 ${filtered.length}/${accounts.length}）`} size="small"
         extra={(
           <Space>
             <Input allowClear placeholder="搜索 uid / 昵称" style={{ width: 220 }} value={search} onChange={e => setSearch(e.target.value)} />
+            <Text type="secondary">剩余余额 {filteredCredits.toLocaleString()}</Text>
             <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
           </Space>
         )}
