@@ -411,6 +411,7 @@ func main() {
 		},
 		TravelNow:   sch.RunTravelNow,
 		ActivityNow: func() { go sch.RunActivityNow(context.Background()) },
+		SchoolNow:   sch.RunSchoolNow,
 		ScheduleEnabled: struct{ AutoenrollGrowthTasks bool }{
 			AutoenrollGrowthTasks: cfg.ScheduleEnabled.AutoenrollGrowthTasks,
 		},

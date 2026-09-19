@@ -354,6 +354,9 @@ func (s *Scheduler) RunCheckinNow() {
 		_ = s.refreshAccountCredits(st.UID, a)
 	}
 	s.RunStreakBonusNow()
+	// 开学季活动（school.go）：每日刷新，搭签到便车；活动期外 in_period=false
+	// 自动跳过（幂等，无需下线代码）。
+	s.RunSchoolNow()
 }
 
 // RunCreditRefreshNow refreshes upstream credit counters without performing a

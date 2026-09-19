@@ -971,3 +971,86 @@ func (h *Handler) runActivity(w http.ResponseWriter, r *http.Request) {
 	h.cfg.ActivityNow()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "活跃上报已启动"})
 }
+
+// runSchool 手动触发开学季活动闭环（异步起跑，立即返回）。
+func (h *Handler) runSchool(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SchoolNow == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "开学季排程未启用"})
+		return
+	}
+	go h.cfg.SchoolNow()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "开学季活动闭环已启动"})
+}
+
+// schoolStatus 开学季状态：并发拉各账号任务矩阵 + 剩余抽奖次数 + 券码。
+// 供前端状态卡展示（只读；活动期外 in_period=false 全量返回）。
+func (h *Handler) schoolStatus(w http.ResponseWriter, r *http.Request) {
+	type accountStatus struct {
+		UID       string                 `json:"uid"`
+		Nickname  string                 `json:"nickname,omitempty"`
+		InPeriod  bool                   `json:"in_period"`
+		Tasks     []upstream.SchoolTask  `json:"tasks,omitempty"`
+		Chances   int                    `json:"chances"`
+		Vouchers  []upstream.SchoolVoucher `json:"vouchers,omitempty"`
+		Error     string                 `json:"error,omitempty"`
+	}
+	var accounts []*auth.Auth
+	for _, st := range h.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := h.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.Snapshot().RefreshToken == "" || a.Region() == "global" {
+			continue
+		}
+		accounts = append(accounts, a)
+	}
+	out := make([]accountStatus, len(accounts))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i, a := range accounts {
+		wg.Add(1)
+		go func(i int, a *auth.Auth) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			creds := a.Snapshot()
+			st := accountStatus{UID: creds.UID, Nickname: creds.Nickname}
+			tasks, inPeriod, err := h.cfg.Upstream.SchoolTasks(a)
+			if err != nil {
+				st.Error = err.Error()
+				out[i] = st
+				return
+			}
+			st.InPeriod = inPeriod
+			st.Tasks = tasks
+			if chances, err := h.cfg.Upstream.SchoolChances(a); err == nil {
+				st.Chances = chances
+			}
+			if vouchers, err := h.cfg.Upstream.SchoolVouchers(a); err == nil && len(vouchers) > 0 {
+				st.Vouchers = vouchers
+			}
+			out[i] = st
+		}(i, a)
+	}
+	wg.Wait()
+	// 汇总：在期账号数 + 全池待办数（供前端一眼看全貌）。
+	inPeriod, pending := 0, 0
+	for _, st := range out {
+		if st.InPeriod {
+			inPeriod++
+		}
+		for _, t := range st.Tasks {
+			if t.TaskCode == "task_student_verify" {
+				continue // 学生认证不做
+			}
+			if t.Status != "claimed" && t.Status != "completed" {
+				pending++
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "in_period_accounts": inPeriod, "pending_tasks": pending,
+		"accounts": out,
+	})
+}

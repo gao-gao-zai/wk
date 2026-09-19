@@ -96,6 +96,8 @@ type Config struct {
 	// TravelNow / ActivityNow 手动触发猫猫旅行巡检 / 活跃上报（控制台按钮）。
 	TravelNow   func()
 	ActivityNow func()
+	// SchoolNow 手动触发开学季活动闭环（控制台按钮；排程每日自动跑）。
+	SchoolNow func()
 	// ScheduleEnabled 解析后的排程开关（main 从 config 传入；零值 = 全关，
 	// 与 scheduler.Config 的 *Disabled 语义互补）。
 	ScheduleEnabled struct {
@@ -303,6 +305,9 @@ func NewHandler(cfg Config) *Handler {
 	// 手动触发猫猫旅行巡检 / 活跃上报。
 	h.mux.HandleFunc("POST /admin/travel", h.withFrontend(h.runTravel))
 	h.mux.HandleFunc("POST /admin/activity", h.withFrontend(h.runActivity))
+	// 开学季活动：手动触发全账号闭环（排程每日自动跑，端点供即时补跑）+ 状态查询。
+	h.mux.HandleFunc("POST /admin/school", h.withFrontend(h.runSchool))
+	h.mux.HandleFunc("GET /admin/school/status", h.withFrontend(h.schoolStatus))
 	// 成长任务异步 job 进度查询（一键完成的后台任务状态）。
 	h.mux.HandleFunc("GET /admin/growth/jobs", h.withFrontend(h.growthJobList))
 	h.mux.HandleFunc("GET /admin/growth/jobs/{id}", h.withFrontend(h.growthJobStatus))

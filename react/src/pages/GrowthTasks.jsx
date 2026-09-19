@@ -64,6 +64,11 @@ export default function GrowthTasks({ api, data, refresh }) {
   const [ledger, setLedger] = useState(null);
   const [ledgerLoading, setLedgerLoading] = useState(false);
   const [ledgerOpen, setLedgerOpen] = useState(false);
+  // 开学季活动状态卡（活动期 2026-09-13 ~ 09-24，不在期后端返回 in_period=0 隐藏）。
+  const [school, setSchool] = useState(null);
+  const [schoolLoading, setSchoolLoading] = useState(false);
+  const [schoolOpen, setSchoolOpen] = useState(false);
+  const [schoolRunning, setSchoolRunning] = useState(false);
 
   // CN 账号（global 无成长任务体系）。
   const accounts = useMemo(
@@ -139,8 +144,31 @@ export default function GrowthTasks({ api, data, refresh }) {
     finally { setLedgerLoading(false); }
   }, [api]);
 
+  // loadSchool 拉取开学季状态（活动期外 in_period_accounts=0 → 隐藏卡片）。
+  const loadSchool = useCallback(async () => {
+    setSchoolLoading(true);
+    try {
+      setSchool(await api('/admin/school/status'));
+    } catch { /* 静默 */ }
+    finally { setSchoolLoading(false); }
+  }, [api]);
+
+  // runSchoolNow 手动触发全账号开学季闭环。
+  const runSchoolNow = useCallback(async () => {
+    setSchoolRunning(true);
+    try {
+      const result = await api('/admin/school', { method: 'POST' });
+      message.success(result.message || '开学季闭环已启动');
+      window.setTimeout(loadSchool, 8000);
+    } catch (error) {
+      message.error(error.message);
+    } finally {
+      setSchoolRunning(false);
+    }
+  }, [api, message, loadSchool]);
+
   // 进页面 + job 结束时刷新台账。
-  useEffect(() => { loadLedger(); }, [loadLedger]);
+  useEffect(() => { loadLedger(); loadSchool(); }, [loadLedger, loadSchool]);
   useEffect(() => {
     if (jobSnap && jobSnap.phase && jobSnap.phase !== 'running') loadLedger();
   }, [jobSnap?.phase]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -557,10 +585,99 @@ export default function GrowthTasks({ api, data, refresh }) {
   // 筛选后的总余额（搜索命中哪些账号就统计哪些）。
   const filteredCredits = filtered.reduce((sum, account) => sum + Number(account.credits || 0), 0);
 
+  // ---------------------------------------------------------------------------
+  // 开学季活动卡片（活动期 2026-09-13 ~ 09-24；结束自动隐藏）。
+  // ---------------------------------------------------------------------------
+  const SCHOOL_TASK_LABELS = {
+    share_invite: '分享活动', desktop_chat_1_time: '桌面端体验', chat_3_times: '对话×3',
+    expert_use: '召唤专家', task_student_verify: '学生认证（需人工）',
+  };
+  const schoolStatusTag = st => ({
+    claimed: <Tag color="green">已领</Tag>,
+    completed: <Tag color="cyan">待领取</Tag>,
+    in_progress: <Tag color="blue">进行中</Tag>,
+    pending: <Tag color="default">未开始</Tag>,
+  }[st] || <Tag>{st}</Tag>);
+  const totalVouchers = (school?.accounts || []).reduce((sum, acc) => sum + (acc.vouchers?.length || 0), 0);
+  const showSchoolCard = school && school.in_period_accounts > 0;
+
+  const schoolCard = showSchoolCard ? (
+    <Card
+      size="small"
+      style={{ borderLeft: '3px solid #eb2f96' }}
+      title="🎒 开学季活动（至 09-24）"
+      extra={(
+        <Space>
+          <Button size="small" type="text" onClick={() => setSchoolOpen(open => !open)} icon={schoolOpen ? <UpOutlined /> : <DownOutlined />}>
+            {schoolOpen ? '收起明细' : '展开明细'}
+          </Button>
+          <Button size="small" icon={<ReloadOutlined />} loading={schoolLoading} onClick={loadSchool}>刷新</Button>
+          <Button size="small" type="primary" danger ghost icon={<RocketOutlined />} loading={schoolRunning} onClick={runSchoolNow}>立即执行闭环</Button>
+        </Space>
+      )}
+    >
+      <Space wrap>
+        <Tag color="pink">活动进行中</Tag>
+        <Tag color="blue">{school.in_period_accounts} 个账号在期</Tag>
+        <Tag color={school.pending_tasks > 0 ? 'orange' : 'green'}>待办 {school.pending_tasks} 项</Tag>
+        {totalVouchers > 0 && <Tag color="gold">🎁 已中 {totalVouchers} 张实体券</Tag>}
+        <Text type="secondary">每日 ~200 分/号 + 抽奖；签到排程末尾自动执行（9/21 点）</Text>
+      </Space>
+      {schoolOpen && (
+        <Table
+          style={{ marginTop: 12 }}
+          rowKey="uid" size="small"
+          dataSource={school.accounts.filter(acc => acc.in_period)}
+          pagination={{ pageSize: 10, showTotal: total => `共 ${total} 个账号` }}
+          columns={[
+            {
+              title: '账号', key: 'uid', ellipsis: true,
+              render: (_, acc) => (
+                <Space direction="vertical" size={0}>
+                  <Text code>{acc.uid}</Text>
+                  <Text type="secondary">{acc.nickname || '-'}</Text>
+                </Space>
+              ),
+            },
+            {
+              title: '任务', key: 'tasks',
+              render: (_, acc) => (
+                <Space wrap size={4}>
+                  {(acc.tasks || []).map(t => (
+                    <Tooltip key={t.task_code} title={`${t.progress}/${t.target_count || '-'}`}>
+                      <span>
+                        {SCHOOL_TASK_LABELS[t.task_code] || t.task_code}
+                        {' '}
+                        {schoolStatusTag(t.status)}
+                      </span>
+                    </Tooltip>
+                  ))}
+                </Space>
+              ),
+            },
+            {
+              title: '抽奖余额', dataIndex: 'chances', key: 'chances', width: 90, align: 'center',
+              render: value => <Tag color={value > 0 ? 'gold' : 'default'}>{value || 0} 次</Tag>,
+            },
+            {
+              title: '券码', key: 'vouchers', width: 220,
+              render: (_, acc) => (acc.vouchers || []).length
+                ? <Tooltip title={acc.vouchers.map(v => `${v.prize_name}: ${v.code}`).join('\n')}>
+                    <Text code>{acc.vouchers.map(v => v.prize_name).join('、')}</Text>
+                  </Tooltip>
+                : <Text type="secondary">—</Text>,
+            },
+          ]}
+        />
+      )}
+    </Card>
+  ) : null;
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {progressCard}
       {ledgerCard}
+      {schoolCard}
 
       <Card title="成长任务运营" size="small">
         <Space wrap>
