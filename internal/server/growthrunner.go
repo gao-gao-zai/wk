@@ -143,6 +143,12 @@ func (h *Handler) growthSubmitAll(job *growthJob, accounts []*auth.Auth) int {
 		}
 	}
 	job.setTotal(enqueued)
+	if enqueued == 0 {
+		// 全部账号被去重拒绝（已在其它 job 的队列里）：本 job 直接收尾，
+		// 不留 running 空壳（TTL 前一直显示"执行中"误导前端）。
+		job.finish("done", "全部账号已在执行队列中（与进行中的批跑重复）")
+		log.Printf("growth: 批跑 job=%s 无新账号（均已入队），直接完成", job.ID)
+	}
 	return enqueued
 }
 
