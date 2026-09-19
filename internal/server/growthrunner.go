@@ -107,6 +107,18 @@ func (h *Handler) growthSubmitAll(job *growthJob, accounts []*auth.Auth) int {
 		aj := accountJobType{uid: uid, a: a}
 		aj.run = func() {
 			job.noteCurrent("账号 " + uid)
+			// 账号级预跳过：对账缓存（TTL 内）显示该号全部可自动任务已领
+			// → 不打上游 ListTasks，直接出结果（批跑重跑已完成号零成本）。
+			if h.growthAccountAllClaimed(uid) {
+				job.appendResult(growthJobItem{UID: uid, OK: true, Skipped: true, Message: "全部任务已领取（缓存快照），跳过"})
+				job.accountDone()
+				h.syncGrowthMark()
+				if job.accountFinished() {
+					job.finish("done", "")
+					log.Printf("growth: 全部账号一键完成 job=%s", job.ID)
+				}
+				return
+			}
 			items, ok := h.runGrowthAllCollect(a, func(code, desc string) {
 				job.noteCurrent(uid + "｜" + code)
 			})
@@ -132,6 +144,27 @@ func (h *Handler) growthSubmitAll(job *growthJob, accounts []*auth.Auth) int {
 	}
 	job.setTotal(enqueued)
 	return enqueued
+}
+
+// growthAccountAllClaimed 对账缓存快照显示该账号全部可自动任务已领奖。
+// 未命中缓存 / 有未领任务 → false（走正常流水线，内含任务级跳过）。
+// 快照只用于「跳过」决策：全已领才跳——部分完成、任何一项未领都不跳，
+// 宁可多打一次 ListTasks 也不漏跑（跳过条件从严）。
+func (h *Handler) growthAccountAllClaimed(uid string) bool {
+	ts, ok := h.ledgerReconCache.tasksForUID(uid)
+	if !ok || len(ts) == 0 {
+		return false
+	}
+	auto := map[string]bool{}
+	for i := range growthActions {
+		auto[growthActions[i].TaskCode] = true
+	}
+	for _, t := range ts {
+		if auto[t.TaskCode] && !t.Claimed {
+			return false // 有可自动任务未领
+		}
+	}
+	return true
 }
 
 // growthSubmitAccount account 模式（手动单账号/自动加号）：入池跑全量流水线。

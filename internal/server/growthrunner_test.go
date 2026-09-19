@@ -8,15 +8,18 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // runnerTasksStub 全部任务已领取：流水线秒级空转（只测池行为，不测任务逻辑）。
-var runnerTasksStub = `[{"task_code":"chat_5","claimed":true,"current":5,"target":5},
-	{"task_code":"first_buddy","claimed":true,"current":1,"target":1}]`
+// claimed 的真实口径是 accept_status == "claimed"（ListTasks 解析时推导）。
+var runnerTasksStub = `[{"task_code":"chat_5","accept_status":"claimed","current":5,"target":5},
+	{"task_code":"first_buddy","accept_status":"claimed","current":1,"target":1}]`
 
 // TestGrowthRunnerSerializesAndFinishes 三个验证点：
 //  1. 两个账号提交 → all job 正常跑完（done=total，phase=done）
@@ -120,4 +123,99 @@ func TestGrowthRunnerMarkSnapshotQueue(t *testing.T) {
 	if _, err := os.Stat(markPath); !os.IsNotExist(err) {
 		t.Fatalf("mark file should be removed after queue drained: %v", err)
 	}
+}
+
+// TestGrowthRunnerPrefetchSkipsAllClaimed 账号级预跳过：对账缓存显示某号
+// 全部可自动任务已领 → 批跑该号零上游 ListTasks 调用（秒级出结果）。
+func TestGrowthRunnerPrefetchSkipsAllClaimed(t *testing.T) {
+	fastGrowthActions(t)
+	// stub 列表：chat_5/first_buddy 均已领 + 一个不在 growthActions 的任务。
+	stub := &growthStub{tasks: runnerTasksStub}
+	h, _ := newGrowthHandler(t, stub,
+		&auth.Auth{UID: "u1", AccessToken: "at"},
+	)
+	a1 := h.cfg.Pool.AuthByUID("u1")
+
+	// 预填对账缓存：u1 快照 = stub 列表（全已领）。
+	accounts := []*auth.Auth{a1}
+	results := make([][]upstream.Task, 1)
+	ts, err := h.cfg.Upstream.ListTasks(a1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results[0] = ts
+	h.ledgerReconCache.set(accounts, results)
+
+	before := atomic.LoadInt64(&stub.listCalls)
+	job := h.growthJobs.newJob("", "all")
+	if n := h.growthSubmitAll(job, accounts); n != 1 {
+		t.Fatalf("enqueued = %d want 1", n)
+	}
+	snap := growthWaitJob(t, h, job.ID, 5*time.Second)
+	if snap["phase"] != "done" {
+		t.Fatalf("phase = %v want done", snap["phase"])
+	}
+	// 预跳过生效：该号不再打 ListTasks。
+	if got := atomic.LoadInt64(&stub.listCalls); got != before {
+		t.Fatalf("listCalls %d -> %d（预跳过应零上游调用）", before, got)
+	}
+	// 结果含跳过标记。
+	results2, _ := snap["results"].([]any)
+	if len(results2) != 1 {
+		t.Fatalf("results = %d want 1", len(results2))
+	}
+	item, _ := results2[0].(map[string]any)
+	if item["skipped"] != true || item["uid"] != "u1" {
+		t.Fatalf("skip item = %v", item)
+	}
+}
+
+// TestGrowthRunnerPrefetchPartialNotSkipped 预跳过条件从严：快照显示还有
+// 可自动任务未领 → 不跳，走正常流水线（宁可多打一次 ListTasks 不漏跑）。
+func TestGrowthRunnerPrefetchPartialNotSkipped(t *testing.T) {
+	fastGrowthActions(t)
+	// chat_5 未领（current 3/5）：预跳过应判定不跳。
+	stub := &growthStub{tasks: `[{"task_code":"chat_5","accept_status":"accepted","current":3,"target":5},
+		{"task_code":"first_buddy","accept_status":"claimed","current":1,"target":1}]`}
+	h, _ := newGrowthHandler(t, stub,
+		&auth.Auth{UID: "u1", AccessToken: "at"},
+	)
+	a1 := h.cfg.Pool.AuthByUID("u1")
+	accounts := []*auth.Auth{a1}
+
+	results := make([][]upstream.Task, 1)
+	ts, err := h.cfg.Upstream.ListTasks(a1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results[0] = ts
+	h.ledgerReconCache.set(accounts, results)
+
+	job := h.growthJobs.newJob("", "all")
+	h.growthSubmitAll(job, accounts)
+	snap := growthWaitJob(t, h, job.ID, 5*time.Second)
+	if snap["phase"] != "done" {
+		t.Fatalf("phase = %v want done", snap["phase"])
+	}
+	// 未预跳过：走了正常流水线——chat_5 被执行（部分完成的号不能账号级跳过）。
+	// first_buddy 已领 → 任务级 skip（skipped:true）是正常流水线行为。
+	results2, _ := snap["results"].([]any)
+	chat5Ran := false
+	accountSkipped := false
+	for _, raw := range results2 {
+		item, _ := raw.(map[string]any)
+		if item["uid"] != "u1" {
+			continue
+		}
+		if item["task_code"] == "chat_5" {
+			chat5Ran = true
+			if item["skipped"] == true {
+				t.Fatalf("chat_5 未领取却被跳过: %v", item)
+			}
+		}
+	}
+	if !chat5Ran {
+		t.Fatalf("chat_5 未被执行（账号被误预跳过？）: %v", results2)
+	}
+	_ = accountSkipped
 }

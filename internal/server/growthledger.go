@@ -162,6 +162,9 @@ type ledgerCache struct {
 	key      string   // 参与对账的 uid 逗号串（签名）
 	fetched  time.Time
 	results  [][]upstream.Task
+	// byUID 单账号索引（与 results 同源同 TTL）：批跑预跳过按号查快，
+	// 不必线性扫描。填充于 set；invalidate 清空。
+	byUID    map[string][]upstream.Task
 }
 
 // signature 账号集签名（uid 顺序拼接）。
@@ -187,10 +190,17 @@ func (c *ledgerCache) get(accounts []*auth.Auth) ([][]upstream.Task, bool) {
 }
 
 // set 写入缓存（深拷贝不需要：ListTasks 每次新分配，读方只读）。
+// 同时填充按 uid 索引（批跑预跳过用）。
 func (c *ledgerCache) set(accounts []*auth.Auth, results [][]upstream.Task) {
 	key := ledgerCacheKey(accounts)
 	c.mu.Lock()
 	c.key, c.results, c.fetched = key, results, time.Now()
+	c.byUID = make(map[string][]upstream.Task, len(accounts))
+	for i, a := range accounts {
+		if i < len(results) && results[i] != nil {
+			c.byUID[a.Snapshot().UID] = results[i]
+		}
+	}
 	c.mu.Unlock()
 }
 
@@ -201,7 +211,38 @@ func (c *ledgerCache) invalidate() {
 	c.mu.Lock()
 	c.key = ""
 	c.fetched = time.Time{}
+	c.byUID = nil
 	c.mu.Unlock()
+}
+
+// tasksForUID 取单账号的对账快照（TTL 内命中才返回 true；快照可能为 nil
+// = 该号上次对账拉取失败，调用方按未命中处理）。
+func (c *ledgerCache) tasksForUID(uid string) ([]upstream.Task, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byUID == nil || time.Since(c.fetched) > ledgerCacheTTL {
+		return nil, false
+	}
+	ts, ok := c.byUID[uid]
+	return ts, ok
+}
+
+// markClaimed 领奖后把该账号快照中对应任务置 claimed（单号精准更新而非
+// 整体失效：批跑中刚领完的号预跳过立即可用，其它号的快照也不丢）。
+// 该号无快照时无操作（get 路径下次对账自然反映）。
+func (c *ledgerCache) markClaimed(uid, taskCode string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byUID == nil || time.Since(c.fetched) > ledgerCacheTTL {
+		return
+	}
+	ts := c.byUID[uid]
+	for i := range ts {
+		if ts[i].TaskCode == taskCode {
+			ts[i].Claimed = true
+			return
+		}
+	}
 }
 
 // growthLedgerOverview GET /admin/growth/ledger：一次性任务三态总览。
