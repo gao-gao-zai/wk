@@ -514,7 +514,8 @@ func TestGrowthJobMarkLifecycleAndResume(t *testing.T) {
 		t.Fatalf("resume results = %d, want 2", len(results))
 	}
 	if _, err := os.Stat(markPath); !os.IsNotExist(err) {
-		t.Fatal("mark file should be removed after resumed job done")
+		raw, _ := os.ReadFile(markPath)
+		t.Fatalf("mark file should be removed after resumed job done: %s", raw)
 	}
 }
 

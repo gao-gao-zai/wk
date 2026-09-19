@@ -182,6 +182,9 @@ type Handler struct {
 
 	// growthLocks 成长任务 per-account 互斥（growthtasks.go）。
 	growthLocks growthTaskLocks
+	// growthRunner 成长任务执行池（growthrunner.go）：所有触发源共用的
+	// 单队列串行执行器。
+	growthRunner growthRunner
 	// growthJobs 一键完成异步任务注册表（growthjobs.go）。
 	growthJobs growthJobRegistry
 	// growthLedger 一次性任务持久台账（growthledger.go）：领取记录 + 积分收益。
@@ -340,25 +343,20 @@ func NewHandler(cfg Config) *Handler {
 		h.cfg.AutoEnroll.SetSMSDebugPath(cfg.SMSDebugPath)
 		// 成长任务联动：schedule.autoenroll_growth_tasks 开启时，加号成功
 		// 即自动跑一遍 17 项任务自动化。默认关（任务链含真实短对话）。
-		// 走异步 job（mode=account，与手动单账号一键完成同形态）而非同步
-		// 直跑：批跑执行统计/进度卡/jobs 列表同样覆盖自动加号触发的执行
-		// ——此前同步直跑只打一行日志，前端完全看不到它跑过。
+		// 提交到全局执行池（与手动批跑共用队列）：排队串行执行、进度卡/
+		// jobs 列表可见、不与其它触发源并发撞同一账号。
 		if cfg.ScheduleEnabled.AutoenrollGrowthTasks {
 			h.cfg.AutoEnroll.SetOnAccountEnrolled(func(uid string) {
 				a := h.cfg.Pool.AuthByUID(uid)
 				if a == nil || a.Region() == "global" {
 					return
 				}
-				if !h.growthLocks.tryLock(uid) {
-					log.Printf("auto-enroll: 新号 %s 有任务正在执行，跳过自动成长任务", uid)
-					return
-				}
-				log.Printf("auto-enroll: 新号 %s 自动执行成长任务（autoenroll_growth_tasks=on）", uid)
 				job := h.growthJobs.newJob(uid, "account")
-				go func() {
-					defer h.growthLocks.unlock(uid) // 流水线真正结束才放锁
-					h.runGrowthAllWithJob(a, job)
-				}()
+				if h.growthSubmitAccount(job, a) {
+					log.Printf("auto-enroll: 新号 %s 已入队自动成长任务（autoenroll_growth_tasks=on）", uid)
+				} else {
+					log.Printf("auto-enroll: 新号 %s 已在执行队列中，跳过重复入队", uid)
+				}
 			})
 		}
 		// WebUI 运行时切换项目 ID 直接推给 AutoEnroll（组装在 NewHandler

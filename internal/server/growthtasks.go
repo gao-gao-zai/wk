@@ -740,23 +740,20 @@ func (h *Handler) runGrowthAction(a *auth.Auth, act *growthAction) map[string]an
 }
 
 // accountTaskAutoAll 一键完成该账号全部可自动任务（17 项，依赖序 + 逐项自动领奖）。
-// 异步 job 化：立即返回 202 + job_id，进度走 GET /admin/growth/jobs/{id} 轮询。
-// 用户可以关页面——任务在后台跑完，结果保留 2 小时可回看。
+// 异步 job 化 + 入执行池：立即返回 202 + job_id，进度走 GET /admin/growth/jobs/{id} 轮询。
+// 与全池批跑共用同一队列（growthRunner）：排队串行执行，不会与其它触发源并发
+// 跑同一账号；已在队列/执行中返回 409（前端提示等待）。
 func (h *Handler) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
 	}
-	if !h.growthLocks.tryLock(uid) {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号有任务动作正在执行中，请等本轮结束后再试"})
+	job := h.growthJobs.newJob(uid, "account")
+	if !h.growthSubmitAccount(job, a) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号已在执行队列中，请等本轮结束后再试"})
 		return
 	}
-	job := h.growthJobs.newJob(uid, "account")
-	go func() {
-		defer h.growthLocks.unlock(uid) // 流水线真正结束才放锁
-		h.runGrowthAllWithJob(a, job)
-	}()
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok": true, "job_id": job.ID, "message": "任务已开始，可关闭页面",
 	})
@@ -804,11 +801,12 @@ func (h *Handler) runGrowthAllWithJob(a *auth.Auth, job *growthJob) {
 	log.Printf("growth: 一键完成可自动任务 uid=%s 共 %d 项", uid, len(items))
 }
 
-// allAccountsTaskAutoAll 对全部非禁用 CN 账号串行执行一键完成（批跑）。
-// 同样 job 化：立即返回 202 + job_id；进度 = 账号粒度（当前跑到哪个账号）。
-// 单账号失败不影响后续；账号间共享的 expert 链节流照常生效。
+// allAccountsTaskAutoAll 对全部非禁用 CN 账号执行一键完成（批跑）。
+// 入执行池（growthRunner）：所有触发源（手动全池/手动单账号/自动加号/重启恢复）
+// 共用同一队列串行消费——不撞锁、不丢统计。job 化立即返回 202 + job_id；
+// 进度 = 账号粒度（当前跑到哪个账号）。
 func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request) {
-	var accounts []accountJobType
+	var accounts []*auth.Auth
 	for _, st := range h.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -820,73 +818,25 @@ func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request)
 		if a.Region() == "global" {
 			continue
 		}
-		accounts = append(accounts, accountJobType{st.UID, a})
+		accounts = append(accounts, a)
 	}
 	if len(accounts) == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "没有可执行的账号"})
 		return
 	}
-	pending := make([]string, 0, len(accounts))
-	for _, aj := range accounts {
-		pending = append(pending, aj.uid)
-	}
 	job := h.growthJobs.newJob("", "all")
-	// 进度分母 = 账号总数（启动即知），分子 = 已完成账号数。任务项明细进
-	// results 但不参与 done/total——否则 total 只能逐账号累加，进度条全程
-	// 显示 0/? 或追赶态，用户看不出"85 个账号跑到第几个"。
-	job.setTotal(len(accounts))
-	go h.runAllAccountsPipeline(job, accounts, pending)
+	// 先写初始快照再入队：入队后 drain 立即起跑，run 尾部的 syncGrowthMark
+	// 是标记文件唯一同步点（入队方滞后写会与 drain 的 clear 竞争复活标记）。
+	pendingUIDs := make([]string, 0, len(accounts))
+	for _, a := range accounts {
+		pendingUIDs = append(pendingUIDs, a.Snapshot().UID)
+	}
+	h.writeGrowthJobMark(pendingUIDs)
+	enqueued := h.growthSubmitAll(job, accounts)
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok": true, "job_id": job.ID, "total_accounts": len(accounts),
+		"ok": true, "job_id": job.ID, "total_accounts": enqueued,
 		"message": "批跑已开始，可关闭页面",
 	})
-}
-
-// runAllAccountsPipeline 批跑主管线（端点触发与重启恢复共用）。
-// accounts 为本轮要跑的账号；pendingUIDs 为落盘标记的待跑清单（每完成一个
-// 划掉一个，全部结束删除标记；nil = 不落盘）。
-func (h *Handler) runAllAccountsPipeline(job *growthJob, accounts []accountJobType, pendingUIDs []string) {
-	pending := pendingUIDs
-	h.writeGrowthJobMark(pending)
-	for _, aj := range accounts {
-		job.noteCurrent("账号 " + aj.uid)
-		if !h.growthLocks.tryLock(aj.uid) {
-			job.finishItem(growthJobItem{UID: aj.uid, OK: false, Message: "该账号有任务动作正在执行中，跳过"})
-			job.accountDone()
-		} else {
-			h.runGrowthAllForJobAll(aj.a, job)
-			h.growthLocks.unlock(aj.uid)
-		}
-		// 标记划账：完成的账号从待跑清单移除（重启恢复只重跑剩余的）。
-		if len(pending) > 0 {
-			pending = pending[1:]
-			h.writeGrowthJobMark(pending)
-		}
-	}
-	if len(pending) == 0 {
-		h.clearGrowthJobMark()
-	}
-	job.finish("done", "")
-	log.Printf("growth: 全部账号一键完成 共 %d 个账号", len(accounts))
-}
-
-// runGrowthAllForJobAll 单账号全量流水线，结果逐项合入 all 模式的 job
-// （进度按账号粒度推进：本函数结束 = done+1；任务项明细进 results 但
-// 不计入 done/total，明细条目带 uid 区分账号）。
-func (h *Handler) runGrowthAllForJobAll(a *auth.Auth, job *growthJob) {
-	uid := a.Snapshot().UID
-	items, ok := h.runGrowthAllCollect(a, func(code, desc string) {
-		job.noteCurrent(uid + "｜" + code)
-	})
-	if !ok {
-		job.finishItem(growthJobItem{UID: uid, OK: false, Message: "任务列表拉取失败"})
-	} else {
-		for _, item := range items {
-			item.UID = uid
-			job.appendResult(item)
-		}
-	}
-	job.accountDone()
 }
 
 // runGrowthAllCollect 带逐项回调的全量流水线（all 模式复用；onStart 在每项

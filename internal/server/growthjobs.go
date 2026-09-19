@@ -127,6 +127,14 @@ func (j *growthJob) accountDone() {
 	j.mu.Unlock()
 }
 
+// accountFinished all 模式：全部账号是否已跑完（done ≥ total）——
+// 执行池里最后一个账号跑完时用它触发 job finish（多 job 交错各收各的）。
+func (j *growthJob) accountFinished() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.done >= j.total
+}
+
 // appendResult 追加结果明细不动进度计数（all 模式的任务项）。
 func (j *growthJob) appendResult(item growthJobItem) {
 	j.mu.Lock()
@@ -238,10 +246,11 @@ type growthJobMark struct {
 // growthJobMarkPath 落盘路径（空 = 功能关闭）。main 从 state.json 同目录注入。
 func (h *Handler) growthJobMarkPath() string { return h.cfg.GrowthJobMarkPath }
 
-// writeGrowthJobMark 原子写标记文件（待跑清单快照）。
+// writeGrowthJobMark 原子写标记文件（待跑清单快照）。空清单不写文件
+//（避免残留 {"pending":[]}——恢复读不到即视为无任务，与删除语义一致）。
 func (h *Handler) writeGrowthJobMark(pending []string) {
 	path := h.growthJobMarkPath()
-	if path == "" {
+	if path == "" || len(pending) == 0 {
 		return
 	}
 	mark := growthJobMark{Mode: "all", Pending: pending, Started: time.Now().Format(time.RFC3339)}
@@ -278,23 +287,17 @@ func (h *Handler) readGrowthJobMark() *growthJobMark {
 	return &mark
 }
 
-// accountJobType 批跑的单账号条目（端点触发与重启恢复共用）。
-type accountJobType struct {
-	uid string
-	a   *auth.Auth
-}
-
 // ResumeGrowthJobsAfterRestart 重启恢复入口（main 启动完成后调用）。
-// 检测到残留标记（上次进程死在批跑半路）时，重新拉起剩余账号的批跑：
+// 检测到残留标记（上次进程死在批跑半路）时，把剩余账号重新提交到执行池：
 //   - 账号按标记里的 Pending 顺序重查（禁用/移除/global 的自然过滤）
 //   - 动作幂等：上次已完成的项这次秒级跳过
-//   - 立即清除旧标记并写新标记（Pending = 本轮实际待跑），避免二次重启叠加
+//   - 立即清除旧标记并入队（入队即同步标记），避免二次重启叠加
 func (h *Handler) ResumeGrowthJobsAfterRestart() {
 	mark := h.readGrowthJobMark()
 	if mark == nil {
 		return
 	}
-	var accounts []accountJobType
+	var accounts []*auth.Auth
 	for _, uid := range mark.Pending {
 		a := h.cfg.Pool.AuthByUID(uid)
 		if a == nil || a.Snapshot().AccessToken == "" {
@@ -303,7 +306,7 @@ func (h *Handler) ResumeGrowthJobsAfterRestart() {
 		if a.Region() == "global" {
 			continue
 		}
-		accounts = append(accounts, accountJobType{uid, a})
+		accounts = append(accounts, a)
 	}
 	log.Printf("growth: 检测到重启前未完成的批跑标记（%d 个待跑账号），自动恢复", len(mark.Pending))
 	if len(accounts) == 0 {
@@ -311,15 +314,15 @@ func (h *Handler) ResumeGrowthJobsAfterRestart() {
 		log.Printf("growth: 待跑账号均已不可用，标记清除")
 		return
 	}
-	pending := make([]string, 0, len(accounts))
-	for _, aj := range accounts {
-		pending = append(pending, aj.uid)
-	}
 	job := h.growthJobs.newJob("", "all")
-	job.setTotal(len(accounts)) // 进度 = 账号粒度（启动即知分母）
-	// 延迟几秒再开跑：让服务先把监听/健康检查立起来，部署脚本不误判启动失败。
+	// 先写初始快照再入队（入队后 drain 立即起跑，run 尾部的 syncGrowthMark
+	// 是唯一同步点；入队方滞后写会与 drain 的 clear 竞争复活已删标记）。
+	h.writeGrowthJobMark(mark.Pending)
+	// 延迟几秒再入队：让服务先把监听/健康检查立起来，部署脚本不误判启动失败。
 	go func() {
 		time.Sleep(5 * time.Second)
-		h.runAllAccountsPipeline(job, accounts, pending)
+		if n := h.growthSubmitAll(job, accounts); n == 0 {
+			h.clearGrowthJobMark()
+		}
 	}()
 }
