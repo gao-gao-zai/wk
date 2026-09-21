@@ -53,7 +53,8 @@ type Rules struct {
 	ExcludeKeywords []string          `json:"exclude_keywords"` // 任一命中即剔除
 	MaxLatencyMs    int               `json:"max_latency_ms"`   // 0 = 不检查
 	RegionRules     map[string][]string `json:"region_rules"`   // 账号region → 允许的节点地区；空 = 不区分
-	AccountsPerNode int               `json:"accounts_per_node"` // 槽位容量（共享度目标）；0 = 不限
+	AccountsPerNode int               `json:"accounts_per_node"` // 槽位容量硬上限（防预算信号失灵的兜底）；0 = 不限
+	SlotBudgetRPM   int               `json:"slot_budget_rpm"`   // 槽位流量软预算（每分钟请求数）；0 = 默认 60
 }
 
 // Slot 槽位：固定端口 + 当前指向的节点。
@@ -103,6 +104,7 @@ func DefaultState() *State {
 			ExcludeKeywords: []string{},
 			RegionRules:     map[string][]string{},
 			AccountsPerNode: 3,
+			SlotBudgetRPM:   60,
 		},
 		Slots:    []Slot{},
 		Bindings: map[string]Binding{},
@@ -140,6 +142,9 @@ func (s *State) Normalize() {
 	}
 	if s.Health == nil {
 		s.Health = map[string]*NodeHealth{}
+	}
+	if s.Rules.SlotBudgetRPM <= 0 {
+		s.Rules.SlotBudgetRPM = 60
 	}
 }
 

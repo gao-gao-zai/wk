@@ -28,7 +28,14 @@ type Pool struct {
 	nodes   map[string]*Node          // node_id → node
 	slots   map[string]*Slot           // slot_id → slot
 	bindngs map[string]Binding         // uid → binding（store.st.Bindings 的运行时镜像）
-	loads   map[string]int64           // node_id → 累计请求数（真实负载，均衡依据）
+	loads   map[string]int64           // node_id → 累计请求数（保留：API/审计用，不再是均衡主信号）
+	// 三层滑动窗口（近 6 分钟速率，均衡主信号）：
+	//   nodeWin 节点级——替换累计值的历史包袱（昨天热今天闲不再被惩罚）
+	//   slotWin 槽位级——同节点槽位间分流（热连接不再挤同一个 inbound）
+	//   uidWin  账号级——账号自身的"占位体积"（热账号只能进真空闲的槽）
+	nodeWin map[string]*WinRate
+	slotWin map[string]*WinRate
+	uidWin  map[string]*WinRate
 	nextPort int
 	portMin  int
 	portMax  int
@@ -42,6 +49,9 @@ func NewPool(store *Store, portMin, portMax int) *Pool {
 		slots:   map[string]*Slot{},
 		bindngs: map[string]Binding{},
 		loads:   map[string]int64{},
+		nodeWin: map[string]*WinRate{},
+		slotWin: map[string]*WinRate{},
+		uidWin:  map[string]*WinRate{},
 		nextPort: portMin,
 		portMin:  portMin,
 		portMax:  portMax,
@@ -176,11 +186,21 @@ func (p *Pool) Assign(uid, region string) (int, *KernelOp, error) {
 		return 0, nil, fmt.Errorf("无可用代理节点")
 	}
 
-	// 槽位选择（负载均衡）：同 region 有未满槽位 → 并入"节点累计请求最少"的。
-	// 依据真实请求数而不是账号数——冷热账号差一个量级，账号数会骗人。
-	// 排序 tie-break：请求数并列时按槽位 ID——否则启动窗口期全是 0 并列，
-	// map 随机序会把账号随机散到各槽（线上 120 账号散出 69 个槽的教训）。
+	// 槽位选择（流量预算模型，v2）：
+	//   剩余预算 = slot_budget_rpm − slotRPM − 节点侧约束 nodeRPM/节点槽数
+	//   热账号（uidRPM 高）只能进剩余预算足够的槽；冷账号可填充。
+	//   accounts_per_node 退化为硬上限兜底（窗口信号失灵时不至于全挤一个槽）。
+	//   窗口全零（冷启动/重启）时自然退化为旧行为，几分钟内信号出现。
 	apn := p.store.st.Rules.AccountsPerNode
+	budget := p.store.st.Rules.SlotBudgetRPM
+	if budget <= 0 {
+		budget = 60
+	}
+	uidRPM := p.uidRPMLocked(uid) // -1 = 新账号无历史
+	if uidRPM < 0 {
+		uidRPM = float64(budget) / 10 // 冷启动占位：中位数试探，首个窗口后自动修正
+	}
+
 	var target *Slot
 	var joinable []*Slot
 	for _, s := range p.slots {
@@ -195,17 +215,32 @@ func (p *Pool) Assign(uid, region string) (int, *KernelOp, error) {
 		}
 		joinable = append(joinable, s)
 	}
-	sort.Slice(joinable, func(i, j int) bool {
-		li, lj := p.nodeLoadLocked(joinable[i].NodeID), p.nodeLoadLocked(joinable[j].NodeID)
-		if li != lj {
-			return li < lj
-		}
-		return joinable[i].ID < joinable[j].ID
-	})
+	// 评分 = 剩余预算（大者优先）；并列时账号占用少者优先；再并列槽位 ID（确定性）
+	nodeSlotCount := map[string]int{}
 	for _, s := range joinable {
-		if apn <= 0 || p.slotCountLocked(s.ID) < apn {
+		nodeSlotCount[s.NodeID]++
+	}
+	slotBudgetLeft := func(s *Slot) float64 {
+		nodeShare := 0.0 // 节点侧占用：把节点流量均摊到它的槽位数上
+		if c := nodeSlotCount[s.NodeID]; c > 0 {
+			nodeShare = p.nodeRPMLocked(s.NodeID) / float64(c)
+		}
+		return float64(budget) - p.slotRPMLocked(s.ID) - nodeShare
+	}
+	var bestLeft float64
+	for _, s := range joinable {
+		if apn > 0 && p.slotCountLocked(s.ID) >= apn {
+			continue // 硬上限
+		}
+		left := slotBudgetLeft(s)
+		if left < uidRPM {
+			continue // 预算不足以容纳该账号的当前热度
+		}
+		if target == nil || left > bestLeft ||
+			(left == bestLeft && p.slotCountLocked(s.ID) < p.slotCountLocked(target.ID)) ||
+			(left == bestLeft && p.slotCountLocked(s.ID) == p.slotCountLocked(target.ID) && s.ID < target.ID) {
 			target = s
-			break
+			bestLeft = left
 		}
 	}
 
@@ -385,8 +420,9 @@ func (p *Pool) nodeLoadLocked(nodeID string) int64 {
 	return int64(1) << 60
 }
 
-// CountRequest 账号请求命中节点时计数（DialProxy 调用；真实负载信号）。
-// 无绑定/节点消失时静默忽略。
+// CountRequest 账号请求命中时计数（DialProxy 每次调用）。三层下钻：
+// 节点（均衡主信号）/ 槽位（同节点槽位分流）/ 账号（自身热度=占位体积）。
+// 无绑定/节点消失时静默忽略。loads 累计值保留仅作审计展示。
 func (p *Pool) CountRequest(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -398,9 +434,85 @@ func (p *Pool) CountRequest(uid string) {
 	if s == nil {
 		return
 	}
-	if _, alive := p.nodes[s.NodeID]; alive {
-		p.loads[s.NodeID]++
+	if _, alive := p.nodes[s.NodeID]; !alive {
+		return
 	}
+	now := WinClock()
+	p.loads[s.NodeID]++
+	p.nodeWinLocked(s.NodeID).Add(now)
+	p.slotWinLocked(s.ID).Add(now)
+	p.uidWinLocked(uid).Add(now)
+}
+
+// ---- 窗口访问器（调用方须持 Pool.mu）----
+
+func (p *Pool) nodeWinLocked(nodeID string) *WinRate {
+	w := p.nodeWin[nodeID]
+	if w == nil {
+		w = NewWinRate(time.Minute, 6)
+		p.nodeWin[nodeID] = w
+	}
+	return w
+}
+
+func (p *Pool) slotWinLocked(slotID string) *WinRate {
+	w := p.slotWin[slotID]
+	if w == nil {
+		w = NewWinRate(time.Minute, 6)
+		p.slotWin[slotID] = w
+	}
+	return w
+}
+
+func (p *Pool) uidWinLocked(uid string) *WinRate {
+	w := p.uidWin[uid]
+	if w == nil {
+		w = NewWinRate(time.Minute, 6)
+		p.uidWin[uid] = w
+	}
+	return w
+}
+
+// nodeRPM 节点近窗口每分钟速率（持锁调用）。
+func (p *Pool) nodeRPMLocked(nodeID string) float64 {
+	if _, ok := p.nodes[nodeID]; !ok {
+		return 1 << 30 // 节点已消失：按超重处理，不参与均衡
+	}
+	return p.nodeWinLocked(nodeID).RPM(WinClock())
+}
+
+// slotRPM 槽位近窗口每分钟速率（持锁调用）。槽位不存在返回 +Inf 语义的超大值。
+func (p *Pool) slotRPMLocked(slotID string) float64 {
+	s := p.slots[slotID]
+	if s == nil {
+		return 1 << 30
+	}
+	return p.slotWinLocked(slotID).RPM(WinClock())
+}
+
+// uidRPM 账号近窗口每分钟速率（持锁调用）。
+// 无历史的新账号返回负值（冷启动占位由调用方预算逻辑处理）。
+func (p *Pool) uidRPMLocked(uid string) float64 {
+	w := p.uidWin[uid]
+	if w == nil {
+		return -1
+	}
+	_, rpm := w.Value(WinClock())
+	return rpm
+}
+
+// SlotRPMView 槽位速率视图（API/调试用，含锁）。
+func (p *Pool) SlotRPMView(slotID string) float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.slotRPMLocked(slotID)
+}
+
+// NodeRPMView 节点速率视图（API/调试用，含锁）。
+func (p *Pool) NodeRPMView(nodeID string) float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.nodeRPMLocked(nodeID)
 }
 
 // NodeLoadsSnapshot 各节点累计请求数（负载视图）。
@@ -470,13 +582,17 @@ func containsStr(list []string, s string) bool {
 // pickNodeLocked 指向选择（须持 Pool.mu）：累计请求最少 → 被指向槽位最少 →
 // 延迟最低 → ID 字典序。首因子是真实请求数（负载均衡），账号数只做次级
 // 稳健信号，延迟作 tie-break。
+// pickNodeLocked 新建槽位时选节点。
+// v2 排序：节点近窗口速率（主）→ 被指向槽位数 → 延迟 → ID。
+// 窗口速率替换了旧的累计值（历史包袱）；"已有槽位数"仍先于延迟——
+// 先在轻节点上开满共享，再开新节点（摊开优先于延迟最优）。
 func (p *Pool) pickNodeLocked(cands []Node) Node {
 	var best Node
-	bestScore := int64(1) << 62
+	bestScore := float64(1 << 62)
 	for _, n := range cands {
-		load := int64(1) << 40 // 池里查不到（刚消失）按超重处理
+		rpm := float64(1 << 30) // 池里查不到（刚消失）按超重处理
 		if _, ok := p.nodes[n.ID]; ok {
-			load = p.loads[n.ID]
+			rpm = p.nodeWinLocked(n.ID).RPM(WinClock())
 		}
 		// 延迟：已知低延迟优先；未测速（-1）垫底但不排除——启动窗口期
 		// 全部未测速时仍要选得出节点。
@@ -484,7 +600,7 @@ func (p *Pool) pickNodeLocked(cands []Node) Node {
 		if h := p.store.st.Health[n.ID]; h != nil && h.LatencyMs >= 0 {
 			lat = h.LatencyMs
 		}
-		score := load*1_000_000_000 + int64(p.pointedCountLocked(n.ID))*10_000_000 + lat
+		score := rpm*10_000_000 + float64(p.pointedCountLocked(n.ID))*1_000_000 + float64(lat)
 		// tie-break by ID：cands 是 map 迭代序，并列时不稳定会随机选
 		if score < bestScore || (score == bestScore && n.ID < best.ID) {
 			bestScore = score

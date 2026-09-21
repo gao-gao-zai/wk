@@ -39,18 +39,26 @@ func markHealthy(t *testing.T, p *Pool, nodeID string, latency int64) {
 	h.FailStreak = 0
 }
 
-// TestAssignLoadBalanceNewAccounts 新账号应按节点负载分到轻载节点：
-// node-A 已有 100 请求、node-B 0 请求 → 新账号的新槽位应指向 node-B。
+// seedWindow 在窗口计数器里预置 n 次"刚刚"的请求（测试辅助）。
+func seedWindow(p *Pool, nodeID string, n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	w := p.nodeWinLocked(nodeID)
+	for i := 0; i < n; i++ {
+		w.Add(WinClock())
+	}
+}
+
+// TestAssignLoadBalanceNewAccounts 新账号应按节点窗口速率分到轻载节点：
+// node-A 近窗口 100 请求、node-B 0 请求 → 新账号的新槽位应指向 node-B。
 func TestAssignLoadBalanceNewAccounts(t *testing.T) {
 	p := newTestPool(t)
 	p.SetNodes([]NodeSpec{probedNode("a"), probedNode("b")})
 	markHealthy(t, p, "a", 100)
 	markHealthy(t, p, "b", 100)
 
-	// 预置负载：a=100, b=0
-	p.mu.Lock()
-	p.loads["a"] = 100
-	p.mu.Unlock()
+	// 预置窗口负载：a=100, b=0
+	seedWindow(p, "a", 100)
 
 	// 第一个账号：无既有槽位，选节点 → b 更轻
 	_, op, err := p.Assign("u1", "cn")
@@ -62,7 +70,8 @@ func TestAssignLoadBalanceNewAccounts(t *testing.T) {
 	}
 }
 
-// TestAssignJoinsLightestSlot 并入槽位时选节点负载最轻的槽位。
+// TestAssignJoinsLightestSlot 并入槽位时选剩余预算最大的槽位
+// （节点侧流量均摊到其槽位数）。
 func TestAssignJoinsLightestSlot(t *testing.T) {
 	p := newTestPool(t)
 	p.SetNodes([]NodeSpec{probedNode("a"), probedNode("b")})
@@ -73,9 +82,9 @@ func TestAssignJoinsLightestSlot(t *testing.T) {
 	p.mu.Lock()
 	p.slots["slot_a"] = &Slot{ID: "slot_a", Port: 31080, NodeID: "a", Region: "cn", Since: time.Now()}
 	p.slots["slot_b"] = &Slot{ID: "slot_b", Port: 31081, NodeID: "b", Region: "cn", Since: time.Now()}
-	p.loads["a"] = 500
-	p.loads["b"] = 10
 	p.mu.Unlock()
+	seedWindow(p, "a", 500)
+	seedWindow(p, "b", 10)
 
 	port, _, err := p.Assign("u1", "cn")
 	if err != nil {
@@ -83,6 +92,55 @@ func TestAssignJoinsLightestSlot(t *testing.T) {
 	}
 	if port != 31081 {
 		t.Fatalf("应并入轻载槽位 slot_b(31081)，实际端口 %d", port)
+	}
+}
+
+// TestAssignBudgetBlocksHotAccount 槽位预算不足时，热账号进不去：
+// slot_a 窗口流量已接近预算 → uidRPM 高的账号被拒，冷账号可进。
+func TestAssignBudgetBlocksHotAccount(t *testing.T) {
+	p := newTestPool(t)
+	p.SetNodes([]NodeSpec{probedNode("a"), probedNode("b")})
+	markHealthy(t, p, "a", 100)
+	markHealthy(t, p, "b", 100)
+
+	p.mu.Lock()
+	p.slots["slot_a"] = &Slot{ID: "slot_a", Port: 31080, NodeID: "a", Region: "cn", Since: time.Now()}
+	p.mu.Unlock()
+	// 预算默认 60；slot_a 已流 50 rpm → 剩 10：容得下冷账号（冷启动占位 6），
+	// 容不下热账号
+	p.mu.Lock()
+	w := p.slotWinLocked("slot_a")
+	for i := 0; i < 50*6; i++ { // 6 分钟窗口共 50 rpm × 6 min
+		w.Add(WinClock())
+	}
+	p.mu.Unlock()
+
+	// 冷账号（uidRPM=0，无历史）可进 slot_a
+	port, _, err := p.Assign("cold_user", "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port != 31080 {
+		t.Fatalf("冷账号应进 slot_a，实际端口 %d", port)
+	}
+
+	// 热账号：uid 窗口 30 rpm → 剩余预算 2 容不下，应落到新槽（指向 b）
+	// 先把 hot_user 的窗口加热
+	p.mu.Lock()
+	hw := p.uidWinLocked("hot_user")
+	for i := 0; i < 30*6; i++ {
+		hw.Add(WinClock())
+	}
+	p.mu.Unlock()
+	_, op, err := p.Assign("hot_user", "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op == nil {
+		t.Fatal("热账号应被预算拒绝后新建槽位")
+	}
+	if op.NodeSpec.ID != "b" {
+		t.Fatalf("热账号新槽应指向无流量的 b，实际 %s", op.NodeSpec.ID)
 	}
 }
 
@@ -111,8 +169,8 @@ func TestCountRequestAccumulates(t *testing.T) {
 	}
 }
 
-// TestRebalanceMigratesFromHeavyToLight 账号数倾斜时迁移（3v0 → 2v1），
-// 绑定换、既有端口不变。
+// TestRebalanceMigratesFromHeavyToLight 流量倾斜时迁移：
+// a 节点窗口 600 rpm、b 节点 0 → a 上的账号应迁到 b。
 func TestRebalanceMigratesFromHeavyToLight(t *testing.T) {
 	p := newTestPool(t)
 	p.SetNodes([]NodeSpec{probedNode("a"), probedNode("b")})
@@ -122,34 +180,99 @@ func TestRebalanceMigratesFromHeavyToLight(t *testing.T) {
 	p.mu.Lock()
 	p.slots["slot_a"] = &Slot{ID: "slot_a", Port: 31080, NodeID: "a", Region: "cn", Since: time.Now()}
 	p.slots["slot_b"] = &Slot{ID: "slot_b", Port: 31081, NodeID: "b", Region: "cn", Since: time.Now()}
-	// a 上 3 个账号，b 上 0 个 → 摊到 2v1
-	for _, uid := range []string{"u1", "u2", "u3"} {
-		p.bindngs[uid] = Binding{SlotID: "slot_a", Since: time.Now()}
-	}
+	p.bindngs["u1"] = Binding{SlotID: "slot_a", Since: time.Now()}
 	p.mu.Unlock()
+	// a 窗口 600 rpm（热），b 0：差 > 预算(60) → 应迁移 u1
+	seedWindow(p, "a", 3600)
 
 	ops := p.PlanRebalance()
 	if len(ops) == 0 {
-		t.Fatal("账号倾斜 3v0 应有迁移方案")
+		t.Fatal("流量倾斜 600v0 应有迁移方案")
 	}
 	n, _ := p.ApplyRebalance(ops)
 	if n == 0 {
 		t.Fatal("应有迁移")
 	}
-	// 验证摊开：a 上账号数 - b 上账号数 ≤ 1
 	p.mu.Lock()
-	accA, accB := 0, 0
-	for _, b := range p.bindngs {
-		switch p.slots[b.SlotID].NodeID {
-		case "a":
-			accA++
-		case "b":
-			accB++
-		}
+	moved := p.bindngs["u1"].SlotID == "slot_b"
+	p.mu.Unlock()
+	if !moved {
+		t.Fatal("u1 应迁到 slot_b")
+	}
+}
+
+// TestRebalanceMigratesHottestAccount 迁移受害者选择：重端有多个账号时，
+// 迁 uidRPM 最大的（迁冷账号不降压）。
+func TestRebalanceMigratesHottestAccount(t *testing.T) {
+	p := newTestPool(t)
+	p.SetNodes([]NodeSpec{probedNode("a"), probedNode("b")})
+	markHealthy(t, p, "a", 100)
+	markHealthy(t, p, "b", 100)
+
+	p.mu.Lock()
+	p.slots["slot_a"] = &Slot{ID: "slot_a", Port: 31080, NodeID: "a", Region: "cn", Since: time.Now()}
+	p.slots["slot_b"] = &Slot{ID: "slot_b", Port: 31081, NodeID: "b", Region: "cn", Since: time.Now()}
+	// a 上两个账号：cold（10 rpm）与 hot（300 rpm）
+	p.bindngs["cold"] = Binding{SlotID: "slot_a", Since: time.Now()}
+	p.bindngs["hot"] = Binding{SlotID: "slot_a", Since: time.Now()}
+	// 热账号的 uid 窗口
+	hw := p.uidWinLocked("hot")
+	for i := 0; i < 300*6; i++ {
+		hw.Add(WinClock())
+	}
+	cw := p.uidWinLocked("cold")
+	for i := 0; i < 10*6; i++ {
+		cw.Add(WinClock())
+	}
+	// 节点 a 的窗口流量 = 两账号之和
+	aw := p.nodeWinLocked("a")
+	for i := 0; i < 310*6; i++ {
+		aw.Add(WinClock())
 	}
 	p.mu.Unlock()
-	if accA-accB > 1 {
-		t.Fatalf("未摊平：a=%d b=%d", accA, accB)
+
+	ops := p.PlanRebalance()
+	if len(ops) == 0 {
+		t.Fatal("a=310rpm vs b=0 应有迁移")
+	}
+	if ops[0].UID != "hot" {
+		t.Fatalf("应迁最热的账号 hot，实际 %s", ops[0].UID)
+	}
+}
+
+// TestRebalanceCooldownBlocksImmediateRemigrate 迁移后 10 分钟冷却：
+// 刚迁过的账号不参与下一轮迁移。
+func TestRebalanceCooldownBlocksImmediateRemigrate(t *testing.T) {
+	p := newTestPool(t)
+	p.SetNodes([]NodeSpec{probedNode("a"), probedNode("b")})
+	markHealthy(t, p, "a", 100)
+	markHealthy(t, p, "b", 100)
+
+	// 冷却记录是包级全局（进程生命周期语义），清掉其他测试的残留
+	p.mu.Lock()
+	for k := range lastMovedAt {
+		delete(lastMovedAt, k)
+	}
+	p.mu.Unlock()
+
+	p.mu.Lock()
+	p.slots["slot_a"] = &Slot{ID: "slot_a", Port: 31080, NodeID: "a", Region: "cn", Since: time.Now()}
+	p.slots["slot_b"] = &Slot{ID: "slot_b", Port: 31081, NodeID: "b", Region: "cn", Since: time.Now()}
+	p.bindngs["cooldown_u1"] = Binding{SlotID: "slot_a", Since: time.Now()}
+	p.mu.Unlock()
+	seedWindow(p, "a", 3600)
+
+	// 第一轮：迁移
+	ops := p.PlanRebalance()
+	if len(ops) != 1 {
+		t.Fatalf("应有 1 个迁移，实际 %d", len(ops))
+	}
+	p.ApplyRebalance(ops)
+
+	// 冷却期内：u1 已在 slot_b（b 现在是重端），再倾斜回去也不会迁 u1
+	seedWindow(p, "b", 3600)
+	if ops2 := p.PlanRebalance(); len(ops2) != 0 {
+		t.Fatalf("冷却期内 u1 不应再迁，实际 %+v", ops2)
 	}
 }
 
@@ -166,11 +289,16 @@ func TestRebalanceKeepsHotAccountHot(t *testing.T) {
 	p.slots["slot_b"] = &Slot{ID: "slot_b", Port: 31081, NodeID: "b", Region: "cn", Since: time.Now()}
 	p.bindngs["u1"] = Binding{SlotID: "slot_a", Since: time.Now()} // 热账号在 a
 	p.bindngs["u2"] = Binding{SlotID: "slot_b", Since: time.Now()}
-	p.loads["a"] = 1000 // u1 打出来的
-	p.loads["b"] = 100
+	// u1 热账号：uid 窗口 200 rpm；节点窗口 a=200 b=20
+	hw := p.uidWinLocked("u1")
+	for i := 0; i < 200*6; i++ {
+		hw.Add(WinClock())
+	}
 	p.mu.Unlock()
+	seedWindow(p, "a", 200*6)
+	seedWindow(p, "b", 20*6)
 
-	// 1v1 账号 + 流量跟人走：迁 u1 到 b 会让 b 更重（210 vs 100），无收益
+	// 迁 u1(200rpm) 到 b：a=0、b=220 → 反向超调比原来（200 vs 20）更糟 → 不迁
 	if ops := p.PlanRebalance(); len(ops) != 0 {
 		t.Fatalf("热账号独占流量时迁移无收益，不应迁移，实际 %+v", ops)
 	}
@@ -248,7 +376,7 @@ func TestAssignSingleSlotPerNode(t *testing.T) {
 	}
 }
 
-// TestRebalanceNoopWhenBalanced 负载接近时不迁移（防抖动）。
+// TestRebalanceNoopWhenBalanced 窗口流量接近时不迁移（防抖动）。
 func TestRebalanceNoopWhenBalanced(t *testing.T) {
 	p := newTestPool(t)
 	p.SetNodes([]NodeSpec{probedNode("a"), probedNode("b")})
@@ -260,18 +388,19 @@ func TestRebalanceNoopWhenBalanced(t *testing.T) {
 	p.slots["slot_b"] = &Slot{ID: "slot_b", Port: 31081, NodeID: "b", Region: "cn", Since: time.Now()}
 	p.bindngs["u1"] = Binding{SlotID: "slot_a", Since: time.Now()}
 	p.bindngs["u2"] = Binding{SlotID: "slot_b", Since: time.Now()}
-	p.loads["a"] = 120
-	p.loads["b"] = 100
 	p.mu.Unlock()
+	// a=12rpm b=10rpm：差 2 << 预算 60，比值 1.2 < 5 → 不迁
+	seedWindow(p, "a", 12*6)
+	seedWindow(p, "b", 10*6)
 
-	// 1v1 账号均衡 + 请求差（20/10=2）远小于 1 账号当量 → 不迁
 	if ops := p.PlanRebalance(); len(ops) != 0 {
-		t.Fatalf("已均衡（1v1 账号）不应迁移，实际 %+v", ops)
+		t.Fatalf("已均衡（12 vs 10 rpm）不应迁移，实际 %+v", ops)
 	}
 }
 
 // TestRebalanceSpreadsAcrossNodes 17 账号挤在 1 个节点、10 个候选节点
-// → 再平衡应主动摊开到多个节点（新建槽位），不再受 apn=30 打包影响。
+// → v3 按窗口流量触发：n00 显著超载时迁最热账号到最轻节点。
+// v3 每 region 每轮最多迁 1 个（窗口信号滞后，多轮收敛）。
 func TestRebalanceSpreadsAcrossNodes(t *testing.T) {
 	p := newTestPool(t)
 	var specs []NodeSpec
@@ -284,45 +413,29 @@ func TestRebalanceSpreadsAcrossNodes(t *testing.T) {
 	}
 
 	p.mu.Lock()
-	// apn=30（用户线上值）：v1 会把 17 个账号打包进 1 个节点；v2 应摊开
 	p.store.st.Rules.AccountsPerNode = 30
 	p.slots["slot_a"] = &Slot{ID: "slot_a", Port: 31080, NodeID: "n00", Region: "cn", Since: time.Now()}
 	for i := 1; i <= 17; i++ {
 		p.bindngs[fmt.Sprintf("u%02d", i)] = Binding{SlotID: "slot_a", Since: time.Now()}
 	}
 	p.mu.Unlock()
+	// n00 窗口流量显著超载（17 账号合力 200 rpm），其余节点零
+	seedWindow(p, "n00", 200*6)
 
 	ops := p.PlanRebalance()
-	if len(ops) == 0 {
-		t.Fatal("17 账号 / 10 节点应摊开")
+	if len(ops) != 1 {
+		t.Fatalf("应有 1 个迁移（v3 单轮单账号），实际 %d", len(ops))
 	}
 	n, addOps := p.ApplyRebalance(ops)
-	if n == 0 {
-		t.Fatal("应有迁移")
+	if n != 1 {
+		t.Fatal("应迁移 1 个账号")
 	}
 	if len(addOps) == 0 {
 		t.Fatal("目标节点没有既有槽位，应产生新建槽位操作")
 	}
-	// 验证摊开效果：最重节点账号数 ≤ 最轻节点 + 1
-	p.mu.Lock()
-	acc := map[string]int{}
-	for _, b := range p.bindngs {
-		if s := p.slots[b.SlotID]; s != nil {
-			acc[s.NodeID]++
-		}
-	}
-	p.mu.Unlock()
-	maxN, minN := 0, 1<<30
-	for _, v := range acc {
-		if v > maxN {
-			maxN = v
-		}
-		if v < minN {
-			minN = v
-		}
-	}
-	if maxN-minN > 1 {
-		t.Fatalf("摊开不均：max=%d min=%d", maxN, minN)
+	// 迁移目标应是最轻节点（非 n00，且窗口为零）
+	if ops[0].ToNode == "n00" {
+		t.Fatal("不应迁回原节点")
 	}
 }
 
