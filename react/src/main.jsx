@@ -6,7 +6,7 @@ import {
 } from 'antd';
 import {
   ApiOutlined, ApartmentOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, GiftOutlined,
-  KeyOutlined, ReloadOutlined, SendOutlined, SettingOutlined, TeamOutlined,
+  GlobalOutlined, KeyOutlined, ReloadOutlined, SendOutlined, SettingOutlined, TeamOutlined,
   ThunderboltOutlined, CloudServerOutlined, UserAddOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
@@ -14,6 +14,7 @@ import './theme.css';
 import AutoEnrollPage from './pages/AutoEnroll';
 import GroupsAndKeysPage from './pages/GroupsAndKeys';
 import ProxyPoolPage from './pages/ProxyPool';
+import ReqProxyPage from './pages/ReqProxy';
 import RequestLogsPage from './pages/RequestLogs';
 import AccountSettingsPage from './pages/AccountSettings';
 import AccountListPage from './pages/AccountList';
@@ -44,7 +45,7 @@ const parseHours = value => String(value || '').split(',').map(item => item.trim
 
 // 页面标识。用 hash 路由（#/auto-enroll）而不是给每页单独打包：
 // 刷新能停在原页、地址可收藏转发，且不引入 react-router 依赖。
-const SECTIONS = ['dashboard', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'groups', 'growth', 'settings'];
+const SECTIONS = ['dashboard', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'reqproxy', 'groups', 'growth', 'settings'];
 
 // sectionFromHash 读取地址栏里的页面标识；非法/缺失时回落到仪表盘。
 function sectionFromHash() {
@@ -595,7 +596,8 @@ function Console() {
     requests: ['请求日志', '按时间、模型、状态、错误码、端点、账号、版本、首字耗时和请求 ID 筛选历史请求。'],
     accounts: ['账号配置', '添加与授权账号：OAuth 登录链接、短信直登，以及账号池区域信息。'],
     'auto-enroll': ['自动加号', '用豪猪接码平台批量添加中国区账号：取号 → 发码 → 收码 → 自动落盘，全程免浏览器。'],
-    proxy: ['代理池', '短信直登链路的出口代理：池内容量、冷却状态和后续扩展。'],
+    proxy: ['注册代理', '短信直登链路的出口代理（旧模块）：池内容量、冷却状态。'],
+    reqproxy: ['请求代理', '实际请求账号的代理池：v2rayN 订阅与多协议节点导入、按规则筛选、账号与槽位绑定，全部在此管理。'],
     groups: ['分组与密钥', '账号分组与 API 密钥管理：分组密钥只能使用绑定分组的账号；管理员密钥不受限。'],
     growth: ['成长任务', '猫猫旅行、连登兑换、抽奖与 17 项成长任务自动化：一键完成、批量执行、进度与领奖闭环。'],
     settings: ['管理设置', '配置签到与保活计划，手动触发签到和积分刷新。'],
@@ -613,7 +615,8 @@ function Console() {
       children: [
         { key: 'accounts', icon: <KeyOutlined />, label: '账号配置' },
         { key: 'auto-enroll', icon: <ThunderboltOutlined />, label: '自动加号' },
-        { key: 'proxy', icon: <CloudServerOutlined />, label: '代理池' },
+        { key: 'proxy', icon: <CloudServerOutlined />, label: '注册代理' },
+        { key: 'reqproxy', icon: <GlobalOutlined />, label: '请求代理' },
         { key: 'growth', icon: <GiftOutlined />, label: '成长任务' },
       ],
     },
@@ -957,6 +960,7 @@ function Console() {
             {activeSection === 'auto-enroll' && <AutoEnrollPage api={api} haozhumaSid={config.sms?.haozhuma?.sid || ''} onSaveHaozhumaSid={saveHaozhumaSid} />}
             {activeSection === 'groups' && <GroupsAndKeysPage api={api} />}
             {activeSection === 'proxy' && <ProxyPoolPage api={api} />}
+            {activeSection === 'reqproxy' && <ReqProxyPage api={api} />}
             {activeSection === 'growth' && <GrowthTasksPage api={api} data={data} refresh={refresh} />}
             {tabItems.find(item => item.key === activeTab)?.children}
           </Content>

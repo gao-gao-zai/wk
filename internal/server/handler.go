@@ -30,6 +30,7 @@ import (
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/reqproxy"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/smslogin"
@@ -55,6 +56,9 @@ type Config struct {
 	KeepaliveAccount func(uid string) scheduler.AccountResult
 	// SMSLogin 短信直登（中国区）。nil = 关闭该入口，控制台回退到 OAuth 链接。
 	SMSLogin *smslogin.Manager
+	// ReqProxy 请求代理模块（实际请求账号的代理池；区别于 SMSLogin 的注册代理）。
+	// nil = 未启用，/admin/reqproxy/* 返回 503，账号请求全部直连（零回归）。
+	ReqProxy *reqproxy.Manager
 	// HaozhumaClient 豪猪接码客户端（可选）。配置了 sms.haozhuma 时由 main
 	// 注入；NewHandler 内部用它组装 AutoEnroll（persist/find 回调指向 handler）。
 	HaozhumaClient *haozhuma.Client
@@ -294,6 +298,31 @@ func NewHandler(cfg Config) *Handler {
 	// 手动兜底，对齐豪猪后台的"释放全部"按钮。
 	h.mux.HandleFunc("POST /admin/account/sms/release-all", h.withFrontend(h.accountSMSReleaseAll))
 	h.mux.HandleFunc("GET /admin/proxy/status", h.withFrontend(h.proxyStatus))
+	// 请求代理模块（reqproxy）：与上面的登录代理池完全独立的新命名空间。
+	h.mux.HandleFunc("GET /admin/reqproxy/config", h.withFrontend(h.reqproxyConfigGet))
+	h.mux.HandleFunc("PUT /admin/reqproxy/config", h.withFrontend(h.reqproxyConfigPut))
+	h.mux.HandleFunc("GET /admin/reqproxy/subscriptions", h.withFrontend(h.reqproxySubsGet))
+	h.mux.HandleFunc("POST /admin/reqproxy/subscriptions", h.withFrontend(h.reqproxySubsPost))
+	h.mux.HandleFunc("PUT /admin/reqproxy/subscriptions/{id}", h.withFrontend(h.reqproxySubPutDelete))
+	h.mux.HandleFunc("DELETE /admin/reqproxy/subscriptions/{id}", h.withFrontend(h.reqproxySubPutDelete))
+	h.mux.HandleFunc("POST /admin/reqproxy/subscriptions/{id}/refresh", h.withFrontend(h.reqproxySubRefresh))
+	h.mux.HandleFunc("POST /admin/reqproxy/subscriptions/preview", h.withFrontend(h.reqproxySubPreview))
+	h.mux.HandleFunc("GET /admin/reqproxy/nodes", h.withFrontend(h.reqproxyNodesGet))
+	h.mux.HandleFunc("POST /admin/reqproxy/nodes/import", h.withFrontend(h.reqproxyNodesImport))
+	h.mux.HandleFunc("DELETE /admin/reqproxy/nodes/{id}", h.withFrontend(h.reqproxyNodeDelete))
+	h.mux.HandleFunc("GET /admin/reqproxy/slots", h.withFrontend(h.reqproxySlotsGet))
+	h.mux.HandleFunc("PUT /admin/reqproxy/slots/{id}", h.withFrontend(h.reqproxySlotPut))
+	h.mux.HandleFunc("GET /admin/reqproxy/bindings", h.withFrontend(h.reqproxyBindingsGet))
+	h.mux.HandleFunc("PUT /admin/reqproxy/bindings/{uid}", h.withFrontend(h.reqproxyBindingPut))
+	h.mux.HandleFunc("POST /admin/reqproxy/health/run", h.withFrontend(h.reqproxyHealthRun))
+	h.mux.HandleFunc("POST /admin/reqproxy/health/run/{node_id}", h.withFrontend(h.reqproxyHealthRun))
+	h.mux.HandleFunc("POST /admin/reqproxy/rebalance", h.withFrontend(h.reqproxyRebalancePost))
+	h.mux.HandleFunc("POST /admin/reqproxy/prewarm", h.withFrontend(h.reqproxyPrewarmPost))
+	h.mux.HandleFunc("POST /admin/reqproxy/compact", h.withFrontend(h.reqproxyCompactPost))
+	h.mux.HandleFunc("POST /admin/reqproxy/reassign", h.withFrontend(h.reqproxyReassignPost))
+	h.mux.HandleFunc("GET /admin/reqproxy/jobs", h.withFrontend(h.reqproxyJobsGet))
+	h.mux.HandleFunc("GET /admin/reqproxy/events", h.withFrontend(h.reqproxyEventsGet))
+	h.mux.HandleFunc("POST /admin/reqproxy/rules/preview", h.withFrontend(h.reqproxyRulesPreview))
 	h.mux.HandleFunc("POST /admin/account/{uid}/enable", h.withFrontend(h.enableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/disable", h.withFrontend(h.disableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/clear-cooldown", h.withFrontend(h.clearCooldownAccount))
@@ -2222,6 +2251,11 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Groups != nil {
 		h.cfg.Groups.RemoveAccount(uid)
 	}
+	// 请求代理解绑（reqproxy）：账号没了，其槽位绑定一并释放；槽位空了
+	// 会自动关闭（释放本地端口）。失败不阻塞——残留绑定只占一个端口。
+	if h.cfg.ReqProxy != nil {
+		h.cfg.ReqProxy.UnbindAccount(uid)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已删除"})
 }
 
@@ -2974,6 +3008,16 @@ func appendResponseInput(msgs *[]map[string]any, input any) {
 					*msgs = append(*msgs, map[string]any{"role": "user", "content": output})
 				}
 				continue
+			case "reasoning":
+				// 客户端回放上一轮的思考 item（DSH/pi-ai 把 thinking 块存成
+				// type=reasoning 的 input item 全量重发）。映射为 assistant 的
+				// reasoning_content，与 chat 多轮回放的形状对齐；无文本时跳过，
+				// 不产生空消息。注意不能走默认分支——那会把它当 user 文本
+				// 混进上下文，污染角色序列。
+				if text := responseReasoningText(m); text != "" {
+					*msgs = append(*msgs, map[string]any{"role": "assistant", "reasoning_content": text})
+				}
+				continue
 			}
 			role, _ := m["role"].(string)
 			if role == "" {
@@ -2999,6 +3043,47 @@ func appendResponseInput(msgs *[]map[string]any, input any) {
 		text, _ := v["content"].(string)
 		appendOne(role, text)
 	}
+}
+
+// responseReasoningText 提取思考 item 的文本：兼容 content[].text
+// （reasoning_text part，本网关产出形状）与 summary[].text（OpenAI 原生
+// 摘要形状）两种来源，content 优先。
+func responseReasoningText(item map[string]any) string {
+	if parts, ok := item["content"].([]any); ok {
+		var sb strings.Builder
+		for _, raw := range parts {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, _ := part["text"].(string); text != "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n\n")
+				}
+				sb.WriteString(text)
+			}
+		}
+		if sb.Len() > 0 {
+			return sb.String()
+		}
+	}
+	if parts, ok := item["summary"].([]any); ok {
+		var sb strings.Builder
+		for _, raw := range parts {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, _ := part["text"].(string); text != "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n\n")
+				}
+				sb.WriteString(text)
+			}
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 func responseContentToChat(content []any) []any {
@@ -3090,6 +3175,17 @@ func responsesFormatToChat(format map[string]any) map[string]any {
 	}
 }
 
+// reasoningOutputItem 构造 Responses API 的思考 output item（type=reasoning）。
+// 内容放 content[].text（OpenAI 原生形状），summary 保持空数组占位——
+// WorkBuddy 上游没有摘要概念，多数客户端（含 pi-ai）对 content 优先兜底 summary。
+func reasoningOutputItem(id, text string) map[string]any {
+	return map[string]any{
+		"id": id, "type": "reasoning", "status": "completed",
+		"summary": []any{},
+		"content": []any{map[string]any{"type": "reasoning_text", "text": text, "annotations": []any{}}},
+	}
+}
+
 func chatToResponse(chat map[string]any, id string) map[string]any {
 	if id == "" {
 		id = newResponseID()
@@ -3107,7 +3203,11 @@ func chatToResponse(chat map[string]any, id string) map[string]any {
 	}
 
 	calls := normalizedAssistantToolCalls(message, id)
-	output := make([]any, 0, len(calls)+1)
+	output := make([]any, 0, len(calls)+2)
+	if reasoning, _ := message["reasoning_content"].(string); reasoning != "" {
+		// 思考 item 排在所有输出之前，与流式路径的顺序（思考先于正文）一致。
+		output = append(output, reasoningOutputItem(id+"-reasoning", reasoning))
+	}
 	if text != "" || len(calls) == 0 {
 		output = append(output, map[string]any{
 			"id": id + "-item", "type": "message", "status": "completed", "role": "assistant",
@@ -3163,6 +3263,12 @@ func chatAssistantMessage(chat map[string]any, responseID string) map[string]any
 	assistant := map[string]any{"role": "assistant"}
 	if content, exists := message["content"]; exists {
 		assistant["content"] = content
+	}
+	// 思考内容随历史一起存：previous_response_id 恢复上下文时它能回到
+	// 上游（chat 层接受 assistant.reasoning_content），与直发 chat 的
+	// 多轮会话行为对齐。上游若无此字段则原样没有，零影响。
+	if reasoning, ok := message["reasoning_content"].(string); ok && reasoning != "" {
+		assistant["reasoning_content"] = reasoning
 	}
 	if calls := normalizedAssistantToolCalls(message, responseID); len(calls) > 0 {
 		assistant["tool_calls"] = calls
@@ -3286,10 +3392,19 @@ type responsesStreamWriter struct {
 	outputText  strings.Builder
 	textStarted bool
 	textIndex   int
+	// reasoning：上游 reasoning_content 的思考流状态。started/index 与
+	// 正文 text 分开管理——思考通常先于正文出现，两条 item 独立计数
+	// output_index，谁先出现谁占小序号（与 Responses API 语义一致）。
+	reasoningText    strings.Builder
+	reasoningStarted bool
+	reasoningIndex   int
 	nextIndex   int
 	usage       map[string]any
 	calls       map[int]*responseStreamCall
 	onComplete  func(string, map[string]any)
+	// seq 是 SSE 事件的单调递增序号（sequence_number）。OpenAI Responses
+	// 规范要求每个事件携带；移植自 responses-proxy 的 next_sequence_number。
+	seq int64
 }
 
 type responseStreamCall struct {
@@ -3376,6 +3491,15 @@ func (w *responsesStreamWriter) Write(p []byte) (int, error) {
 							}
 							w.outputText.WriteString(text)
 							if err := w.emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "response_id": w.id, "item_id": w.id + "-item", "output_index": w.textIndex, "content_index": 0, "delta": text}); err != nil {
+								return 0, err
+							}
+						}
+						if text, ok := d["reasoning_content"].(string); ok && text != "" {
+							if err := w.startReasoningOutput(); err != nil {
+								return 0, err
+							}
+							w.reasoningText.WriteString(text)
+							if err := w.emit("response.reasoning_text.delta", map[string]any{"type": "response.reasoning_text.delta", "response_id": w.id, "item_id": w.reasoningItemID(), "output_index": w.reasoningIndex, "content_index": 0, "delta": text}); err != nil {
 								return 0, err
 							}
 						}
@@ -3471,7 +3595,11 @@ func (w *responsesStreamWriter) complete() error {
 	w.completed = true
 	w.ensureID(nil)
 	text := w.outputText.String()
+	reasoning := w.reasoningText.String()
 	output := make([]any, w.nextIndex)
+	if w.reasoningStarted {
+		output[w.reasoningIndex] = reasoningOutputItem(w.reasoningItemID(), reasoning)
+	}
 	if w.textStarted {
 		output[w.textIndex] = map[string]any{"id": w.id + "-item", "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
 	}
@@ -3503,6 +3631,9 @@ func (w *responsesStreamWriter) complete() error {
 	}
 	if w.onComplete != nil {
 		assistant := map[string]any{"role": "assistant", "content": text}
+		if reasoning != "" {
+			assistant["reasoning_content"] = reasoning
+		}
 		if len(indexes) > 0 {
 			toolCalls := make([]any, 0, len(indexes))
 			for _, index := range indexes {
@@ -3512,6 +3643,16 @@ func (w *responsesStreamWriter) complete() error {
 			assistant["tool_calls"] = toolCalls
 		}
 		w.onComplete(w.id, assistant)
+	}
+	if w.reasoningStarted {
+		// 思考收尾：done 事件先行（顺序与到达顺序一致：思考在正文之前），
+		// item.done 同时携带完整的 content 数组，供只读终态的客户端消费。
+		if err := w.emit("response.reasoning_text.done", map[string]any{"type": "response.reasoning_text.done", "response_id": w.id, "item_id": w.reasoningItemID(), "output_index": w.reasoningIndex, "content_index": 0, "text": reasoning}); err != nil {
+			return err
+		}
+		if err := w.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "response_id": w.id, "output_index": w.reasoningIndex, "item": reasoningOutputItem(w.reasoningItemID(), reasoning)}); err != nil {
+			return err
+		}
 	}
 	if w.textStarted {
 		if err := w.emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "response_id": w.id, "item_id": w.id + "-item", "output_index": w.textIndex, "content_index": 0, "text": text}); err != nil {
@@ -3561,6 +3702,28 @@ func (w *responsesStreamWriter) startTextOutput() error {
 		"type": "response.content_part.added", "response_id": w.id, "item_id": itemID,
 		"output_index": w.textIndex, "content_index": 0,
 		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+	})
+}
+
+// reasoningItemID 思考 item 的 id。按 Responses API 的惯例（rs_ 前缀）与
+// 正文 item（<resp>-item）区分开，客户端可独立追踪两类 item。
+func (w *responsesStreamWriter) reasoningItemID() string {
+	return w.id + "-reasoning"
+}
+
+// startReasoningOutput 首个 reasoning_content 片段到达时发出思考 item 的
+// added 事件（正文 item 的镜像逻辑）。思考通常先于正文，谁先到达谁占
+// 较小的 output_index。
+func (w *responsesStreamWriter) startReasoningOutput() error {
+	if w.reasoningStarted {
+		return nil
+	}
+	w.reasoningStarted = true
+	w.reasoningIndex = w.nextIndex
+	w.nextIndex++
+	return w.emit("response.output_item.added", map[string]any{
+		"type": "response.output_item.added", "response_id": w.id, "output_index": w.reasoningIndex,
+		"item": map[string]any{"id": w.reasoningItemID(), "type": "reasoning", "status": "in_progress", "summary": []any{}, "content": []any{}},
 	})
 }
 

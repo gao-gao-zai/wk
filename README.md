@@ -184,6 +184,51 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 **注意**：`cooldown.hard_credit` / `cooldown.err_threshold` / `cooldown.err_cooldown` 三个历史键已退役。硬冷却固定为**次日 04:00**（本地时区，`CooldownUntilTomorrow4AM`），连续错误语义并入熔断器（`pool.breaker_threshold` 触发指数退避）。旧配置中的这些键因 JSON 未知字段被自然忽略，不报错。
 
+## 请求代理（reqproxy，实际请求账号的代理池）
+
+与 `sms.proxy`（注册用代理）完全独立的**新模块**：让号池账号的日常 API 请求
+（对话、token 刷新、签到、成长任务）走代理出口，避免全部账号共用一个服务器 IP。
+
+- **内核**：内嵌 [Xray-core](https://github.com/XTLS/Xray-core)（MPL-2.0），支持
+  vmess / vless（含 reality）/ trojan / shadowsocks / socks / http / wireguard。
+  hysteria2、tuic、ssr 等协议不支持，订阅里遇到会跳过并在 WebUI 标注。
+- **订阅**：支持 v2rayN 订阅（UA 强制 `v2rayN/6.60`），自动解析
+  `subscription-userinfo`（流量/到期，90% 用量告警）。Clash YAML 格式暂不支持，
+  会明确报错而不是解析出 0 个节点。可配多个订阅 + 手动批量导入并存。
+- **槽位模型**：账号 → 槽位 → 节点。每个槽位是内核里一个固定本地端口
+  （默认 31080-31999）+ 一条静态路由规则。换节点只动 outbound，端口不变——
+  账号侧零感知、连接不断、IP 切换意图明确。
+- **绑定语义**：账号第一次发请求时自动分配槽位（粘性）；节点被筛掉/消失时
+  该槽位自动换指向（保留端口）。支持手动 pin 到指定节点。
+- **筛选规则**（WebUI 实时可改 + 草稿预览模拟）：名称白/黑名单关键词、
+  延迟上限、`cn`/`global` 分地区规则、共享度（账号/节点目标值）。
+- **健康检查**：每 15 分钟经节点真实测速（cn→copilot.tencent.com，
+  global→workbuddy.ai），连续 3 次失败摘除 10 分钟。首轮未测速的节点不参与分配。
+- **失败语义**：有节点但全不合格 → 请求失败（结构化报错，**绝不静默直连**）；
+  节点池为空（无订阅且无手动节点）→ 降级直连 + 事件告警。
+- **零回归**：模块停用（默认）或 `reqproxy` 不配置时，所有账号请求与旧版
+  行为完全一致（直连）。
+
+**WebUI**：控制台「账号运营 → 请求代理」（`#/reqproxy`），订阅 / 节点池 /
+筛选规则 / 槽位与绑定 / 事件流五个视图，全部免改配置文件。
+
+config.json 基础设施参数（全部可选，不配即用默认值）：
+
+```json
+"reqproxy": {
+  "state_file": "",
+  "health_interval": "15m",
+  "latency_timeout": "5s",
+  "unhealthy_cooldown": "10m",
+  "port_min": 31080,
+  "port_max": 31999
+}
+```
+
+模块开关、订阅、节点、规则、绑定全部存 `data/reqproxy/state.json`（WebUI 管理，
+改完即生效，5 秒内落盘）。管理 API 挂在 `/admin/reqproxy/*`（见
+`internal/server/reqproxy_handlers.go`）。
+
 ## 并发与性能
 
 `pool.max_in_flight` 默认是 **每个账号 3 个在途请求**。例如 5 个健康账号对应最多约 15 个同时转发的聊天请求；100 个健康账号对应约 300 个。流式请求会占用名额直到响应结束。模型冷却、禁用和上游限流会降低可用容量；`0` 表示不限制本地账号名额，不表示上游无配额。当前不排队，名额耗尽时返回 503。

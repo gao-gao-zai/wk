@@ -185,6 +185,160 @@ func TestResponsesStreamPreservesWorkBuddyRecordID(t *testing.T) {
 	}
 }
 
+// TestResponsesNonStreamIncludesReasoningItem 非流式：上游 chat 响应带
+// reasoning_content 时，Responses 输出必须包含 type=reasoning 的 item，
+// 而不是把思考内容整段丢弃。
+func TestResponsesNonStreamIncludesReasoningItem(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, "data: {\"id\":\"chatcmpl-r1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"让我想想\"}}]}\n\n" +
+			"data: {\"id\":\"chatcmpl-r1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"答案是 2\"}}]}\n\n" +
+			"data: {\"id\":\"chatcmpl-r1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+			"data: [DONE]\n\n", true
+	})
+	h := newTestHandler(t, Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := doResponsesRequest(h, `{"model":"glm-5.2","input":"1+1=?"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	output, _ := response["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("output items=%d, want 2 (reasoning + message): %#v", len(output), output)
+	}
+	reasoning, ok := output[0].(map[string]any)
+	if !ok || reasoning["type"] != "reasoning" {
+		t.Fatalf("first output item should be reasoning, got %#v", output[0])
+	}
+	content, _ := reasoning["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("reasoning content parts=%d, want 1", len(content))
+	}
+	if text, _ := content[0].(map[string]any)["text"].(string); text != "让我想想" {
+		t.Fatalf("reasoning text=%q want %q", text, "让我想想")
+	}
+	msg, ok := output[1].(map[string]any)
+	if !ok || msg["type"] != "message" {
+		t.Fatalf("second output item should be message, got %#v", output[1])
+	}
+	if response["output_text"] != "答案是 2" {
+		t.Fatalf("output_text=%v", response["output_text"])
+	}
+}
+
+// TestResponsesStreamEmitsReasoningEvents 流式：reasoning_content 增量要转成
+// Responses 的 reasoning item 生命周期事件（added / reasoning_text.delta /
+// reasoning_text.done / output_item.done），且 completed 的 output 里包含
+// 完整思考 item。这是 DSH 等客户端展示思考过程所依赖的事件面。
+func TestResponsesStreamEmitsReasoningEvents(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, "data: {\"id\":\"chatcmpl-r2\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"思考A\"}}]}\n\n" +
+			"data: {\"id\":\"chatcmpl-r2\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"思考B\"}}]}\n\n" +
+			"data: {\"id\":\"chatcmpl-r2\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"正文\"}}]}\n\n" +
+			"data: {\"id\":\"chatcmpl-r2\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+			"data: [DONE]\n\n", true
+	})
+	h := newTestHandler(t, Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := doResponsesRequest(h, `{"model":"glm-5.2","input":"hi","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"event: response.output_item.added",
+		"response.reasoning_text.delta",
+		"\"delta\":\"思考A\"",
+		"\"delta\":\"思考B\"",
+		"event: response.reasoning_text.done",
+		"\"text\":\"思考A思考B\"",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream missing %q:\n%s", want, body)
+		}
+	}
+	// added 事件里必须是 reasoning item，且先于正文 message item 出现。
+	addedIdx := strings.Index(body, "\"type\":\"reasoning\"")
+	msgIdx := strings.Index(body, "response.output_text.delta")
+	if addedIdx < 0 || msgIdx < 0 || addedIdx > msgIdx {
+		t.Fatalf("reasoning item should appear before text output:\n%s", body)
+	}
+	// completed 终态里包含完整 reasoning item。
+	if !strings.Contains(body, "event: response.completed") {
+		t.Fatalf("missing response.completed:\n%s", body)
+	}
+	completed := body[strings.Index(body, "event: response.completed"):]
+	if !strings.Contains(completed, "\"type\":\"reasoning\"") || !strings.Contains(completed, "思考A思考B") {
+		t.Fatalf("completed response missing reasoning item:\n%s", completed)
+	}
+}
+
+// TestResponsesReasoningItemReplayBecomesAssistantReasoning 客户端回放
+// type=reasoning 的 input item 时，转译为 assistant.reasoning_content，
+// 而不是混进 user 文本污染角色序列。
+func TestResponsesReasoningItemReplayBecomesAssistantReasoning(t *testing.T) {
+	body, _, err, _ := responsesToChat([]byte(`{
+		"model":"glm-5.2",
+		"input":[
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"上一轮的思考"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	messages := got["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages=%d, want 2 (assistant reasoning + user): %#v", len(messages), messages)
+	}
+	assistant, ok := messages[0].(map[string]any)
+	if !ok || assistant["role"] != "assistant" {
+		t.Fatalf("first message should be assistant, got %#v", messages[0])
+	}
+	if assistant["reasoning_content"] != "上一轮的思考" {
+		t.Fatalf("reasoning_content=%v", assistant["reasoning_content"])
+	}
+	user, ok := messages[1].(map[string]any)
+	if !ok || user["role"] != "user" {
+		t.Fatalf("second message should be user, got %#v", messages[1])
+	}
+}
+
+// TestResponsesReasoningItemReplayContentShape 回放 content[].text 形态
+// （本网关产出的 reasoning item 形状）同样要映射到 reasoning_content。
+func TestResponsesReasoningItemReplayContentShape(t *testing.T) {
+	body, _, err, _ := responsesToChat([]byte(`{
+		"model":"glm-5.2",
+		"input":[
+			{"type":"reasoning","id":"rs_2","content":[{"type":"reasoning_text","text":"思考内容"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"go on"}]}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	messages := got["messages"].([]any)
+	assistant, ok := messages[0].(map[string]any)
+	if !ok || assistant["role"] != "assistant" || assistant["reasoning_content"] != "思考内容" {
+		t.Fatalf("assistant reasoning mapping wrong: %#v", messages[0])
+	}
+}
+
 func doResponsesRequest(h http.Handler, body string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))

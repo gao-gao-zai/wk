@@ -159,6 +159,23 @@ type Config struct {
 		} `json:"haozhuma"`
 	} `json:"sms"`
 
+	// ReqProxy 实际请求账号的代理池（新模块，与 sms.proxy 的注册代理完全独立）。
+	// 订阅/节点/规则/绑定全部在 WebUI 管理（/admin/reqproxy/*），这里只有
+	// 基础设施参数；不配即用默认值。enabled 开关在模块自己的 state.json 里。
+	ReqProxy struct {
+		// StateFile 模块状态文件。空 = state.json 同目录下 reqproxy/state.json。
+		StateFile string `json:"state_file"`
+		// HealthInterval 周期测速间隔，默认 "15m"。
+		HealthInterval string `json:"health_interval"`
+		// LatencyTimeout 单次测速超时，默认 "5s"。
+		LatencyTimeout string `json:"latency_timeout"`
+		// UnhealthyCooldown 节点摘除后的复测冷却，默认 "10m"。
+		UnhealthyCooldown string `json:"unhealthy_cooldown"`
+		// PortMin / PortMax 槽位本地端口段，默认 31080-31999。
+		PortMin int `json:"port_min"`
+		PortMax int `json:"port_max"`
+	} `json:"reqproxy"`
+
 	Postgres struct {
 		DSN              string `json:"dsn"`
 		MaxOpenConns     int    `json:"max_open_conns"`
@@ -189,12 +206,15 @@ type Config struct {
 	} `json:"session_sticky"`
 
 	// 解析后
-	SoftRateDur         time.Duration `json:"-"`
-	BreakerCooldownDur  time.Duration `json:"-"`
-	BreakerCooldownMaxD time.Duration `json:"-"`
-	SessionTTL          time.Duration `json:"-"`
-	SessionGCInterval   time.Duration `json:"-"`
-	SMSProxyCooldownDur time.Duration `json:"-"`
+	SoftRateDur            time.Duration `json:"-"`
+	BreakerCooldownDur     time.Duration `json:"-"`
+	BreakerCooldownMaxD    time.Duration `json:"-"`
+	SessionTTL             time.Duration `json:"-"`
+	SessionGCInterval      time.Duration `json:"-"`
+	SMSProxyCooldownDur    time.Duration `json:"-"`
+	ReqProxyHealthDur      time.Duration `json:"-"`
+	ReqProxyLatencyDur     time.Duration `json:"-"`
+	ReqProxyUnhealthyDur   time.Duration `json:"-"`
 	PostgresMaxLifetime time.Duration `json:"-"`
 	PostgresMaxIdleTime time.Duration `json:"-"`
 	// ScheduleEnabled 解析后的排程开关（JSON 里缺省 false，这里归一为「缺省=开」）。
@@ -442,6 +462,22 @@ func (c *Config) normalize() error {
 	}
 	if c.SMSProxyCooldownDur, err = time.ParseDuration(c.SMS.Proxy.Cooldown); err != nil {
 		return fmt.Errorf("sms.proxy.cooldown: %w", err)
+	}
+	// reqproxy 基础设施参数（全可选：空串/零值 = 默认）
+	if s := strings.TrimSpace(c.ReqProxy.HealthInterval); s != "" {
+		if c.ReqProxyHealthDur, err = time.ParseDuration(s); err != nil {
+			return fmt.Errorf("reqproxy.health_interval: %w", err)
+		}
+	}
+	if s := strings.TrimSpace(c.ReqProxy.LatencyTimeout); s != "" {
+		if c.ReqProxyLatencyDur, err = time.ParseDuration(s); err != nil {
+			return fmt.Errorf("reqproxy.latency_timeout: %w", err)
+		}
+	}
+	if s := strings.TrimSpace(c.ReqProxy.UnhealthyCooldown); s != "" {
+		if c.ReqProxyUnhealthyDur, err = time.ParseDuration(s); err != nil {
+			return fmt.Errorf("reqproxy.unhealthy_cooldown: %w", err)
+		}
 	}
 	if c.Postgres.ConnMaxLifetime == "" {
 		c.Postgres.ConnMaxLifetime = "30m"

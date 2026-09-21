@@ -119,7 +119,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -219,7 +219,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -289,7 +289,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -404,7 +404,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return nil, err
 	}
@@ -462,7 +462,12 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
 	}
-	resp, err := c.HTTP.Do(req)
+	// 账号级统一路由（reqproxy）：经钩子取该账号 client。
+	cli, err := c.proxyClientFor(a)
+	if err != nil {
+		return "", "", err // D4：无可用节点，不回退直连
+	}
+	resp, err := cli.Do(req)
 	if err != nil {
 		return "", "", err
 	}

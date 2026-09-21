@@ -23,6 +23,7 @@ import (
 	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
+	"workbuddy2api/internal/reqproxy"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
@@ -330,6 +331,24 @@ func main() {
 	log.Printf("upstream timeouts: request=%ds stream_total=%s stream_idle=%s",
 		cfg.Upstream.TimeoutSeconds, durLabel(cfg.StreamTimeoutDur), durLabel(cfg.StreamIdleDur))
 
+	// reqproxy：实际请求账号的代理池（区别于 sms 的注册代理）。
+	// 始终构造（WebUI 需要管理界面），enabled 状态在 state.json 里控制。
+	// 启动失败不致命：降级为直连（零回归），控制台仍可诊断。
+	reqProxyMgr, reqProxyKernel, reqProxyErr := newReqProxyManager(cfg)
+	if reqProxyErr != nil {
+		log.Printf("reqproxy: 启动失败，账号请求直连: %v", reqProxyErr)
+	}
+	if reqProxyMgr != nil {
+		defer reqProxyMgr.Close()
+		if reqProxyKernel != nil {
+			defer reqProxyKernel.Close()
+		}
+		// 账号清单注入（预热用）：启动后首轮测速完成即给全量账号建槽，
+		// 不等第一个请求才分配。
+		reqProxyMgr.SetAccounts(poolAccountSource{p})
+		up.DialProxy = reqProxyMgr.DialProxy
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -385,6 +404,8 @@ func main() {
 		KeepaliveAccount: sch.KeepaliveAccount,
 		// 短信直登只走中国区 codebuddy.cn 的 OneID/Keycloak；海外版继续用 OAuth 链接。
 		SMSLogin: smsManager,
+		// 请求代理模块（实际请求账号的代理池）：nil = 直连（零回归）。
+		ReqProxy: reqProxyMgr,
 		// 豪猪自动加号（可选）：取号→直登→落盘全自动。与手动发码共用代理池；
 		// AutoEnroll 在 NewHandler 内部组装（persist 回调指向 handler）。
 		HaozhumaClient: newHaozhumaClient(cfg),
@@ -508,6 +529,60 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// poolAccountSource 账号清单适配器（reqproxy 预热用）。
+type poolAccountSource struct{ p *pool.Pool }
+
+func (s poolAccountSource) UIDs() []string { return s.p.UIDs() }
+
+func (s poolAccountSource) RegionOf(uid string) string {
+	if a := s.p.AuthByUID(uid); a != nil {
+		return a.Region()
+	}
+	return ""
+}
+
+// newReqProxyManager 组装请求代理模块。
+//
+// 返回 (manager, kernel, err)：kernel 单独返回是因为 Manager.Close 会停后台任务，
+// 但 kernel 实例的 Close 需要在 manager 停止后仍可控（main defer 里按序关）。
+// 启动失败不致命——降级直连（零回归），控制台可见错误。
+func newReqProxyManager(cfg *Config) (*reqproxy.Manager, *reqproxy.Kernel, error) {
+	rc := reqproxy.DefaultConfig()
+	if cfg.ReqProxy.StateFile != "" {
+		rc.StateFile = cfg.ReqProxy.StateFile
+	} else {
+		// 默认与 state.json 同目录（部署挂载卷内）
+		rc.StateFile = filepath.Join(filepath.Dir(cfg.StateFile), "reqproxy", "state.json")
+	}
+	if cfg.ReqProxyHealthDur > 0 {
+		rc.HealthInterval = cfg.ReqProxyHealthDur
+	}
+	if cfg.ReqProxyLatencyDur > 0 {
+		rc.LatencyTimeout = cfg.ReqProxyLatencyDur
+	}
+	if cfg.ReqProxyUnhealthyDur > 0 {
+		rc.UnhealthyCooldown = cfg.ReqProxyUnhealthyDur
+	}
+	if cfg.ReqProxy.PortMin > 0 {
+		rc.PortMin = cfg.ReqProxy.PortMin
+	}
+	if cfg.ReqProxy.PortMax > 0 {
+		rc.PortMax = cfg.ReqProxy.PortMax
+	}
+
+	kernel, err := reqproxy.NewKernel()
+	if err != nil {
+		return nil, nil, err
+	}
+	mgr, err := reqproxy.NewManager(rc, kernel)
+	if err != nil {
+		kernel.Close()
+		return nil, nil, err
+	}
+	log.Printf("reqproxy: 已启动（端口段 %d-%d，状态文件 %s）", rc.PortMin, rc.PortMax, rc.StateFile)
+	return mgr, kernel, nil
 }
 
 // newSMSLoginManager 组装短信直登管理器。

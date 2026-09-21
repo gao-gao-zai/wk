@@ -179,6 +179,10 @@ type Client struct {
 	// WebBaseCN Web 域（任务领奖）。零值回落默认常量（webBase()），
 	// 字段化便于测试注入。
 	WebBaseCN string
+
+	// DialProxy reqproxy 接入钩子（账号级统一路由，见 reqproxy_hook.go）。
+	// nil = 模块关闭，全部直连，行为与旧版逐字节一致。
+	DialProxy DialProxyFunc
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -288,8 +292,13 @@ func (c *Client) billingBase(a *auth.Auth) string {
 }
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+// 账号级统一路由（reqproxy）：a 非 nil 且 DialProxy 已配置时经该账号槽位出站。
+func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	cli, err := c.proxyClientFor(a)
+	if err != nil {
+		return nil, err // D4：无可用节点，不回退直连
+	}
+	resp, err := cli.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -328,7 +337,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		return err
 	}
 	RefreshHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return err
 	}
@@ -491,7 +500,14 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 
 	// 复制 client 并清零 Timeout：流式的时长已完全交给 policy，若保留整请求超时
 	// 会把长流式回答再次掐断，那就白改了。
-	cli := *c.HTTP
+	// reqproxy（账号级统一路由）：先经钩子取该账号的 client（代理 Transport 或直连原样），
+	// 再清零 Timeout。D4：钩子报错（无可用节点）直接失败，不回退直连。
+	baseCli, err := c.proxyClientFor(a)
+	if err != nil {
+		cancel()
+		return nil, 0, nil, nil, err
+	}
+	cli := *baseCli
 	cli.Timeout = 0
 	resp, err := cli.Do(req)
 	// 声明"响应头已到"：若回调抢先抢到 CAS，这里会失败且 headerTimedOut 已置位。
@@ -553,7 +569,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", clientUA)
-	resp, err := c.HTTP.Do(req)
+	// 账号级统一路由（reqproxy）：经钩子取该账号 client（代理 Transport 或直连原样）。
+	cli, err := c.proxyClientFor(a)
+	if err != nil {
+		return nil, err // D4：无可用节点，不回退直连
+	}
+	resp, err := cli.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -700,7 +721,7 @@ func (c *Client) UserRequestUsage(a *auth.Auth, start, end time.Time, page, page
 		return nil, 0, err
 	}
 	BillingHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -732,7 +753,7 @@ func (c *Client) UserResourceDetails(a *auth.Auth) (ResourceUsage, error) {
 		return ResourceUsage{}, err
 	}
 	BillingHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return ResourceUsage{}, err
 	}
@@ -803,7 +824,7 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 		return err
 	}
 	BillingHeaders(req, a)
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 

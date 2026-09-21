@@ -81,5 +81,13 @@
       "token": "",
       "sid": ""
     }
+  },
+  "reqproxy": {
+    "state_file": "",
+    "health_interval": "15m",
+    "latency_timeout": "5s",
+    "unhealthy_cooldown": "10m",
+    "port_min": 31080,
+    "port_max": 31999
   }
 }

@@ -61,7 +61,7 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		return nil, err
 	}
 	BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSON(req, a)
 }
 
 // billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil
@@ -81,7 +81,7 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 		return nil, err
 	}
 	BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSON(req, a)
 }
 
 // ---------------------------------------------------------------------------
