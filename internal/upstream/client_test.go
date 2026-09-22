@@ -36,6 +36,15 @@ func TestClassify(t *testing.T) {
 		{503, `all accounts unavailable (cooling/disabled): upstream soft_rate (http 429): {"code":6004,"msg":"将在 2026-09-11 17:58:44 UTC+8 重置"}`, ErrSoftRate},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
+		// 11140 账号级风控：线上实测形态（顶层 code + request illegal）。
+		// 此前误归 ErrClient（只换号不罚），被标记的号永远显示健康。
+		{403, `{"code":11140,"msg":"request illegal","requestId":"35e3ff4d-2c18-4fb3-b248-dcf42181f404","displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请调整后重试。"}}`, ErrRiskFlag},
+		{403, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrRiskFlag},
+		// 文本副信道（措辞漂移兜底）。
+		{403, `内容未通过安全审核，请调整后重试。`, ErrRiskFlag},
+		{403, `The content did not pass the safety review.`, ErrRiskFlag},
+		// 11140 必须伴随 403；200 带 11140 文本不构成风控信号。
+		{200, `{"code":11140}`, ErrNone},
 		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},

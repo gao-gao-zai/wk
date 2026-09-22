@@ -16,6 +16,7 @@ package pool
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
@@ -82,6 +83,7 @@ type Status struct {
 	ModelCooldowns  map[string]ModelCooldownStatus `json:"model_cooldowns,omitempty"`
 	SuccessCount    int64                          `json:"success_count,omitempty"`
 	ErrTotal        int64                          `json:"err_total,omitempty"`
+	RiskStrikes     int                            `json:"risk_strikes,omitempty"`
 	LastSuccessTime time.Time                      `json:"last_success,omitempty"`
 	LastErrTime     time.Time                      `json:"last_err,omitempty"`
 
@@ -130,6 +132,12 @@ type entry struct {
 	breakerUntil time.Time // 熔断截止（指数退避）
 	fails        int       // 连续失败计数（熔断用，唯一权威）
 	retryCount   int       // 已熔断次数（指数退避的指数）
+
+	// riskStrikes 11140 风控连续计数（持久化）。与 fails 分开：fails 是"连续
+	// 失败"（任何错误），风控计数是"疑似被标记"的专项信号，阈值与恢复语义
+	// 独立（NoteSuccess 同时清两者）。持久化是为了重启不清零——被标记的号
+	// 重启后依旧被标记，计数不应归零重来。
+	riskStrikes int `json:"-"`
 
 	// spent 影子扣减累计（运行态，不持久化）：请求成功结束时按上游
 	// usage.credit（或费率估算）累计，weightOf 里从 credits 里减去后再
@@ -258,6 +266,9 @@ type stateAccount struct {
 	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
 	LastSuccess time.Time `json:"last_success,omitempty"`
 	LastErr     time.Time `json:"last_err,omitempty"`
+	// RiskStrikes 11140 风控连续计数。达到 pool 的 riskDisableThreshold
+	// 时账号已被 Disable（disabled=true 配 reason），计数本身保留作观测。
+	RiskStrikes int `json:"risk_strikes,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -296,6 +307,10 @@ type Pool struct {
 	breakerCooldown    time.Duration
 	breakerCooldownMax time.Duration
 
+	// riskDisableThreshold 11140 风控连续计数达到该值自动 Disable（默认
+	// defaultRiskDisableThreshold；SetRiskThreshold 注入测试用）。
+	riskDisableThreshold int
+
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -327,6 +342,12 @@ const (
 	defaultBreakerCooldownMax = 6 * time.Hour
 )
 
+// defaultRiskDisableThreshold 11140 风控连续计数达到该值自动禁用。
+// 3 的依据：健康号的偶发内容审核触发（同 body 换号即成功）最多贡献 1 次，
+// 且会被 NoteSuccess 清零；被标记的号对任何内容都失败，计数只涨不跌。
+// 阈值取 3 = 过滤偶发噪声后最快出局，与熔断器默认阈值同口径。
+const defaultRiskDisableThreshold = 3
+
 // StoreSnapshotter 池状态快照镜像的最小接口（redisstore.Store 满足；Noop 空实现安全）。
 // 与本地 state.json 并存，作启动恢复备份：快照比本地新才采用，否则本地优先。
 type StoreSnapshotter interface {
@@ -343,10 +364,11 @@ const (
 // New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。
 func New(stateFp string) *Pool {
 	p := &Pool{
-		byUID:              map[string]*entry{},
-		stateFp:            stateFp,
-		breakerThreshold:   defaultBreakerThreshold,
-		breakerCooldown:    defaultBreakerCooldown,
+		byUID:               map[string]*entry{},
+		stateFp:             stateFp,
+		breakerThreshold:     defaultBreakerThreshold,
+		breakerCooldown:      defaultBreakerCooldown,
+		riskDisableThreshold: defaultRiskDisableThreshold,
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
@@ -370,6 +392,15 @@ func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 	}
 	if cooldownMax > 0 {
 		p.breakerCooldownMax = cooldownMax
+	}
+}
+
+// SetRiskThreshold 注入 11140 风控自动禁用阈值。非正值保留原值（用默认）。
+func (p *Pool) SetRiskThreshold(threshold int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if threshold > 0 {
+		p.riskDisableThreshold = threshold
 	}
 }
 
@@ -1205,6 +1236,7 @@ func (p *Pool) NoteError(uid string) {
 
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
+// 风控计数一并清零：成功证明 chat 通道未被标记，此前的 11140 是内容误触发。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1214,8 +1246,33 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
+		e.riskStrikes = 0
 		p.dirty.Store(true)
 	}
+}
+
+// NoteRiskStrike 记录一次 11140 风控拒绝：riskStrikes++ 并喂 errTotal（风控
+// 拒绝也是真实失败，成功率权重应感知）。达到 riskDisableThreshold 自动 Disable——
+// 被标记的号对任何内容都失败，冷却无意义（不自愈），禁用是唯一止损手段。
+// 返回禁用后的 reason（未触发禁用返回空串），调用方据此打日志。
+// 已禁用的账号再次喂入是幂等的（计数照涨，禁用状态不变）。
+func (p *Pool) NoteRiskStrike(uid string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return ""
+	}
+	e.riskStrikes++
+	e.errTotal++
+	e.lastErr = time.Now()
+	p.dirty.Store(true)
+	if e.riskStrikes >= p.riskDisableThreshold && !e.disabled {
+		e.disabled = true
+		e.reason = fmt.Sprintf("11140 risk flag (连续 %d 次, 连续阈值 %d)", e.riskStrikes, p.riskDisableThreshold)
+		return e.reason
+	}
+	return ""
 }
 
 // Status 查询单账号状态。
@@ -1389,6 +1446,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Disabled:            e.disabled,
 		SuccessCount:        e.successCount,
 		ErrTotal:            e.errTotal,
+		RiskStrikes:         e.riskStrikes,
 		LastSuccessTime:     e.lastSuccess,
 		LastErrTime:         e.lastErr,
 		Until:               e.until,
@@ -1473,6 +1531,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal:            errTotal,
 			lastErr:             s.LastErr,
 			lastSuccess:         s.LastSuccess,
+			riskStrikes:         s.RiskStrikes,
 		}
 	}
 }
@@ -1619,6 +1678,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			ErrTotal:            e.errTotal,
 			LastSuccess:         e.lastSuccess,
 			LastErr:             e.lastErr,
+			RiskStrikes:         e.riskStrikes,
 		}
 	}
 	return sf

@@ -212,6 +212,14 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
+	// 配置文件可写性探测：控制台保存（管理设置 → 保存）会回写 config.json，
+	// 挂载成 :ro 时每次保存都静默失败，直到有人点保存才暴露。启动时探一次，
+	// 把问题变成日志里的一行。只告警不阻断——只读部署（纯 env + 外部编排
+	// 工具改配置）是合法形态。
+	if err := probeConfigWritable(*cfgPath); err != nil {
+		log.Printf("[warning] %v", err)
+	}
+
 	auths, err := auth.LoadDir(cfg.AuthDir, cfg.Region)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)

@@ -29,7 +29,15 @@ const (
 	ErrSessionDead                // 401 + 12153 offline session 失效 → 禁用
 	ErrNotFound                   // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                     // 5xx 上游故障
-	ErrClient                     // 其他 4xx / 业务错误
+	// ErrRiskFlag 上游 403 + code=11140（"request illegal"，displayMsg 为
+	// "内容未通过安全审核"）：账号级风控标记，对该账号的所有请求一律失败，
+	// 且不会自愈（余额/token 都正常，唯独 chat 通道被拒）。与 ErrClient 的
+	// 关键差异：ErrClient 是"请求体形态错误"（换号必复现、账号无辜），
+	// 11140 则高度指向账号本身被标记。由于健康号偶发的内容审核触发也会
+	// 返回 11140，责任归属由 pool 侧的连续计数（NoteRiskStrike）判定，
+	// 达阈值才 Disable；成功一次即清零。
+	ErrRiskFlag
+	ErrClient // 其他 4xx / 业务错误
 )
 
 func (k ErrKind) String() string {
@@ -44,6 +52,8 @@ func (k ErrKind) String() string {
 		return "not_found"
 	case ErrServer:
 		return "server"
+	case ErrRiskFlag:
+		return "risk_flag"
 	case ErrClient:
 		return "client"
 	default:
@@ -102,6 +112,12 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusTooManyRequests || isRateLimit6004(body) {
 		return ErrSoftRate
 	}
+	// 11140 是账号级风控标记（403 "request illegal"），必须在通用 4xx 兜底
+	// 之前判定，否则会落进 ErrClient 的"只换号不罚"——被标记的号因此永远
+	// 显示健康并持续吃流量（线上实测：15 个号反复 403，err_total 恒 0）。
+	if status == http.StatusForbidden && isRiskFlag11140(body) {
+		return ErrRiskFlag
+	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
 	}
@@ -141,6 +157,35 @@ func isRateLimit6004(body string) bool {
 	return strings.Contains(body, "6004") &&
 		(strings.Contains(body, "使用量已超出频率限制") ||
 			strings.Contains(lower, "rate limit") || strings.Contains(lower, "soft_rate"))
+}
+
+// riskFlagMarkers 11140 风控的文本副信道。code=11140 是主信道（数字码稳定），
+// 文本匹配是冗余兜底：上游措辞历史上有过漂移（14018 "额度用尽"→"额度已用尽"
+// 就漏判过），displayMsg 的 zh/en 两条都收录，与 hardMarkers 的双通道思路一致。
+var riskFlagMarkers = []string{
+	"request illegal",
+	"内容未通过安全审核",
+	"did not pass the safety review",
+}
+
+// isRiskFlag11140 识别上游信封里的 code=11140（账号级风控标记）。
+// 与 isHardCredit1418 同构：标准解析 + 宽松子串双通道，外层信封包裹时也能命中。
+func isRiskFlag11140(body string) bool {
+	var envelope struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err == nil && envelope.Code == 11140 {
+		return true
+	}
+	if strings.Contains(body, `"code":11140`) || strings.Contains(body, `"code":"11140"`) {
+		return true
+	}
+	for _, m := range riskFlagMarkers {
+		if strings.Contains(body, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // apiEnvelope 上游统一信封。

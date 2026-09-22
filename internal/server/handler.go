@@ -3977,6 +3977,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			setRequestError(st, kind.String(), bodyText)
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: bodyText}
 			h.applyErrorPolicy(acct.UID, routeModel, kind, bodyText)
+			if kind == upstream.ErrRiskFlag {
+				// 11140 账号级风控：账号侧已喂连续计数（达阈值自动 Disable）。
+				// 这里换号重试——被标记的号对任何内容都失败，但健康号
+				// 可能只是该内容触发审核，换号即活。不 break：单号 11140
+				// 不应终结整个客户端请求。
+				fail(acct.UID)
+				continue
+			}
 			if kind == upstream.ErrClient {
 				// 确定性 body 级 4xx（11128 首条须 system、11101 tool_choice 形态、
 				// 11148 工具序列断裂等）：同一 body 换号重发必然复现同样错误，
@@ -4180,12 +4188,14 @@ func (h *Handler) currentCreditPolicy() CreditPolicy {
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
 //
-// 五条路径，各司其职：
+// 六条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate：有模型上下文时只冷却该模型；无模型时退回账号级 CoolSoft/CoolRateLimit。
 //     上游 code=6004 或带 reset 时间的限流 → 精确冷却到 reset，期间不对该模型兜底重试。
 //   - ErrNotFound → Cooldown(CoolSoft)：即时账号级软冷却（404）。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrRiskFlag → NoteRiskStrike：11140 风控连续计数，达阈值自动 Disable
+//    （健康号偶发的内容审核触发会被 NoteSuccess 清零，不会连坐）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
@@ -4232,6 +4242,13 @@ func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, bod
 		}
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
+	case upstream.ErrRiskFlag:
+		// 11140 账号级风控：喂连续计数，达阈值自动 Disable（返回的 reason
+		// 非空 = 本次触发禁用，打日志供运维归因）。冷却无意义——风控
+		// 不自愈，余额/token 都正常，唯独 chat 通道被拒。
+		if reason := h.cfg.Pool.NoteRiskStrike(uid); reason != "" {
+			log.Printf("pool: account %s disabled by risk policy: %s", uid, reason)
+		}
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")

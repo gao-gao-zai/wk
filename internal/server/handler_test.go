@@ -52,9 +52,11 @@ func TestValidateImagePartsAcceptsDataURLAndFileID(t *testing.T) {
 }
 
 func TestReadRequestBodyDetectsLimit(t *testing.T) {
-	body := strings.Repeat("x", maxRequestBodyBytes+1)
+	// 零值 Config = 默认 8 MiB 上限（与改造前的硬编码行为一致）。
+	h := newTestHandler(t, Config{})
+	body := strings.Repeat("x", defaultMaxRequestBodyBytes+1)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	got, tooLarge, err := readRequestBody(req)
+	got, tooLarge, err := h.readRequestBody(req)
 	if err != nil || !tooLarge || got != nil {
 		t.Fatalf("readRequestBody = (%d bytes, tooLarge=%v, err=%v)", len(got), tooLarge, err)
 	}
@@ -401,6 +403,85 @@ func TestChatNonClientErrorStillRotates(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if total := calls["Bearer at1"] + calls["Bearer at2"]; total < 2 {
 		t.Errorf("5xx should still rotate across accounts, upstream calls=%v", calls)
+	}
+}
+
+// TestChatRiskFlagRotatesAndStrikes 11140 账号级风控：换号重试（健康号能救回
+// 客户端请求），且被标记号喂入连续计数。区别于 ErrClient 的不换号透传——
+// 11140 高度指向账号本身，单号失败不应终结整个请求。
+func TestChatRiskFlagRotatesAndStrikes(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-flagged" {
+			return 403, `{"code":11140,"msg":"request illegal","requestId":"35e3ff4d","displayMsg":{"en":"The content did not pass the safety review.","zh":"内容未通过安全审核，请调整后重试。"}}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "flagged", AccessToken: "at-flagged", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	// 让被标记号积分更高被先选中（复现线上场景：高余额死号先吃流量）。
+	p.SetCredits("flagged", 2000)
+	p.SetCredits("good", 1000)
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("rotation should rescue request via healthy account, code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-flagged"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want flagged=1 good=1", calls)
+	}
+	st, _ := p.Status("flagged")
+	if st.RiskStrikes != 1 {
+		t.Errorf("risk_strikes=%d want 1 (fed by applyErrorPolicy)", st.RiskStrikes)
+	}
+	if st.Disabled {
+		t.Error("single strike must not disable (threshold=3)")
+	}
+	// 成功号不受牵连。
+	st, _ = p.Status("good")
+	if st.Disabled || st.RiskStrikes != 0 {
+		t.Errorf("healthy account must be untouched: %+v", st)
+	}
+}
+
+// TestChatRiskFlagAutoDisable 连续 3 次命中被标记号 → 自动禁用（端到端）。
+func TestChatRiskFlagAutoDisable(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 403, `{"code":11140,"msg":"request illegal"}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999},
+	)
+	h := newTestHandler(t, Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	body := `{"model":"glm-5.2","messages":[]}`
+	// 每个请求轮完 3 个号（全部 11140）后 503；三次请求后 u1 累计 3 strikes。
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		if rec.Code != 503 {
+			t.Fatalf("round %d: code=%d want 503 (all accounts risk-flagged)", i, rec.Code)
+		}
+	}
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("u1 should be auto-disabled after 3 consecutive risk strikes: %+v", st)
+	}
+	if st.RiskStrikes != 3 {
+		t.Errorf("u1 risk_strikes=%d want 3", st.RiskStrikes)
+	}
+	// 三号同罪：轮转让每个号每轮都吃一击，均应达到阈值。
+	for _, uid := range []string{"u2", "u3"} {
+		st, _ := p.Status(uid)
+		if !st.Disabled || st.RiskStrikes < 3 {
+			t.Errorf("%s should be auto-disabled too: %+v", uid, st)
+		}
 	}
 }
 

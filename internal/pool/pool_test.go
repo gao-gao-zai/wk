@@ -718,6 +718,86 @@ func TestNoteSuccessIncrementsAndRecords(t *testing.T) {
 	}
 }
 
+func TestRiskStrikeAutoDisable(t *testing.T) {
+	// 连续 3 次 11140 风控 → 自动 Disable；计数持久化字段同步。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	if reason := p.NoteRiskStrike("u1"); reason != "" {
+		t.Fatalf("strike 1 should not disable, got reason=%q", reason)
+	}
+	if reason := p.NoteRiskStrike("u1"); reason != "" {
+		t.Fatalf("strike 2 should not disable, got reason=%q", reason)
+	}
+	st, _ := p.Status("u1")
+	if st.Disabled || st.RiskStrikes != 2 {
+		t.Fatalf("after 2 strikes: disabled=%v risk_strikes=%d want false/2", st.Disabled, st.RiskStrikes)
+	}
+	reason := p.NoteRiskStrike("u1") // 第 3 次：达到默认阈值
+	if reason == "" {
+		t.Fatal("strike 3 should trigger disable, got empty reason")
+	}
+	st, _ = p.Status("u1")
+	if !st.Disabled {
+		t.Fatal("account should be disabled after 3 risk strikes")
+	}
+	if st.RiskStrikes != 3 {
+		t.Errorf("risk_strikes=%d want 3", st.RiskStrikes)
+	}
+	if st.Reason == "" {
+		t.Error("disable reason should be set for observability")
+	}
+	// 已禁用后再喂入：幂等，不重复触发（reason 为空），计数照涨。
+	if reason := p.NoteRiskStrike("u1"); reason != "" {
+		t.Fatalf("strike on disabled account should be idempotent, got reason=%q", reason)
+	}
+	st, _ = p.Status("u1")
+	if st.RiskStrikes != 4 {
+		t.Errorf("risk_strikes=%d want 4 (still counted)", st.RiskStrikes)
+	}
+}
+
+func TestRiskStrikeClearedBySuccess(t *testing.T) {
+	// 健康号偶发内容审核触发：成功一次即清零，不会累积到禁用。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteRiskStrike("u1")
+	p.NoteRiskStrike("u1")
+	p.NoteSuccess("u1")
+	st, _ := p.Status("u1")
+	if st.RiskStrikes != 0 {
+		t.Fatalf("risk_strikes=%d want 0 after success", st.RiskStrikes)
+	}
+	if st.Disabled {
+		t.Fatal("account must not be disabled")
+	}
+	// 清零后重新计数：两次成功间穿插的风控不连坐。
+	p.NoteRiskStrike("u1")
+	st, _ = p.Status("u1")
+	if st.RiskStrikes != 1 || st.Disabled {
+		t.Fatalf("after reset: risk_strikes=%d disabled=%v want 1/false", st.RiskStrikes, st.Disabled)
+	}
+}
+
+func TestRiskStrikeCustomThreshold(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetRiskThreshold(1)
+	if reason := p.NoteRiskStrike("u1"); reason == "" {
+		t.Fatal("threshold=1 should disable on first strike")
+	}
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatal("account should be disabled at custom threshold 1")
+	}
+}
+
+func TestRiskStrikeUnknownUID(t *testing.T) {
+	p := New("")
+	if reason := p.NoteRiskStrike("nope"); reason != "" {
+		t.Fatalf("unknown uid should return empty reason, got %q", reason)
+	}
+}
+
 func TestReenableClearsCoolingNotBreaker(t *testing.T) {
 	// C5：签到解冻只清冷却（until/coolKind/reason）+ 更新 credits，不清熔断
 	// （fails/retryCount/breakerUntil）。签到成功只证明余额与 billing 通道恢复，
