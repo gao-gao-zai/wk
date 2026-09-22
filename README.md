@@ -72,7 +72,7 @@ curl -sN http://localhost:7863/v1/chat/completions \
   -d '{"model":"glm-5v-turbo","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"请描述图片"},{"type":"image_url","image_url":{"url":"data:image/png;base64,<BASE64>"}}]}]}'
 ```
 
-当前接口接收 JSON，不提供 multipart 文件上传接口；请求体上限为 8 MiB。图片模型能力由 WorkBuddy 上游账号决定，格式不完整时服务会返回 `400 invalid_image`。
+当前接口接收 JSON，不提供 multipart 文件上传接口；请求体上限默认 8 MiB，可通过 `max_request_body_mib`（1-64）或控制台「管理设置 → 请求体大小限制」修改，WebUI 保存即时生效。图片模型能力由 WorkBuddy 上游账号决定，格式不完整时服务会返回 `400 invalid_image`。
 
 ## 配置说明
 
@@ -122,6 +122,7 @@ curl -sN http://localhost:7863/v1/chat/completions \
   "region": "cn",
   "frontend_dir": "frontend",
   "trusted_proxies": [],
+  "max_request_body_mib": 8,
   "cooldown": {
     "soft_rate": "60s"
   },
@@ -405,6 +406,12 @@ ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
 对应环境变量 `WB2A_TIMEOUT_SECONDS`、`WB2A_STREAM_IDLE_SECONDS`、
 `WB2A_STREAM_TIMEOUT_SECONDS`；启动日志会打印三者生效值。
 
+聊天/Responses 请求体大小上限默认 8 MiB，可用 `max_request_body_mib`
+（1-64）调整（超限返回 `413 request_too_large`）。控制台「管理设置 →
+请求体大小限制」可在线修改，保存即时生效并写回 config.json；对应环境变量
+`WB2A_MAX_REQUEST_BODY_MIB`。请求体会完整读进内存再解析，调大前先确认
+服务器内存足够——上限封顶 64 MiB 也是因此。
+
 上游 WorkBuddy 返回的请求 ID 会原值传给客户端：兼容响应体中的 `id`、`request_id`、
 `requestId`、`requestID`、`record_id`、`recordId`、`recordID` 以及常见请求 ID 响应头。Chat Completions、Responses
 和请求日志使用同一个上游 ID，不添加前缀，也不重新生成；只有上游完全未返回 ID 时才使用本地兜底 ID。
@@ -418,7 +425,7 @@ ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
 - **静态资源白名单**：控制台只放行 `index.html` 与 `assets/index-<hash>.{js,css}`，不提供目录列表，其它文件一律 404。
 - **安全响应头**：所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、`Referrer-Policy: no-referrer` 与 CSP（`script-src 'self'`）。
 - **控制台不持久化 API Key**：Key 只保留在当前页面内存中，刷新后需重新输入；历史版本写入 `sessionStorage`/`localStorage` 的值会在加载时清除。
-- **请求体上限**：聊天/Responses 请求体上限 8 MiB，且必须是合法 JSON 对象。
+- **请求体上限**：聊天/Responses 请求体上限默认 8 MiB（`max_request_body_mib` 可调，1-64，WebUI 即时生效），且必须是合法 JSON 对象。
 - **上游响应上限**：单帧 SSE 1 MiB、聚合正文 8 MiB，超限返回 `response_too_large` 并正常补 `[DONE]`。
 - **日志净化**：客户端可控字段进入日志前会按 rune 截断并剔除控制字符，防止 `\r` 与 ANSI 转义伪造日志行。
 - **手机号脱敏**：自动加号日志中的号码以 `138****8000` 形式记录（号池账号昵称即手机号）。

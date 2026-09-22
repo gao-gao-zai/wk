@@ -414,3 +414,68 @@ func TestPprofRejectsWildcardOrMissingHost(t *testing.T) {
 		}
 	}
 }
+
+// 请求体大小上限：默认 8 MiB（与历史硬编码一致）；文件/env 可改；范围 1-64。
+func TestMaxRequestBodyMiB(t *testing.T) {
+	// 默认值 = 8。
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxRequestBodyMiB != 8 {
+		t.Errorf("default MaxRequestBodyMiB=%d want 8", c.MaxRequestBodyMiB)
+	}
+
+	// 老配置文件没写该字段 → 保持默认 8。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"api_key":"k"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxRequestBodyMiB != 8 {
+		t.Errorf("unset MaxRequestBodyMiB=%d want default 8", c.MaxRequestBodyMiB)
+	}
+
+	// 文件显式配置。
+	if err := os.WriteFile(fp, []byte(`{"api_key":"k","max_request_body_mib":32}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxRequestBodyMiB != 32 {
+		t.Errorf("MaxRequestBodyMiB=%d want 32", c.MaxRequestBodyMiB)
+	}
+
+	// env 覆盖文件。
+	t.Setenv("WB2A_MAX_REQUEST_BODY_MIB", "16")
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxRequestBodyMiB != 16 {
+		t.Errorf("env override MaxRequestBodyMiB=%d want 16", c.MaxRequestBodyMiB)
+	}
+
+	// 非法范围拒绝：0/负数（显式）/超 64。normalize 报错而不是静默回落。
+	for _, mib := range []int{-1, 65, 1000} {
+		c := Default()
+		c.MaxRequestBodyMiB = mib
+		if err := c.normalize(); err == nil {
+			t.Errorf("mib=%d accepted, want error", mib)
+		}
+	}
+	// 全部合法边界：1 与 64。
+	for _, mib := range []int{1, 64} {
+		c := Default()
+		c.MaxRequestBodyMiB = mib
+		if err := c.normalize(); err != nil {
+			t.Errorf("mib=%d unexpected error: %v", mib, err)
+		}
+	}
+}

@@ -95,7 +95,7 @@ function Console() {
   const [dashboardSummary, setDashboardSummary] = useState(null);
   const [config, setConfig] = useState({
     checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn',
-    features: null, billing: null, upstream: null,
+    features: null, billing: null, upstream: null, max_request_body: null,
   });
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
@@ -172,8 +172,8 @@ function Console() {
     try {
       const currentConfig = await api('/admin/config', { signal: controller.signal });
       if (serial !== refreshSerial.current) return;
-      // features/billing/upstream 是运行时可变配置（老后端没有这些字段时保持 null，
-      // 管理设置页据此隐藏对应区域，避免误导）。
+      // features/billing/upstream/max_request_body 是运行时可变配置（老后端没有
+      // 这些字段时保持 null，管理设置页据此隐藏对应区域，避免误导）。
       setConfig(current => ({
         ...current,
         ...(currentConfig.schedule || {}),
@@ -183,6 +183,7 @@ function Console() {
         upstream: currentConfig.upstream || current.upstream,
         sms: currentConfig.sms || current.sms,
         request_log_retention: currentConfig.request_log_retention || current.request_log_retention,
+        max_request_body: currentConfig.max_request_body || current.max_request_body,
       }));
     } catch (error) {
       if (error.name === 'AbortError') return;
@@ -398,6 +399,30 @@ function Console() {
       });
       setConfig(current => ({ ...current, request_log_retention: retention }));
       message.success(result?.updated?.request_log_retention_restart_required ? '保留策略已保存，重启后生效' : '保留策略已保存并即时生效');
+      return result;
+    } catch (error) {
+      message.error(error.message);
+      return null;
+    }
+  };
+
+  // saveMaxRequestBody 保存请求体大小上限（MiB）：即时生效（下一条
+  // chat/responses 请求按新上限判定，已在途请求不受影响）。
+  const saveMaxRequestBody = async mib => {
+    try {
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          checkin_hours: config.checkin_hours || [9],
+          keepalive_hours: config.keepalive_hours || [22],
+          max_request_body: { mib },
+        }),
+      });
+      setConfig(current => ({
+        ...current,
+        max_request_body: { ...(current.max_request_body || {}), mib },
+      }));
+      message.success('请求体大小限制已保存并即时生效');
       return result;
     } catch (error) {
       message.error(error.message);
@@ -810,6 +835,38 @@ function Console() {
                   <InputNumber min={0} max={3600} style={{ width: 130 }} addonAfter="秒" />
                 </Form.Item>
                 <Button type="primary" htmlType="submit">保存超时</Button>
+              </Form>
+            </Card>
+          )}
+          {config.max_request_body && (
+            <Card title="请求体大小限制">
+              <Paragraph type="secondary" style={{ margin: '0 0 12px' }}>
+                /v1/chat/completions 与 /v1/responses 请求体的最大体积（含 Base64 图片）。
+                保存后即时生效（同时写回 config.json，重启不丢）。调大前先确认服务器内存：
+                请求体会完整读进内存再解析。带多张 Base64 图片的请求建议 16-32。
+              </Paragraph>
+              <Form
+                layout="inline"
+                onFinish={values => saveMaxRequestBody(Number(values.mib) || 8)}
+                initialValues={{ mib: config.max_request_body?.mib ?? 8 }}
+                key={config.max_request_body?.mib}
+              >
+                <Form.Item
+                  name="mib"
+                  label={(
+                    <Tooltip title="请求体上限，单位 MiB。范围 1-64，默认 8。超限请求返回 413 request_too_large。">
+                      <span style={{ borderBottom: '1px dashed #bfbfbf' }}>上限</span>
+                    </Tooltip>
+                  )}
+                >
+                  <InputNumber
+                    min={config.max_request_body?.min_mib ?? 1}
+                    max={config.max_request_body?.max_mib ?? 64}
+                    style={{ width: 150 }}
+                    addonAfter="MiB"
+                  />
+                </Form.Item>
+                <Button type="primary" htmlType="submit">保存限制</Button>
               </Form>
             </Card>
           )}

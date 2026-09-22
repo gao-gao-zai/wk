@@ -473,6 +473,9 @@ func main() {
 				Idle:  time.Duration(streamIdleSecs) * time.Second,
 			})
 		},
+		// 请求体大小上限（字节）：WebUI「请求体大小限制」卡片保存后
+		// 即时生效；默认 8 MiB（config normalize 已保证 1-64）。
+		MaxRequestBodyBytes: cfg.MaxRequestBodyMiB << 20,
 		SoftCooldown: cfg.SoftRateDur,
 	})
 
