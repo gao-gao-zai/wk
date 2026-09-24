@@ -47,3 +47,15 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+
+# 本机会话探针/部署临时产物（DSH 工具与离线部署流程的中间文件）
+.dsh-probe/
+deploy-tmp/
+deploy-tmp.tar.gz
+reference/
+tmp/
+metrics-007.db
+
+# 本机曾用 pnpm 装过前端依赖产生的副产物（仓库走 npm，package-lock.json 为准）
+react/pnpm-lock.yaml
+react/pnpm-workspace.yaml

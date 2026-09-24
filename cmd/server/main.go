@@ -512,6 +512,22 @@ func main() {
 	// SIGKILL，收尾代码不会执行，号会一直占着豪猪的取号额度，导致之后每次
 	// 取号都返回"余额不足,请释放拉黑后再取号"（看着像没钱，其实是号没还）。
 	if h.AutoEnroller() != nil {
+		// config.json 的 autoenroll.* 节覆盖默认阈值（优先级：配置文件 >
+		// 环境变量 > 内置默认；未配置的字段沿用 NewAutoEnroller 里按环境
+		// 变量初始化的值）。WebUI 保存高级设置时走 handler 的热改回调，
+		// 这里只负责启动时把文件里的显式配置压进去。
+		if mb, cf := h.AutoEnroller().Limits(); cfg.AutoEnroll.MinBalance != nil || cfg.AutoEnroll.ConsecutiveFails != nil {
+			if cfg.AutoEnroll.MinBalance != nil {
+				mb = *cfg.AutoEnroll.MinBalance
+			}
+			if cfg.AutoEnroll.ConsecutiveFails != nil {
+				cf = *cfg.AutoEnroll.ConsecutiveFails
+			}
+			h.AutoEnroller().SetLimits(mb, cf)
+		}
+		if cfg.AutoEnroll.RetryDelaySeconds != nil && *cfg.AutoEnroll.RetryDelaySeconds > 0 {
+			h.AutoEnroller().SetRetryDelay(time.Duration(*cfg.AutoEnroll.RetryDelaySeconds) * time.Second)
+		}
 		if n := h.AutoEnroller().ReclaimOrphans(); n > 0 {
 			log.Printf("auto-enroll: reclaimed %d number(s) left over from a previous run", n)
 		}

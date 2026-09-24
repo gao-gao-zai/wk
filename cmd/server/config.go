@@ -164,6 +164,19 @@ type Config struct {
 		} `json:"haozhuma"`
 	} `json:"sms"`
 
+	// AutoEnroll 自动加号的任务控制参数（WebUI「高级设置」）。指针类型区分
+	// "未配置"（走环境变量/默认值兜底）与"显式配置"；运行期可经 WebUI 热改。
+	AutoEnroll struct {
+		// MinBalance 余额保护阈值（元）。低于此值不再开始新的取号；
+		// 0 = 关闭保护。
+		MinBalance *float64 `json:"min_balance"`
+		// ConsecutiveFails 连续失败熔断阈值：连续这么多个号都失败时停止
+		// 任务（通道坏了/项目被限，继续跑也不会有结果）。
+		ConsecutiveFails *int `json:"consecutive_fails"`
+		// RetryDelaySeconds 两次取号尝试之间的间隔（秒）。
+		RetryDelaySeconds *int `json:"retry_delay_seconds"`
+	} `json:"autoenroll"`
+
 	// ReqProxy 实际请求账号的代理池（新模块，与 sms.proxy 的注册代理完全独立）。
 	// 订阅/节点/规则/绑定全部在 WebUI 管理（/admin/reqproxy/*），这里只有
 	// 基础设施参数；不配即用默认值。enabled 开关在模块自己的 state.json 里。
@@ -211,21 +224,21 @@ type Config struct {
 	} `json:"session_sticky"`
 
 	// 解析后
-	SoftRateDur            time.Duration `json:"-"`
-	BreakerCooldownDur     time.Duration `json:"-"`
-	BreakerCooldownMaxD    time.Duration `json:"-"`
-	SessionTTL             time.Duration `json:"-"`
-	SessionGCInterval      time.Duration `json:"-"`
-	SMSProxyCooldownDur    time.Duration `json:"-"`
-	ReqProxyHealthDur      time.Duration `json:"-"`
-	ReqProxyLatencyDur     time.Duration `json:"-"`
-	ReqProxyUnhealthyDur   time.Duration `json:"-"`
-	PostgresMaxLifetime time.Duration `json:"-"`
-	PostgresMaxIdleTime time.Duration `json:"-"`
+	SoftRateDur          time.Duration `json:"-"`
+	BreakerCooldownDur   time.Duration `json:"-"`
+	BreakerCooldownMaxD  time.Duration `json:"-"`
+	SessionTTL           time.Duration `json:"-"`
+	SessionGCInterval    time.Duration `json:"-"`
+	SMSProxyCooldownDur  time.Duration `json:"-"`
+	ReqProxyHealthDur    time.Duration `json:"-"`
+	ReqProxyLatencyDur   time.Duration `json:"-"`
+	ReqProxyUnhealthyDur time.Duration `json:"-"`
+	PostgresMaxLifetime  time.Duration `json:"-"`
+	PostgresMaxIdleTime  time.Duration `json:"-"`
 	// ScheduleEnabled 解析后的排程开关（JSON 里缺省 false，这里归一为「缺省=开」）。
 	ScheduleEnabled struct {
 		Checkin, Travel, Activity, Keepalive, Blackcat bool
-		AutoenrollGrowthTasks                           bool
+		AutoenrollGrowthTasks                          bool
 	} `json:"-"`
 	// HasScheduleEnabled 区分「配置文件显式写了 false」与「没写」（JSON bool 零值歧义）。
 	HasScheduleEnabled map[string]bool `json:"-"`

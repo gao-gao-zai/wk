@@ -182,6 +182,7 @@ function Console() {
         billing: currentConfig.billing || current.billing,
         upstream: currentConfig.upstream || current.upstream,
         sms: currentConfig.sms || current.sms,
+        autoenroll: currentConfig.autoenroll || current.autoenroll,
         request_log_retention: currentConfig.request_log_retention || current.request_log_retention,
         max_request_body: currentConfig.max_request_body || current.max_request_body,
       }));
@@ -364,26 +365,54 @@ function Console() {
     }
   };
 
-  // saveHaozhumaSid 保存豪猪项目 ID：即时生效（新取号立刻用新项目；
-  // 在途号码按旧项目自然收尾）。schedule 是必填校验项，回传当前值。
-  const saveHaozhumaSid = async sid => {
+  // saveHaozhuma 豪猪设置的通用保存（自动加号页）：patch 只含显式要改的
+  // haozhuma 子字段（指针语义，后端增量合并）。即时生效（新取号立刻用新
+  // 项目/对接码；在途号码按旧值收尾）。schedule 是必填校验项，回传当前值。
+  const saveHaozhuma = async patch => {
     try {
       const result = await api('/admin/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           checkin_hours: config.checkin_hours || [9],
           keepalive_hours: config.keepalive_hours || [22],
-          sms: { haozhuma: { sid } },
+          sms: { haozhuma: patch },
         }),
       });
-      setConfig(current => ({ ...current, sms: { haozhuma: { ...(current.sms?.haozhuma || {}), sid } } }));
-      message.success(result?.updated?.haozhuma_sid_restart_required ? '项目 ID 已保存，重启后生效' : '豪猪项目 ID 已切换，新取号立即生效');
+      // 本地乐观合并：sid/author/uid/isp 直写；user/pass/token 是凭据，
+      // 只在后端回显里体现，这里不往 config 里塞草稿值。
+      setConfig(current => ({
+        ...current,
+        sms: { haozhuma: { ...(current.sms?.haozhuma || {}), ...patch } },
+      }));
       return result;
     } catch (error) {
       message.error(error.message);
       return null;
     }
   };
+
+  // saveAutoEnroll 自动加号任务控制参数（高级设置抽屉）：余额阈值/熔断/
+  // 尝试间隔。保存即时生效（下一个 worker 循环按新值判定）。
+  const saveAutoEnroll = async patch => {
+    try {
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          checkin_hours: config.checkin_hours || [9],
+          keepalive_hours: config.keepalive_hours || [22],
+          autoenroll: patch,
+        }),
+      });
+      setConfig(current => ({ ...current, autoenroll: { ...(current.autoenroll || {}), ...patch } }));
+      return result;
+    } catch (error) {
+      message.error(error.message);
+      return null;
+    }
+  };
+
+  // saveHaozhumaSid 旧入口保留（兼容页内其他引用）：走泛化版。
+  const saveHaozhumaSid = async sid => saveHaozhuma({ sid });
 
   // saveRequestLogRetention 保存请求日志保留策略（天数 + 条数双条件）：
   // 即时生效（下一次修剪按新值执行）。0 = 对应条件不限。
@@ -718,7 +747,8 @@ function Console() {
                   ['activity_enabled', '活跃上报', '每日一条 chat_request_send 事件，点亮连登与任务解锁'],
                   ['keepalive_enabled', 'token 保活', '刷新全部账号 token，session 失效自动禁用'],
                   ['blackcat_enabled', '夜猫子', '23:00–08:00 窗口内 glm-5.2 对话补足（black_cat 任务）'],
-                  ['autoenroll_growth_tasks', '加号后自动跑任务', '自动加号注册成功即自动执行 17 项成长任务（约 +1950 积分；含数条真实短对话）'],
+                  // autoenroll_growth_tasks 已搬到「自动加号」页（与加号主流程
+                  // 同处一目了然），这里不再重复入口。
                 ].map(([key, label, desc]) => (
                   <div key={key} style={{ display: 'flex', justifyContent: 'space-between', gap: 24, alignItems: 'flex-start' }}>
                     <div>
@@ -1014,7 +1044,15 @@ function Console() {
             {activeSection === 'requests' && <RequestLogsPage api={api} models={models} accounts={data.accounts || []} />}
             {activeSection === 'pool' && <AccountListPage api={api} data={data} refresh={refresh} refreshCredits={refreshCredits} creditRefreshing={creditRefreshing} />}
             {activeSection === 'accounts' && <AccountSettingsPage api={api} refresh={refresh} region={config.region} />}
-            {activeSection === 'auto-enroll' && <AutoEnrollPage api={api} haozhumaSid={config.sms?.haozhuma?.sid || ''} onSaveHaozhumaSid={saveHaozhumaSid} />}
+            {activeSection === 'auto-enroll' && (
+              <AutoEnrollPage
+                api={api}
+                config={config}
+                onSaveHaozhuma={saveHaozhuma}
+                onSaveAutoEnroll={saveAutoEnroll}
+                onToggleGrowthTasks={checked => saveScheduleToggle('autoenroll_growth_tasks', checked)}
+              />
+            )}
             {activeSection === 'groups' && <GroupsAndKeysPage api={api} />}
             {activeSection === 'proxy' && <ProxyPoolPage api={api} />}
             {activeSection === 'reqproxy' && <ReqProxyPage api={api} />}

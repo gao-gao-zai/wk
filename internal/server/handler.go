@@ -68,6 +68,18 @@ type Config struct {
 	// 自动接上（见 NewHandler）；main 无需注入。nil = 自动加号未启用，
 	// WebUI 改 sid 只落盘（重启后生效）。
 	SetHaozhumaSid func(sid string)
+	// SetHaozhumaFetch 运行时更新豪猪取号策略（author/uid/isp）。
+	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘。
+	SetHaozhumaFetch func(author, uid, isp string)
+	// ReplaceHaozhumaClient 运行时更换豪猪客户端（WebUI 改鉴权）。
+	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘
+	//（重启后生效）。
+	ReplaceHaozhumaClient func(c *haozhuma.Client) error
+	// SetAutoEnrollLimits 运行时更新自动加号任务控制参数（余额阈值/熔断）。
+	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘。
+	SetAutoEnrollLimits func(minBalance float64, consecutiveFails int)
+	// SetAutoEnrollRetry 运行时更新两次尝试间隔。nil = 未启用，只落盘。
+	SetAutoEnrollRetry func(seconds int)
 	// SetRequestLogRetention 运行时更新请求日志保留策略（main 注入：推给
 	// metricsstore 的 SetRetention）。nil = 未启用持久化存储，WebUI 改
 	// 保留策略只落盘（重启后生效）。
@@ -328,6 +340,9 @@ func NewHandler(cfg Config) *Handler {
 	// 一键释放豪猪名下所有占用号码（cancelAllRecv）：额度被旧号占满时的
 	// 手动兜底，对齐豪猪后台的"释放全部"按钮。
 	h.mux.HandleFunc("POST /admin/account/sms/release-all", h.withFrontend(h.accountSMSReleaseAll))
+	// 豪猪凭据验证（不保存）+ 账户概览（余额/占用/账本）。
+	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/verify", h.withFrontend(h.haozhumaVerify))
+	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/summary", h.withFrontend(h.haozhumaSummary))
 	h.mux.HandleFunc("GET /admin/proxy/status", h.withFrontend(h.proxyStatus))
 	// 请求代理模块（reqproxy）：与上面的登录代理池完全独立的新命名空间。
 	h.mux.HandleFunc("GET /admin/reqproxy/config", h.withFrontend(h.reqproxyConfigGet))
@@ -426,6 +441,14 @@ func NewHandler(cfg Config) *Handler {
 		// WebUI 运行时切换项目 ID 直接推给 AutoEnroll（组装在 NewHandler
 		// 内部，main 拿不到指针，这里自接回调最省事）。
 		h.cfg.SetHaozhumaSid = h.cfg.AutoEnroll.SetSid
+		// 取号策略热改（author/uid/isp）与任务控制参数同理；ReplaceClient
+		// 的运行态保护（ErrBusyAuth）在 AutoEnroller 内部。
+		h.cfg.SetHaozhumaFetch = h.cfg.AutoEnroll.UpdateFetchOptions
+		h.cfg.ReplaceHaozhumaClient = h.cfg.AutoEnroll.ReplaceClient
+		h.cfg.SetAutoEnrollLimits = h.cfg.AutoEnroll.SetLimits
+		h.cfg.SetAutoEnrollRetry = func(seconds int) {
+			h.cfg.AutoEnroll.SetRetryDelay(time.Duration(seconds) * time.Second)
+		}
 	}
 	// Static console assets are served through an explicit allow-list (see
 	// staticConsoleHandler) instead of http.FileServer(http.Dir("frontend")).
@@ -927,12 +950,26 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 			StreamTimeoutSeconds int `json:"stream_timeout_seconds"`
 			StreamIdleSeconds    int `json:"stream_idle_seconds"`
 		} `json:"upstream"`
-		// SMS 豪猪项目 ID（WebUI 可改，运行时生效）。
+		// SMS 豪猪接码配置（WebUI「自动加号」页）。sid/author/uid/isp 是
+		// 明文回显（非凭据）；user/token 做脱敏、pass/token 只回"有没有"。
 		SMS struct {
 			Haozhuma struct {
-				Sid string `json:"sid"`
+				Sid    string `json:"sid"`
+				Author string `json:"author"`
+				UID    string `json:"uid"`
+				ISP    string `json:"isp"`
+				User   string `json:"user"`
+				Pass   string `json:"pass"`
+				Token  string `json:"token"`
 			} `json:"haozhuma"`
 		} `json:"sms"`
+		// AutoEnroll 任务控制参数（WebUI「高级设置」）。老配置没有该节时
+		// 用当前 AutoEnroller 实例的生效值兜底回显（它包含环境变量/默认值）。
+		AutoEnroll struct {
+			MinBalance       *float64 `json:"min_balance"`
+			ConsecutiveFails *int     `json:"consecutive_fails"`
+			RetryDelaySecs   *int     `json:"retry_delay_seconds"`
+		} `json:"autoenroll"`
 		// 请求日志保留策略（WebUI 可改，运行时生效）。config.json 里是
 		// 平级的 request_log_retention_days / _rows；对前端组装成嵌套
 		// request_log_retention 对象（与 POST 补丁形状一致）。
@@ -994,23 +1031,40 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		c.MaxRequestBodyMiB = defaultMaxRequestBodyBytes >> 20
 	}
 	resp := struct {
-		Schedule  any `json:"schedule"`
-		Region    any `json:"region"`
-		Features  any `json:"features"`
-		Billing   any `json:"billing"`
-		Upstream  any `json:"upstream"`
-		SMS       any `json:"sms"`
-		Retention any `json:"request_log_retention"`
+		Schedule   any `json:"schedule"`
+		Region     any `json:"region"`
+		Features   any `json:"features"`
+		Billing    any `json:"billing"`
+		Upstream   any `json:"upstream"`
+		SMS        any `json:"sms"`
+		AutoEnroll any `json:"autoenroll"`
+		Retention  any `json:"request_log_retention"`
 		// MaxRequestBodyMiB 对前端组装成嵌套对象（与 POST 补丁形状一致）。
 		MaxRequestBody any `json:"max_request_body"`
 	}{
-		Schedule:  c.Schedule,
-		Region:    c.Region,
-		Features:  c.Features,
-		Billing:   c.Billing,
-		Upstream:  c.Upstream,
-		SMS:       c.SMS,
-		Retention: map[string]int{"days": c.RetentionDays, "rows": c.RetentionRows},
+		Schedule: c.Schedule,
+		Region:   c.Region,
+		Features: c.Features,
+		Billing:  c.Billing,
+		Upstream: c.Upstream,
+		SMS: map[string]any{
+			"haozhuma": map[string]any{
+				"sid":    c.SMS.Haozhuma.Sid,
+				"author": c.SMS.Haozhuma.Author,
+				"uid":    c.SMS.Haozhuma.UID,
+				"isp":    c.SMS.Haozhuma.ISP,
+				// 凭据脱敏：user 前后各 2 位（不足 5 位全 *）；pass/token
+				// 只回"有没有"，值本体绝不出接口。
+				"auth": map[string]any{
+					"mode":      haozhumaAuthMode(c.SMS.Haozhuma.User, c.SMS.Haozhuma.Token),
+					"user":      maskCredential(c.SMS.Haozhuma.User),
+					"has_pass":  c.SMS.Haozhuma.Pass != "",
+					"has_token": c.SMS.Haozhuma.Token != "",
+				},
+			},
+		},
+		AutoEnroll: h.autoenrollEcho(c.AutoEnroll),
+		Retention:  map[string]int{"days": c.RetentionDays, "rows": c.RetentionRows},
 		MaxRequestBody: map[string]int{
 			"mib":         c.MaxRequestBodyMiB,
 			"min_mib":     minWebRequestBodyBytes >> 20,
@@ -1019,6 +1073,60 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	writeJSON(w, 200, resp)
+}
+
+// haozhumaAuthMode 凭据形态：userpass（有账密，login 换 token，可自动重登）
+// / token（只有 token）/ none（都没配）。
+func haozhumaAuthMode(user, token string) string {
+	if user != "" {
+		return "userpass"
+	}
+	if token != "" {
+		return "token"
+	}
+	return "none"
+}
+
+// maskCredential 凭据脱敏回显：不足 5 位全打码；否则前 2 后 2 中间 ***。
+func maskCredential(s string) string {
+	if s == "" {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) < 5 {
+		return strings.Repeat("*", len(rs))
+	}
+	return string(rs[:2]) + "***" + string(rs[len(rs)-2:])
+}
+
+// autoenrollEcho 任务控制参数回显：配置文件显式值优先；没配的字段用
+// AutoEnroller 当前生效值（含环境变量/默认值）兜底，前端表单永远有初值。
+func (h *Handler) autoenrollEcho(file struct {
+	MinBalance       *float64 `json:"min_balance"`
+	ConsecutiveFails *int     `json:"consecutive_fails"`
+	RetryDelaySecs   *int     `json:"retry_delay_seconds"`
+}) map[string]any {
+	mb, cf := defaultMinBalance, defaultConsecutiveFails
+	if h.cfg.AutoEnroll != nil {
+		mb, cf = h.cfg.AutoEnroll.Limits()
+	}
+	rd := 5
+	if h.cfg.AutoEnroll != nil {
+		if d := h.cfg.AutoEnroll.RetryDelay(); d > 0 {
+			rd = int(d.Seconds())
+		}
+	}
+	out := map[string]any{"min_balance": mb, "consecutive_fails": cf, "retry_delay_seconds": rd}
+	if file.MinBalance != nil {
+		out["min_balance"] = *file.MinBalance
+	}
+	if file.ConsecutiveFails != nil {
+		out["consecutive_fails"] = *file.ConsecutiveFails
+	}
+	if file.RetryDelaySecs != nil {
+		out["retry_delay_seconds"] = *file.RetryDelaySecs
+	}
+	return out
 }
 
 // featuresPatch / billingPatch 是 POST /admin/config 的可选字段组。
@@ -1048,13 +1156,56 @@ type upstreamPatch struct {
 	StreamIdleSeconds    *int `json:"stream_idle_seconds"`
 }
 
-// smsPatch 豪猪接码设置的可选字段组（WebUI「自动加号」卡片）。当前只开放
-// 项目 ID：账号/token 属于凭据，凭轮换走文件；uid（对接码钉死）依赖豪猪
-// 后台的具体对接列表，WebUI 改错会让取号全挂，也不开放。
+// smsPatch 豪猪接码设置的可选字段组（WebUI「自动加号」页）。凭据字段
+// （user/pass/token）走"验证通过才落盘 + ReplaceClient"链路（见
+// saveAdminConfig 内的处理），取号字段（sid/author/uid/isp）直接热改。
 type smsPatch struct {
 	Haozhuma struct {
-		Sid *string `json:"sid"`
+		Sid    *string `json:"sid"`
+		Author *string `json:"author"`
+		UID    *string `json:"uid"`
+		ISP    *string `json:"isp"`
+		User   *string `json:"user"`
+		Pass   *string `json:"pass"`
+		Token  *string `json:"token"`
 	} `json:"haozhuma"`
+}
+
+// autoEnrollPatch 自动加号任务控制参数（WebUI「高级设置」）。
+type autoEnrollPatch struct {
+	MinBalance       *float64 `json:"min_balance"`
+	ConsecutiveFails *int     `json:"consecutive_fails"`
+	RetryDelaySecs   *int     `json:"retry_delay_seconds"`
+}
+
+// haozhumaUIDPattern 对接码格式：项目数字 ID - 字母数字（豪猪后台实测，
+// 如 52283-WW9L2J4WOL）。
+var haozhumaUIDPattern = regexp.MustCompile(`^[0-9]+-[A-Za-z0-9]+$`)
+
+// validISPList 运营商优先级：1/2/3 的逗号组合，允许重复项以外的任何顺序
+// （豪猪按列表顺序降级）。空串合法（= 不限）。
+func validISPList(s string) bool {
+	seen := map[string]bool{}
+	for _, part := range strings.Split(s, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if p != "1" && p != "2" && p != "3" {
+			return false
+		}
+		if seen[p] {
+			return false
+		}
+		seen[p] = true
+	}
+	return true
+}
+
+// haozhumaAuthPatchPresent 请求是否带了鉴权字段（user/pass/token 任一）。
+// 鉴权字段走独立的"验证→构建→替换"链路，与取号字段分开处理。
+func (h *Handler) haozhumaAuthPatchPresent(p *smsPatch) bool {
+	return p != nil && (p.Haozhuma.User != nil || p.Haozhuma.Pass != nil || p.Haozhuma.Token != nil)
 }
 
 // retentionPatch 请求日志保留策略（WebUI「日志保留」卡片）。
@@ -1092,6 +1243,7 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		Billing               *billingPatch        `json:"billing"`
 		Upstream              *upstreamPatch       `json:"upstream"`
 		SMS                   *smsPatch            `json:"sms"`
+		AutoEnrollCfg         *autoEnrollPatch     `json:"autoenroll"`
 		Retention             *retentionPatch      `json:"request_log_retention"`
 		MaxRequestBody        *maxRequestBodyPatch `json:"max_request_body"`
 	}
@@ -1167,6 +1319,54 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	}
+	// 对接码：空（= 平台自动分配）或「项目ID-字母数字」格式（豪猪后台
+	// 实测格式，如 52283-WW9L2J4WOL）。
+	if req.SMS != nil && req.SMS.Haozhuma.UID != nil {
+		uid := strings.TrimSpace(*req.SMS.Haozhuma.UID)
+		if uid != "" && !haozhumaUIDPattern.MatchString(uid) {
+			writeJSON(w, 400, map[string]string{"error": "对接码格式形如 52283-WW9L2J4WOL（留空 = 平台自动分配）"})
+			return
+		}
+	}
+	// 运营商优先级：只允许 1（移动）/2（联通）/3（电信）的逗号组合，不重复。
+	if req.SMS != nil && req.SMS.Haozhuma.ISP != nil {
+		isp := strings.TrimSpace(*req.SMS.Haozhuma.ISP)
+		if isp != "" && !validISPList(isp) {
+			writeJSON(w, 400, map[string]string{"error": "运营商优先级只能是 1（移动）/2（联通）/3（电信）的逗号组合，如 2,1"})
+			return
+		}
+	}
+	// 任务控制参数（autoenroll 节）。
+	if req.AutoEnrollCfg != nil {
+		for _, pair := range []struct {
+			v   any
+			ok  bool
+			msg string
+		}{
+			{req.AutoEnrollCfg.MinBalance, req.AutoEnrollCfg.MinBalance == nil ||
+				(*req.AutoEnrollCfg.MinBalance >= 0 && *req.AutoEnrollCfg.MinBalance <= 1000 &&
+					!math.IsInf(*req.AutoEnrollCfg.MinBalance, 0) && !math.IsNaN(*req.AutoEnrollCfg.MinBalance)),
+				"余额保护阈值需在 0-1000 元之间（0 = 关闭保护）"},
+			{req.AutoEnrollCfg.ConsecutiveFails, req.AutoEnrollCfg.ConsecutiveFails == nil ||
+				(*req.AutoEnrollCfg.ConsecutiveFails >= 1 && *req.AutoEnrollCfg.ConsecutiveFails <= 100),
+				"连续失败熔断阈值需在 1-100 之间"},
+			{req.AutoEnrollCfg.RetryDelaySecs, req.AutoEnrollCfg.RetryDelaySecs == nil ||
+				(*req.AutoEnrollCfg.RetryDelaySecs >= 1 && *req.AutoEnrollCfg.RetryDelaySecs <= 60),
+				"尝试间隔需在 1-60 秒之间"},
+		} {
+			if !pair.ok {
+				writeJSON(w, 400, map[string]string{"error": pair.msg})
+				return
+			}
+		}
+	}
+	// 鉴权字段（user/pass/token）的运行态保护：任务运行中换客户端会让
+	// 在途号码的收码/释放打到新 token 上。校验+构建新客户端在落盘段做
+	//（需要读 config.json 现值），这里先挡运行态。
+	if req.SMS != nil && h.haozhumaAuthPatchPresent(req.SMS) && h.cfg.AutoEnroll != nil && h.cfg.AutoEnroll.Status().Running {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": ErrBusyAuth.Error()})
+		return
 	}
 	// 请求日志保留策略：天数 1-3650（10 年封顶），条数 100-1,000,000。
 	// 0 合法（= 该条件不限）；负数无意义直接拒。双零 = 回到旧默认 1 万条
@@ -1303,9 +1503,9 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		doc["upstream"] = ups
 	}
-	if req.SMS != nil && req.SMS.Haozhuma.Sid != nil {
-		sid := strings.TrimSpace(*req.SMS.Haozhuma.Sid)
-		// 校验已保证非空数字。落盘保留 sms 节的其余字段（账号/token/uid）。
+	// 豪猪补丁落盘：sid/author/uid/isp 直接合并；鉴权字段（user/pass/token）
+	// 先验证再落盘（见下方 authPatch 分支）。
+	if req.SMS != nil {
 		sms, _ := doc["sms"].(map[string]any)
 		if sms == nil {
 			sms = map[string]any{}
@@ -1314,9 +1514,111 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		if hz == nil {
 			hz = map[string]any{}
 		}
-		hz["sid"] = sid
+		if req.SMS.Haozhuma.Sid != nil {
+			hz["sid"] = strings.TrimSpace(*req.SMS.Haozhuma.Sid)
+		}
+		if req.SMS.Haozhuma.Author != nil {
+			hz["author"] = strings.TrimSpace(*req.SMS.Haozhuma.Author)
+		}
+		if req.SMS.Haozhuma.UID != nil {
+			hz["uid"] = strings.TrimSpace(*req.SMS.Haozhuma.UID)
+		}
+		if req.SMS.Haozhuma.ISP != nil {
+			hz["isp"] = strings.TrimSpace(*req.SMS.Haozhuma.ISP)
+		}
+		if len(hz) > 0 {
+			sms["haozhuma"] = hz
+			doc["sms"] = sms
+		}
+	}
+	// 鉴权补丁：未提供的字段沿用 config.json 现值，拼出完整凭据后构建
+	// 新客户端并真调一次（login 或 getSummary）。验证通过才落盘 + 热替换；
+	// 失败原样报错、什么都不动——绝不把一个坏 token 存进配置把运行中的
+	// 自动加号搞挂。
+	var haozhumaNewClient *haozhuma.Client
+	if h.haozhumaAuthPatchPresent(req.SMS) {
+		cur := struct {
+			SMS struct {
+				Haozhuma struct {
+					User string `json:"user"`
+					Pass string `json:"pass"`
+					// Token 指针：显式清空 token（改回纯账密模式）合法。
+					Token *string `json:"token"`
+					// 取号参数带上：新客户端要保持当前 author/uid/isp。
+					Author string `json:"author"`
+					UID    string `json:"uid"`
+					ISP    string `json:"isp"`
+				} `json:"haozhuma"`
+			} `json:"sms"`
+		}{}
+		_ = json.Unmarshal(raw, &cur)
+		user, pass := cur.SMS.Haozhuma.User, cur.SMS.Haozhuma.Pass
+		if req.SMS.Haozhuma.User != nil {
+			user = strings.TrimSpace(*req.SMS.Haozhuma.User)
+		}
+		if req.SMS.Haozhuma.Pass != nil {
+			pass = *req.SMS.Haozhuma.Pass
+		}
+		token := ""
+		if cur.SMS.Haozhuma.Token != nil {
+			token = strings.TrimSpace(*cur.SMS.Haozhuma.Token)
+		}
+		if req.SMS.Haozhuma.Token != nil {
+			token = strings.TrimSpace(*req.SMS.Haozhuma.Token)
+		}
+		if user == "" && token == "" {
+			writeJSON(w, 400, map[string]string{"error": "账号与 token 至少要填一个（豪猪 API 凭据）"})
+			return
+		}
+		client, err := h.buildHaozhumaClient(user, pass, token,
+			cur.SMS.Haozhuma.Author, cur.SMS.Haozhuma.UID, cur.SMS.Haozhuma.ISP)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "豪猪凭据验证失败，未保存：" + err.Error()})
+			return
+		}
+		haozhumaNewClient = client
+		// 验证通过：落盘新凭据（pass/token 未提供时保留文件现值）。
+		sms, _ := doc["sms"].(map[string]any)
+		if sms == nil {
+			sms = map[string]any{}
+		}
+		hz, _ := sms["haozhuma"].(map[string]any)
+		if hz == nil {
+			hz = map[string]any{}
+		}
+		hz["user"] = user
+		// pass：显式提供才写（避免把"没填"落成空串清掉现有密码）。
+		if req.SMS.Haozhuma.Pass != nil {
+			hz["pass"] = *req.SMS.Haozhuma.Pass
+		}
+		if user != "" {
+			// 账密模式下 token 由 login 动态持有，不落盘（旧 token 失效后
+			// 会误导排查）。显式清空 = 改回账密优先。
+			hz["token"] = ""
+		} else if req.SMS.Haozhuma.Token != nil {
+			hz["token"] = token
+		}
 		sms["haozhuma"] = hz
 		doc["sms"] = sms
+	}
+	// 任务控制参数（autoenroll 节）：增量合并，只写显式提供的字段。
+	if req.AutoEnrollCfg != nil {
+		ae, _ := doc["autoenroll"].(map[string]any)
+		if ae == nil {
+			ae = map[string]any{}
+		}
+		if req.AutoEnrollCfg.MinBalance != nil {
+			ae["min_balance"] = *req.AutoEnrollCfg.MinBalance
+		}
+		if req.AutoEnrollCfg.ConsecutiveFails != nil {
+			ae["consecutive_fails"] = *req.AutoEnrollCfg.ConsecutiveFails
+		}
+		if req.AutoEnrollCfg.RetryDelaySecs != nil {
+			ae["retry_delay_seconds"] = *req.AutoEnrollCfg.RetryDelaySecs
+		}
+		if len(ae) > 0 {
+			doc["autoenroll"] = ae
+		}
 	}
 	if req.Retention != nil && (req.Retention.Days != nil || req.Retention.Rows != nil) {
 		// 未显式给出的字段沿用文件当前值（增量补丁语义，与 features 一致）。
@@ -1402,6 +1704,73 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 			updated["haozhuma_sid_restart_required"] = true
 		}
 	}
+	// 取号策略热改：author/uid/isp。任一显式提供就整体推一次（UpdateFetchOptions
+	// 是幂等赋值，未变的字段推现值无害）。
+	if req.SMS != nil && (req.SMS.Haozhuma.Author != nil || req.SMS.Haozhuma.UID != nil || req.SMS.Haozhuma.ISP != nil) {
+		if h.cfg.SetHaozhumaFetch != nil {
+			// 基准 = 落盘后的合并值（out），未显式提供的字段自动带现值。
+			var merged struct {
+				SMS struct {
+					Haozhuma struct {
+						Author string `json:"author"`
+						UID    string `json:"uid"`
+						ISP    string `json:"isp"`
+					} `json:"haozhuma"`
+				} `json:"sms"`
+			}
+			_ = json.Unmarshal(out, &merged)
+			h.cfg.SetHaozhumaFetch(merged.SMS.Haozhuma.Author, merged.SMS.Haozhuma.UID, merged.SMS.Haozhuma.ISP)
+			updated["haozhuma_fetch"] = true
+		} else {
+			updated["haozhuma_fetch_restart_required"] = true
+		}
+	}
+	// 鉴权热替换：验证通过的客户端直接换上。AutoEnroll 未组装（启动时
+	// 没配豪猪）时只落盘，重启后生效。
+	if haozhumaNewClient != nil {
+		if h.cfg.ReplaceHaozhumaClient != nil {
+			if err := h.cfg.ReplaceHaozhumaClient(haozhumaNewClient); err != nil {
+				// 理论上到不了这（前面已挡运行态），防御性兜底。
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
+			updated["haozhuma_auth"] = "reconnected"
+		} else {
+			updated["haozhuma_auth"] = "saved"
+			updated["haozhuma_auth_restart_required"] = true
+		}
+	}
+	// 任务控制参数热改：autoenroll 节显式提供的字段即时生效。
+	if req.AutoEnrollCfg != nil {
+		if h.cfg.SetAutoEnrollLimits != nil {
+			// 基准 = 落盘后的合并值，保持"未提供的字段维持现值"。
+			var merged struct {
+				AutoEnroll struct {
+					MinBalance       *float64 `json:"min_balance"`
+					ConsecutiveFails *int     `json:"consecutive_fails"`
+					RetryDelaySecs   *int     `json:"retry_delay_seconds"`
+				} `json:"autoenroll"`
+			}
+			_ = json.Unmarshal(out, &merged)
+			mb, cf := h.cfg.AutoEnroll.Limits()
+			if merged.AutoEnroll.MinBalance != nil {
+				mb = *merged.AutoEnroll.MinBalance
+			}
+			if merged.AutoEnroll.ConsecutiveFails != nil {
+				cf = *merged.AutoEnroll.ConsecutiveFails
+			}
+			h.cfg.SetAutoEnrollLimits(mb, cf)
+			updated["autoenroll_limits"] = map[string]any{"min_balance": mb, "consecutive_fails": cf}
+			if merged.AutoEnroll.RetryDelaySecs != nil {
+				if h.cfg.SetAutoEnrollRetry != nil {
+					h.cfg.SetAutoEnrollRetry(*merged.AutoEnroll.RetryDelaySecs)
+				}
+				updated["autoenroll_retry_seconds"] = *merged.AutoEnroll.RetryDelaySecs
+			}
+		} else {
+			updated["autoenroll_restart_required"] = true
+		}
+	}
 	if req.Retention != nil && (req.Retention.Days != nil || req.Retention.Rows != nil) {
 		cur := struct {
 			Days int `json:"request_log_retention_days"`
@@ -1435,6 +1804,109 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		updated["max_request_body_mib"] = mib
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "updated": updated})
+}
+
+// haozhumaBase 豪猪 API 基址。变量而非常量：测试里指到 fakeHZM。
+var haozhumaBase = "https://api.haozhuma.com/sms/"
+
+// buildHaozhumaClient 按给定凭据构建豪猪客户端并**真调一次**验证可用性：
+//   - 有账密：login 换 token（失败但配了 token 时退回 token 模式，
+//     与 main 启动链同语义）；
+//   - 只有 token：New + Summary 验活。
+//
+// 取号参数（author/uid/isp）原样带上，保证替换后行为不漂移。
+// 返回的客户端已通过至少一次完整调用，可安全交给 ReplaceClient。
+//
+// login 不走 haozhuma.Login（它把真实 Base 写死在构造里）：用
+// NewWithCredentials + Relogin 组合，客户端的 Base 可被测试替换。
+func (h *Handler) buildHaozhumaClient(user, pass, token, author, uid, isp string) (*haozhuma.Client, error) {
+	setup := func(c *haozhuma.Client) *haozhuma.Client {
+		c.Author = strings.TrimSpace(author)
+		c.SetUID(strings.TrimSpace(uid))
+		c.ISP = strings.TrimSpace(isp)
+		return c
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if user != "" && pass != "" {
+		c := haozhuma.NewWithCredentials(token, user, pass)
+		c.Base = haozhumaBase
+		if err := c.Relogin(); err != nil {
+			if token != "" {
+				// login 失败但手里有 token：先让任务能跑（token 可能还有效），
+				// 与 main 的 newHaozhumaClient 同语义。
+				c2 := setup(haozhuma.NewWithCredentials(token, user, pass))
+				c2.Base = haozhumaBase
+				if _, serr := c2.Summary(ctx); serr != nil {
+					return nil, fmt.Errorf("登录失败（%v），且 token 验证也失败（%v）", err, serr)
+				}
+				return setup(c2), nil
+			}
+			return nil, err
+		}
+		return setup(c), nil
+	}
+	if token != "" {
+		c := setup(haozhuma.New(token))
+		c.Base = haozhumaBase
+		if _, serr := c.Summary(ctx); serr != nil {
+			return nil, fmt.Errorf("token 无效：%v", serr)
+		}
+		return c, nil
+	}
+	return nil, errors.New("账号与 token 至少要填一个")
+}
+
+// haozhumaVerify 验证豪猪凭据（WebUI「验证连接」按钮）。不保存、不碰
+// 运行态：构建临时客户端真调一次，把结果原样带回。错误信息走豪猪 client
+// 的脱敏链（redactNetErr），不会把 token 带进日志/响应。
+func (h *Handler) haozhumaVerify(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode  string `json:"mode"`
+		User  string `json:"user"`
+		Pass  string `json:"pass"`
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	user := strings.TrimSpace(req.User)
+	token := strings.TrimSpace(req.Token)
+	if user == "" && token == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号与 token 至少填一个"})
+		return
+	}
+	// 草稿验证不带 author/uid/isp：它们不影响凭据有效性，别让一个填错的
+	// 对接码把"验证连接"也搞失败。
+	c, err := h.buildHaozhumaClient(user, req.Pass, token, "", "", "")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	s, err := c.Summary(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "凭据可用但查询余额失败：" + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "balance": s.Balance, "occupied": s.Occupied})
+}
+
+// haozhumaSummary 账户卡片数据源：余额/占用/本地账本/当前取号配置。
+// 前端手动刷新或慢轮询用（免费接口，但没必要高频打）。
+func (h *Handler) haozhumaSummary(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.AutoEnroll == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用（缺少豪猪配置）"})
+		return
+	}
+	s, err := h.cfg.AutoEnroll.Summary(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, s)
 }
 
 // applyRuntimeUpstreamTimeouts 把超时变更推到 upstream Client。

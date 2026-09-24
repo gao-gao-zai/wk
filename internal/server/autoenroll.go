@@ -61,6 +61,16 @@ type AutoEnroller struct {
 	workers    int
 	// retryDelay 两次尝试之间的间隔（测试里调短）。0 时用默认 5s。
 	retryDelay time.Duration
+	// minBalance 豪猪余额低于此值（元）时不再开始新的取号。只在**收码成功**
+	// 时扣费，所以留出够付一次成功的钱即可；比这更低时收到码也扣不了费，
+	// 白等。0 = 关闭余额保护。启动时从环境变量 AUTO_ENROLL_MIN_BALANCE /
+	// 配置文件 autoenroll.min_balance 初始化（配置文件优先），运行期可经
+	// SetLimits 热改（WebUI「高级设置」）。
+	minBalance float64
+	// consecutiveFails 连续失败熔断阈值。单号收不到码很正常（接收率就是有
+	// 概率），但连续这么多个都失败说明通道坏了或项目被限。失败不扣费，
+	// 阈值主要防"浪费时间"。运行期可经 SetLimits 热改。
+	consecutiveFails int
 	// pollTimeout 单个号等验证码的时长（测试里调短）。0 时用默认 90s。
 	// pollCount > 0 时以次数为准，本字段只作为推导次数的后备。
 	pollTimeout time.Duration
@@ -131,10 +141,10 @@ const (
 	minAttempts = 20
 )
 
-// consecutiveFails 连续失败熔断阈值。单号收不到码很正常（接收率就是有概率），
-// 但连续这么多个都失败说明通道坏了或项目被限，继续跑也出不了结果。
-// 失败不扣费，所以阈值主要防"浪费时间"，可用 AUTO_ENROLL_MAX_CONSECUTIVE 覆盖。
-var consecutiveFails = envInt("AUTO_ENROLL_MAX_CONSECUTIVE", 15)
+// consecutiveFails 连续失败熔断阈值的默认值（AUTO_ENROLL_MAX_CONSECUTIVE
+// 可覆盖）。真正的阈值存在 AutoEnroller.consecutiveFails 实例字段上，
+// 运行期可经 SetLimits 热改。
+var defaultConsecutiveFails = envInt("AUTO_ENROLL_MAX_CONSECUTIVE", 15)
 
 func envInt(key string, def int) int {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -145,11 +155,10 @@ func envInt(key string, def int) int {
 	return def
 }
 
-// minBalance 豪猪余额低于此值（元）时不再开始新的取号。只在**收码成功**时
-// 扣费，所以留出够付一次成功的钱即可；比这更低时收到码也扣不了费，白等。
-// 52283 腾讯项目单价 2.2 元/次，故默认 2.2；0 表示不做余额保护。
-// 可用 AUTO_ENROLL_MIN_BALANCE 覆盖。
-var minBalance = envFloat("AUTO_ENROLL_MIN_BALANCE", 2.2)
+// minBalance 豪猪余额保护阈值的默认值（元）（AUTO_ENROLL_MIN_BALANCE
+// 可覆盖；52283 腾讯项目单价 2.2 元/次）。真正的阈值存在
+// AutoEnroller.minBalance 实例字段上，运行期可经 SetLimits 热改。
+var defaultMinBalance = envFloat("AUTO_ENROLL_MIN_BALANCE", 2.2)
 
 func envFloat(key string, def float64) float64 {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -231,7 +240,62 @@ func NewAutoEnroller(sms *smslogin.Manager, hzm *haozhuma.Client, sid string,
 		// 默认轮询次数可用 AUTO_ENROLL_POLL_COUNT 覆盖（部署级调参），
 		// 单次任务还能再用 poll_count 覆盖它。
 		pollCount: envInt("AUTO_ENROLL_POLL_COUNT", defaultPollCount),
+		// 熔断/余额保护默认值：环境变量兜底（部署级），配置文件
+		// autoenroll.* 与 WebUI SetLimits 优先（main 启动链 + handler）。
+		minBalance:       defaultMinBalance,
+		consecutiveFails: defaultConsecutiveFails,
 	}
+}
+
+// SetLimits 更新余额保护阈值与连续失败熔断阈值（WebUI「高级设置」）。
+// 即时生效：余额检查在下一个 worker 循环按新值判定，熔断计数在下一个
+// 失败时按新阈值比较（已累计的连续失败数不清零——中途调小阈值理应
+// 立刻更容易触发熔断，清零反而把它推迟了）。任务运行中调用安全。
+func (a *AutoEnroller) SetLimits(minBalance float64, consecutiveFails int) {
+	a.mu.Lock()
+	a.minBalance = minBalance
+	a.consecutiveFails = consecutiveFails
+	a.mu.Unlock()
+}
+
+// Limits 返回当前生效的余额保护阈值与熔断阈值（GET config / 状态回显用）。
+func (a *AutoEnroller) Limits() (minBalance float64, consecutiveFails int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.minBalance, a.consecutiveFails
+}
+
+// currentMinBalance / currentConsecutiveFails 是 run 循环的每轮快照读。
+// 单独成函数（而不是直接 a.mu.Lock）是因为 run 的 worker 循环里已有
+// 多处持锁段，抽方法保证读法唯一、不会某天改出双锁死锁。
+func (a *AutoEnroller) currentMinBalance() float64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.minBalance
+}
+
+func (a *AutoEnroller) currentConsecutiveFails() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.consecutiveFails
+}
+
+// SetRetryDelay 更新两次尝试之间的间隔（默认 5s）。0 = 恢复默认。
+func (a *AutoEnroller) SetRetryDelay(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	a.mu.Lock()
+	a.retryDelay = d
+	a.mu.Unlock()
+}
+
+// RetryDelay 返回当前生效的两次尝试间隔（0 = 默认 5s，回显时由调用方
+// 翻译成具体秒数）。
+func (a *AutoEnroller) RetryDelay() time.Duration {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.retryDelay
 }
 
 // currentSid 读取当前项目 ID 快照（mu 保护，与 SetSid 并发安全）。
@@ -323,6 +387,85 @@ func (a *AutoEnroller) Balance(ctx context.Context) (float64, error) {
 	return a.hzm.Balance(ctx)
 }
 
+// EnrollAccountSummary 账户卡片数据：一次调用拿全（WebUI「豪猪账户」卡片，
+// GET /admin/account/sms/haozhuma/summary 的响应体）。
+type EnrollAccountSummary struct {
+	Balance     float64 `json:"balance"`
+	Occupied    int     `json:"occupied"`   // 平台侧占用号数；-1 = 未知
+	HeldLocal   int     `json:"held_local"` // 本地账本"仍占着额度"的号数
+	Sid         string  `json:"sid"`
+	UID         string  `json:"uid"` // 当前钉死的对接码（空 = 平台自动分配）
+	ISP         string  `json:"isp,omitempty"`
+	Author      string  `json:"author,omitempty"`
+	MinBalance  float64 `json:"min_balance"`
+	ConsecFails int     `json:"consecutive_fails"`
+	Running     bool    `json:"running"`
+}
+
+// Summary 账户概览（余额/占用/本地账本/当前取号配置）。hzm 为 nil 时
+// 返回 ErrNotConfigured（理论上不会发生：AutoEnroller 只在有豪猪配置时组装）。
+func (a *AutoEnroller) Summary(ctx context.Context) (EnrollAccountSummary, error) {
+	a.mu.Lock()
+	base := EnrollAccountSummary{
+		HeldLocal:   len(a.held),
+		Sid:         a.sid,
+		MinBalance:  a.minBalance,
+		ConsecFails: a.consecutiveFails,
+		Running:     a.running,
+	}
+	hzm := a.hzm
+	a.mu.Unlock()
+	if hzm == nil {
+		return base, errors.New("豪猪客户端未配置")
+	}
+	s, err := hzm.Summary(ctx)
+	if err != nil {
+		return base, err
+	}
+	base.Balance = s.Balance
+	base.Occupied = s.Occupied
+	base.UID = hzm.UID()
+	base.ISP = hzm.ISP
+	base.Author = hzm.Author
+	return base, nil
+}
+
+// ErrBusyAuth 鉴权更换被拒：任务运行中取号/释放必须同一客户端身份，
+// 换客户端会让在途号码的收码/释放打到新 token 上（新 token 不认识这些号）。
+var ErrBusyAuth = errors.New("自动加号任务运行中不可更换豪猪鉴权，等任务结束后再试")
+
+// ReplaceClient 更换豪猪客户端（WebUI 改鉴权后调用）。
+// 调用方（handler）负责先用新客户端验证（login/getSummary 成功）再替换；
+// 这里只做运行态保护。失败不回滚——调用方验证过才进来，走到这里说明
+// 新客户端至少能通过一次完整调用。
+func (a *AutoEnroller) ReplaceClient(c *haozhuma.Client) error {
+	if c == nil {
+		return errors.New("新客户端为 nil")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrBusyAuth
+	}
+	a.hzm = c
+	return nil
+}
+
+// UpdateFetchOptions 更新取号策略（对接方标识/对接码/运营商优先级）。
+// 任务运行中允许（与 SetSid 同语义）：在途号码按 tryOne 开头快照的旧值
+// 收尾，新取号立刻用新值。
+func (a *AutoEnroller) UpdateFetchOptions(author, uid, isp string) {
+	a.mu.Lock()
+	hzm := a.hzm
+	a.mu.Unlock()
+	if hzm == nil {
+		return
+	}
+	hzm.Author = strings.TrimSpace(author)
+	hzm.SetUID(strings.TrimSpace(uid))
+	hzm.ISP = strings.TrimSpace(isp)
+}
+
 // AutoRunOptions 一次自动加号任务的参数。
 //
 // 零值成员一律取默认值，所以调用方只填用户显式给的部分即可——这样新增参数
@@ -382,6 +525,8 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 		a.mu.Unlock()
 		return errors.New("自动加号已在进行中")
 	}
+	// 快照本次启动检查用的阈值（SetLimits 运行中热改只影响后续轮次）。
+	minBalance := a.minBalance
 	// 开跑前先看余额：不够一次成功就别启动，省得用户以为在跑其实取不到号。
 	if bal, err := a.hzm.Balance(context.Background()); err == nil && bal >= 0 && bal < minBalance {
 		a.mu.Unlock()
@@ -543,11 +688,12 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 				}
 				inflight.Add(1)
 				// 余额检查：所有 worker 都查一遍，代价可忽略（一次 HTTP），
-				// 但能保证钱不够时立刻全停。
-				if minBalance > 0 {
+				// 但能保证钱不够时立刻全停。阈值每轮快照读取——SetLimits
+				// 运行中热改后，下一个循环立刻按新值判定。
+				if mb := a.currentMinBalance(); mb > 0 {
 					bal, err := a.hzm.Balance(ctx)
-					if err == nil && bal >= 0 && bal < minBalance {
-						setStop(fmt.Sprintf("豪猪余额不足（%.2f 元 < %.2f），任务停止。请充值后重跑。", bal, minBalance))
+					if err == nil && bal >= 0 && bal < mb {
+						setStop(fmt.Sprintf("豪猪余额不足（%.2f 元 < %.2f），任务停止。请充值后重跑。", bal, mb))
 						cancel()
 						return
 					}
@@ -617,7 +763,9 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 						a.reloginOnce()
 						continue
 					}
-					if n := consecutive.Add(1); n >= int64(consecutiveFails) {
+					// 熔断阈值同样每轮快照：运行中调小阈值能立刻触发，调大
+					// 立刻放宽（已累计的连续失败数保留）。
+					if n := consecutive.Add(1); n >= int64(a.currentConsecutiveFails()) {
 						setStop(fmt.Sprintf("连续 %d 个号失败（成功 %d/%d），熔断停止。若都是「取号失败」= 对接商没号；若是「未收到验证码」= 对接商号码收不到腾讯短信。失败号不扣费。",
 							n, oks, want))
 						cancel()

@@ -334,21 +334,53 @@ func (e *APIError) TokenInvalid() bool {
 	return strings.Contains(e.Msg, "token") || strings.Contains(e.Msg, "登录")
 }
 
+// Summary 账户概览：余额 + 平台侧当前占用号码数（getSummary）。
+//
+// Occupied 来自响应的 num 字段。语义按"当前占用号数"处理（豪猪后台首页
+// 的"已占用"同源），-1 表示平台未返回/无法解析——前端按"未知"展示，
+// 不要把 -1 当成"0 个占用"。
+type Summary struct {
+	Balance  float64
+	Occupied int
+}
+
 // Balance 返回 getSummary 里的余额（元）。解析失败返回 -1。
+// 内部走 Summary 后取 Balance 字段，保证与 Summary 的解析逻辑不会漂移。
 func (c *Client) Balance(ctx context.Context) (float64, error) {
+	s, err := c.Summary(ctx)
+	return s.Balance, err
+}
+
+func (c *Client) Summary(ctx context.Context) (Summary, error) {
 	raw, err := c.call(ctx, "getSummary", url.Values{"token": {c.Token}})
 	if err != nil {
-		return -1, err
+		return Summary{}, err
 	}
-	s, _ := raw["money"].(string)
-	v, perr := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if perr != nil {
-		if f, ok := raw["money"].(float64); ok {
-			return f, nil
+	s := Summary{Occupied: -1}
+	switch v := raw["money"].(type) {
+	case string:
+		f, perr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if perr != nil {
+			return Summary{Occupied: -1}, fmt.Errorf("余额字段无法解析: %v", raw["money"])
 		}
-		return -1, fmt.Errorf("余额字段无法解析: %v", raw["money"])
+		s.Balance = f
+	case float64:
+		s.Balance = v
+	default:
+		return Summary{Occupied: -1}, fmt.Errorf("余额字段无法解析: %v", raw["money"])
 	}
-	return v, nil
+	// num 可能是数字或数字字符串，两态都接；失败保持 -1（未知）。
+	switch v := raw["num"].(type) {
+	case float64:
+		if v >= 0 {
+			s.Occupied = int(v)
+		}
+	case string:
+		if n, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil && n >= 0 {
+			s.Occupied = n
+		}
+	}
+	return s, nil
 }
 
 func (r Response) IsWaiting() bool { return false }

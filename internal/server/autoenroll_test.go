@@ -201,12 +201,12 @@ func TestAutoEnrollCircuitBreaker(t *testing.T) {
 	if !strings.Contains(st.StopReason, "连续") && !strings.Contains(st.StopReason, "熔断") {
 		t.Fatalf("stop_reason=%q want 熔断", st.StopReason)
 	}
-	// 熔断阈值 consecutiveFails=8，远小于 50*3 的上限。
-	if st.Attempts > consecutiveFails+2 {
+	// 熔断阈值 consecutiveFails=8（实例字段默认值），远小于 50*3 的上限。
+	if st.Attempts > en.consecutiveFails+2 {
 		t.Fatalf("attempts=%d exceeds circuit breaker expectation", st.Attempts)
 	}
 	// 熔断必须真的省下取号：不该跑满 150 次。
-	if n := f.getPhone.Load(); int(n) > consecutiveFails+2 {
+	if n := f.getPhone.Load(); int(n) > en.consecutiveFails+2 {
 		t.Fatalf("getPhone called %d times, circuit breaker did not stop it", n)
 	}
 }
@@ -515,7 +515,7 @@ func TestAutoEnrollConcurrentCircuitBreaker(t *testing.T) {
 		t.Fatalf("concurrent run should stop with a reason, status=%+v", st)
 	}
 	// 并发不会让熔断失效：尝试次数被限制住，不会跑满 50*12。
-	if st.Attempts > consecutiveFails+4*2 {
+	if st.Attempts > en.consecutiveFails+4*2 {
 		t.Fatalf("attempts=%d too high for circuit breaker", st.Attempts)
 	}
 }
@@ -778,10 +778,7 @@ func TestPollCodeReturnsEarlyOnCode(t *testing.T) {
 // 尝试上限生效。这是有意的（通道真坏了就别再抽号），所以本测试显式抬高它
 // 来单独验证 max_attempts。
 func TestMaxAttemptsOverride(t *testing.T) {
-	oldFails := consecutiveFails
-	consecutiveFails = 1000
-	t.Cleanup(func() { consecutiveFails = oldFails })
-
+	// 熔断阈值现在是实例字段（SetLimits），测试直接改字段即可。
 	f := newFakeHZM(t)
 	// 取号一直失败（可重试，非致命），任务会一直重试到上限。
 	f.phoneResp.Store(`{"code":"-1","msg":"没有取到号码，请重新尝试"}`)
@@ -789,6 +786,7 @@ func TestMaxAttemptsOverride(t *testing.T) {
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
 		nil,
 		nil)
+	en.consecutiveFails = 1000
 	en.retryDelay = time.Millisecond
 	// 目标 1 个，默认上限是 max(20, 1*12) = 20；放宽到 35 应该真的跑 35 次。
 	if err := en.AutoRunWith(AutoRunOptions{Want: 1, Workers: 1, MaxAttempts: 35}); err != nil {
@@ -813,15 +811,16 @@ func TestCircuitBreakerStillCapsRaisedAttempts(t *testing.T) {
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
 		nil,
 		nil)
+	en.consecutiveFails = 15 // 显式钉住默认值，避免环境变量干扰断言
 	en.retryDelay = time.Millisecond
 	if err := en.AutoRunWith(AutoRunOptions{Want: 1, Workers: 1, MaxAttempts: 500}); err != nil {
 		t.Fatal(err)
 	}
 	waitDone(t, en)
 	st := en.Status()
-	if st.Attempts > consecutiveFails+2 {
+	if st.Attempts > en.consecutiveFails+2 {
 		t.Fatalf("attempts=%d — circuit breaker must cap a raised max_attempts (%d)",
-			st.Attempts, consecutiveFails)
+			st.Attempts, en.consecutiveFails)
 	}
 	if st.StopReason == "" {
 		t.Fatal("circuit breaker should record a stop reason")
@@ -1280,4 +1279,137 @@ func waitDone(t *testing.T, en *AutoEnroller) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("auto-enroll did not finish in 30s")
+}
+
+// —— WebUI 高级设置支撑：SetLimits / Summary / ReplaceClient / UpdateFetchOptions ——
+
+// TestSetLimitsImmediate 运行中 SetLimits 调高余额阈值，下一个 worker 循环
+// 必须按新值停（热改即时生效，不是下次任务才生效）。
+func TestSetLimitsImmediate(t *testing.T) {
+	f := newFakeHZM(t)
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
+		nil)
+	en.retryDelay = time.Millisecond
+	// 取号一直可重试地失败：任务不会自然结束，靠余额阈值热改来停。
+	f.phoneResp.Store(`{"code":"-1","msg":"没有取到号码，请重新尝试"}`)
+	en.consecutiveFails = 100000 // 关掉熔断，让余额检查成为唯一出口
+
+	if err := en.AutoRunWith(AutoRunOptions{Want: 5, Workers: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// 余额 10.00 元；把阈值调到 10 以上，下一个循环就该停。
+	en.SetLimits(20.0, 100000)
+	waitDone(t, en)
+	st := en.Status()
+	if st.Running {
+		t.Fatal("task still running after min-balance raised")
+	}
+	if !strings.Contains(st.StopReason, "余额不足") {
+		t.Fatalf("stop_reason=%q want 余额不足", st.StopReason)
+	}
+}
+
+// TestLimitsRoundTrip SetLimits 后 Limits 应回显新值。
+func TestLimitsRoundTrip(t *testing.T) {
+	f := newFakeHZM(t)
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
+		nil)
+	en.SetLimits(7.5, 30)
+	mb, cf := en.Limits()
+	if mb != 7.5 || cf != 30 {
+		t.Fatalf("Limits()=(%v,%v), want (7.5,30)", mb, cf)
+	}
+}
+
+// TestSummaryParsesNum fakeHZM 的 getSummary 带 num 字段时，AutoEnroller.Summary
+// 要把余额与占用数都带回；不带 num 时 Occupied=-1（未知≠0）。
+func TestSummaryParsesNum(t *testing.T) {
+	f := newFakeHZM(t)
+	f.summary.Store(`{"code":"0","msg":"ok","money":"58.20","num":3}`)
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
+		nil)
+	s, err := en.Summary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Balance != 58.20 {
+		t.Fatalf("balance=%v want 58.20", s.Balance)
+	}
+	if s.Occupied != 3 {
+		t.Fatalf("occupied=%d want 3", s.Occupied)
+	}
+	if s.Sid != "52283" {
+		t.Fatalf("sid=%q want 52283", s.Sid)
+	}
+	// 无 num：-1（未知），不能当 0。
+	f.summary.Store(`{"code":"0","msg":"ok","money":"58.20"}`)
+	s, err = en.Summary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Occupied != -1 {
+		t.Fatalf("occupied=%d want -1 (unknown)", s.Occupied)
+	}
+}
+
+// TestReplaceClientBusy 任务运行中拒绝换客户端；空闲时替换后 Balance 走新端。
+func TestReplaceClientBusy(t *testing.T) {
+	f1 := newFakeHZM(t)
+	f2 := newFakeHZM(t)
+	en := NewAutoEnroller(noSMSManager(), f1.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
+		nil)
+	en.retryDelay = time.Millisecond
+	// 取号一直可重试地失败，让任务挂着不结束。
+	f1.phoneResp.Store(`{"code":"-1","msg":"没有取到号码，请重新尝试"}`)
+	f1.summary.Store(`{"code":"0","msg":"ok","money":"10.00"}`)
+	f2.summary.Store(`{"code":"0","msg":"ok","money":"99.00"}`)
+	en.consecutiveFails = 100000
+
+	if err := en.AutoRunWith(AutoRunOptions{Want: 3, Workers: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := en.ReplaceClient(f2.client()); err == nil {
+		t.Fatal("ReplaceClient must be rejected while running")
+	}
+	en.Stop("test")
+	waitDone(t, en)
+
+	// 空闲时替换成功，且余额走新客户端。
+	if err := en.ReplaceClient(f2.client()); err != nil {
+		t.Fatal(err)
+	}
+	bal, err := en.Balance(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bal != 99.00 {
+		t.Fatalf("balance=%v want 99.00 (new client)", bal)
+	}
+}
+
+// TestUpdateFetchOptions 热改取号参数：Author/ISP 即时生效，UID 走 SetUID 语义。
+func TestUpdateFetchOptions(t *testing.T) {
+	f := newFakeHZM(t)
+	c := f.client()
+	en := NewAutoEnroller(noSMSManager(), c, "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil,
+		nil)
+	en.UpdateFetchOptions("someone", "52283-ABC123", "2,1")
+	if c.Author != "someone" || c.ISP != "2,1" || c.UID() != "52283-ABC123" {
+		t.Fatalf("author=%q isp=%q uid=%q", c.Author, c.ISP, c.UID())
+	}
+	// 清空 uid = 退回平台自动分配。
+	en.UpdateFetchOptions("", "", "")
+	if c.UID() != "" {
+		t.Fatalf("uid=%q want empty", c.UID())
+	}
 }
