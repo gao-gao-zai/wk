@@ -43,17 +43,39 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
   const searchTimer = useRef(null);
 
   // —— 对接码列表（H5 type=8 代理，按选中的项目 sid 拉取） ——
+  // 注意：type=8 只认 16 位 hex 项目标识（type=30 返回的 sid），不认
+  // 数字项目 ID（实测 61904 → "没有数据"，hex → 正常返回）。表单里存
+  // 的是数字 ID（写入配置用），映射关系记在 hexSidMap。
+  const [hexSidMap, setHexSidMap] = useState({}); // 数字ID → hex sid
   const [uidItems, setUidItems] = useState(null); // null=未加载（手填态），[]=已加载无数据
   const [uidLoading, setUidLoading] = useState(false);
   const [uidError, setUidError] = useState('');
 
-  // 选中项目后加载对接码列表。
-  const loadUIDs = async (sid) => {
-    if (!h5Ready || !sid) return;
+  // 选中项目后加载对接码列表。参数是数字项目 ID（表单值）。
+  const loadUIDs = async (projectId) => {
+    if (!h5Ready || !projectId) return;
+    const hexSid = hexSidMap[projectId];
+    if (!hexSid) {
+      // 没有映射（手填的项目 ID / 映射丢失）：先搜索该 ID 拿 hex sid。
+      try {
+        const resp = await api(`/admin/account/sms/haozhuma/projects?q=${encodeURIComponent(projectId)}`);
+        const hit = (resp.projects || []).find(p => p.project_id === projectId);
+        if (!hit) { setUidItems(null); return; }
+        setHexSidMap(current => ({ ...current, [projectId]: hit.sid }));
+        loadUIDsByHex(hit.sid);
+      } catch {
+        setUidItems(null); // 搜不到就保持手填
+      }
+      return;
+    }
+    loadUIDsByHex(hexSid);
+  };
+
+  const loadUIDsByHex = async (hexSid) => {
     setUidLoading(true);
     setUidError('');
     try {
-      const resp = await api(`/admin/account/sms/haozhuma/uids?sid=${encodeURIComponent(sid)}`);
+      const resp = await api(`/admin/account/sms/haozhuma/uids?sid=${encodeURIComponent(hexSid)}`);
       setUidItems(resp.uids || []);
     } catch (err) {
       setUidError(err.message);
@@ -80,9 +102,10 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       setProjectOptions([]);
       setSearched(false);
       setSearchError('');
+      setHexSidMap({});
       setUidItems(null);
       setUidError('');
-      // 已有 sid 且 H5 可用：自动拉一次对接码列表。
+      // 已有 sid 且 H5 可用：自动拉一次对接码列表（内部会先搜索补映射）。
       if (h5Ready && hz.sid) loadUIDs(hz.sid);
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }
@@ -95,7 +118,15 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
     setSearchError('');
     try {
       const resp = await api(`/admin/account/sms/haozhuma/projects?q=${encodeURIComponent(q)}`);
-      setProjectOptions(resp.projects || []);
+      const projects = resp.projects || [];
+      setProjectOptions(projects);
+      // 记录 数字ID → hex sid 映射（对接码列表只认 hex，实测数字 ID
+      // 返回"没有数据"）。
+      setHexSidMap(current => {
+        const next = { ...current };
+        projects.forEach(p => { if (p.project_id) next[p.project_id] = p.sid; });
+        return next;
+      });
       setSearched(true);
     } catch (err) {
       setSearchError(err.message);
