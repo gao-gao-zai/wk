@@ -184,6 +184,11 @@ type Config struct {
 		ConsecutiveFails *int `json:"consecutive_fails"`
 		// RetryDelaySeconds 两次取号尝试之间的间隔（秒）。
 		RetryDelaySeconds *int `json:"retry_delay_seconds"`
+		// Watch 对接码监控 + 额度化自动加号（UID Watcher，2026-09）。
+		// 字段校验/默认值见 internal/server.WatchConfig；这里只承载
+		// JSON 结构（Enable 与项目列表校验在 handler PUT 入口做，
+		// 启动时宽松加载——坏配置只影响 watcher 不该挡服务启动）。
+		Watch WatchJSON `json:"watch"`
 	} `json:"autoenroll"`
 
 	// ReqProxy 实际请求账号的代理池（新模块，与 sms.proxy 的注册代理完全独立）。
@@ -636,6 +641,28 @@ func (c *Config) normalize() error {
 		c.PprofAddr = addr
 	}
 	return nil
+}
+
+// WatchJSON config.json 里 autoenroll.watch 节的 JSON 结构。
+// 与 server.WatchConfig 字段一致但独立声明：cmd/server 不 import
+// internal/server（保持 main 的依赖面干净），main 加载后翻译过去。
+type WatchJSON struct {
+	Enabled         bool             `json:"enabled"`
+	IntervalSeconds int              `json:"interval_seconds"`
+	WantPerTrigger  int              `json:"want_per_trigger"`
+	Workers         int              `json:"workers"`
+	Groups          []string         `json:"groups"`
+	Projects        []WatchProjectJSON `json:"projects"`
+}
+
+// WatchProjectJSON 单个监控项目（同上，翻译用）。
+type WatchProjectJSON struct {
+	Sid      string  `json:"sid"`
+	HexSID   string  `json:"hex_sid"`
+	Name     string  `json:"name"`
+	MaxPrice float64 `json:"max_price"`
+	MinStock int     `json:"min_stock"`
+	Enabled  bool    `json:"enabled"`
 }
 
 func validCreditRate(value float64) float64 {

@@ -517,6 +517,20 @@ func main() {
 		log.Printf("haozhuma H5 增强已启用（PHPSESSID 已配置，7 天自动保活）")
 	}
 
+	// 对接码监控（UID Watcher，可选）：autoenroll.watch 配置 + 豪猪 H5 +
+	// AutoEnroll 三者齐备才组装。状态文件在 state.json 同目录（卷内，
+	// 额度/per-uid 基线重启不丢）。
+	if wc := watchConfigFrom(cfg); h.AutoEnroller() != nil && h.H5Client() != nil {
+		watcher := server.NewUIDWatcher(wc, h.H5Client(), h.AutoEnroller(),
+			filepath.Join(filepath.Dir(cfg.StateFile), "watcher-state.json"))
+		watcher.SetLogf(h.AutoEnroller().AppendLog)
+		h.SetUIDWatcher(watcher)
+		if wc.Enabled {
+			log.Printf("uid-watcher: 对接码监控已启用（%d 个项目，间隔 %ds）",
+				len(wc.Projects), wc.IntervalSeconds)
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	// 补释放上次进程非正常结束时遗留的号码。放在开始服务之前：容器重启是
@@ -546,6 +560,12 @@ func main() {
 	go sch.RunCreditRefreshNow()
 	go sch.RunRequestCreditRefreshNow()
 	go sch.Run(ctx)
+
+	// 对接码监控值班循环（常驻模型：Start 幂等拉起，enabled 由配置控制
+	// tick 是否派活——WebUI 开关切换即时生效，无需重启进程）。
+	if w := h.UIDWatcher(); w != nil {
+		w.Start()
+	}
 
 	// pprof 性能分析端点（默认关，见 config.Pprof 注释：无鉴权，只允许绑回环）。
 	// CPU profile 会带来 ~几% 开销，heap/goroutine 基本零成本——平时不开，
@@ -679,6 +699,36 @@ func autoEnrollLedgerPath(cfg *Config) string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(sf), "autoenroll-held.json")
+}
+
+// watchConfigFrom 把 config.json 的 autoenroll.watch（WatchJSON）翻译成
+// server.WatchConfig。启动路径宽松：非法字段直接丢弃（监控配置坏了不该
+// 挡服务启动），PUT /watch 入口有严格校验兜底。
+func watchConfigFrom(cfg *Config) server.WatchConfig {
+	out := server.WatchConfig{
+		Enabled:         cfg.AutoEnroll.Watch.Enabled,
+		IntervalSeconds: cfg.AutoEnroll.Watch.IntervalSeconds,
+		WantPerTrigger:  cfg.AutoEnroll.Watch.WantPerTrigger,
+		Workers:         cfg.AutoEnroll.Watch.Workers,
+		Groups:          cfg.AutoEnroll.Watch.Groups,
+	}
+	for _, p := range cfg.AutoEnroll.Watch.Projects {
+		sid := strings.TrimSpace(p.Sid)
+		hex := strings.TrimSpace(p.HexSID)
+		if sid == "" || hex == "" || p.MaxPrice <= 0 || p.MinStock < 1 {
+			log.Printf("uid-watcher: 跳过非法监控项目 %q（sid/hex_sid/价格/库存校验不过）", p.Name)
+			continue
+		}
+		out.Projects = append(out.Projects, server.WatchProject{
+			Sid:      sid,
+			HexSID:   hex,
+			Name:     strings.TrimSpace(p.Name),
+			MaxPrice: p.MaxPrice,
+			MinStock: p.MinStock,
+			Enabled:  p.Enabled,
+		})
+	}
+	return out
 }
 
 // ledgerStoreAdapter 把 statestore 的台账方法适配成 server.GrowthLedgerStore。

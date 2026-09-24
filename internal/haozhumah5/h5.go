@@ -446,6 +446,19 @@ func (c *Client) InvalidateMyUIDs() {
 	c.cacheMu.Unlock()
 }
 
+// InvalidateUIDLists 清空对接码列表缓存（type=8）。UIDWatcher 每轮拉
+// 表前调用：它的间隔（≥60s）可以短于通用缓存 TTL（5 分钟），且监控
+// 语义就是"看最新的库存/价格"，旧缓存只会制造假事件。
+func (c *Client) InvalidateUIDLists() {
+	c.cacheMu.Lock()
+	for k := range c.cache {
+		if strings.HasPrefix(k, "8:") {
+			delete(c.cache, k)
+		}
+	}
+	c.cacheMu.Unlock()
+}
+
 // ---- 内部：缓存值类型（避免 any 里存指针再解引用的类型断言噪音） ----
 
 type projects []Project

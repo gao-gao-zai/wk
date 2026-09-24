@@ -9,6 +9,7 @@ import {
 } from '@ant-design/icons';
 
 import AutoEnrollAdvanced from './AutoEnrollAdvanced';
+import WatchCard from './WatchCard';
 
 const { Text, Paragraph } = Typography;
 
@@ -535,6 +536,9 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
       {status?.stop_reason && (
         <Alert type="warning" showIcon message="任务终止原因" description={status.stop_reason} />
       )}
+
+      {/* —— 卡片③ 监控加号（H5 已配置才显示；值班员盯对接码市场） —— */}
+      <WatchCard api={api} h5Ready={!!(hz.h5 && hz.h5.has && !hz.h5.expired)} />
 
       {/* —— 卡片④ 运行日志 —— */}
       <Card

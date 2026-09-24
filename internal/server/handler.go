@@ -95,6 +95,12 @@ type Config struct {
 	SetRequestLogRetention func(days, rows int)
 	// AutoEnroll 豪猪自动加号（NewHandler 内部组装）。nil = 未启用该端点。
 	AutoEnroll *AutoEnroller
+	// UIDWatcher 对接码监控值班员（main 组装后注入；与 AutoEnroll 共享
+	// 加号链路）。nil = 未启用监控（GET /watch 回 503）。
+	UIDWatcher *UIDWatcher
+	// WatchStatePath watcher 状态文件路径（main 从 state.json 目录推导；
+	// watcher 持久化额度/per-uid 基线用）。
+	WatchStatePath string
 	// AutoEnrollLedger 号码账本落盘路径。号码取走后会占住豪猪的并发额度，
 	// 额度满了后续取号全部失败（报"余额不足,请释放拉黑后再取号"）。落盘后
 	// 容器被 SIGKILL 重启也能在下次启动时补释放（见 ReclaimOrphans）。
@@ -359,6 +365,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/uids", h.withFrontend(h.haozhumaUIDs))
 	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/add-uid", h.withFrontend(h.haozhumaAddUID))
 	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/my-uids", h.withFrontend(h.haozhumaMyUIDs))
+	// 对接码监控 + 额度化自动加号（UID Watcher）。UIDWatcher 为 nil（豪猪
+	// H5 或自动加号未配置）时 GET 返回 503 语义的可用性标记。
+	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/watch", h.withFrontend(h.haozhumaWatchGet))
+	h.mux.HandleFunc("PUT /admin/account/sms/haozhuma/watch", h.withFrontend(h.haozhumaWatchPut))
+	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/watch/budget", h.withFrontend(h.haozhumaWatchBudget))
 	h.mux.HandleFunc("GET /admin/proxy/status", h.withFrontend(h.proxyStatus))
 	// 请求代理模块（reqproxy）：与上面的登录代理池完全独立的新命名空间。
 	h.mux.HandleFunc("GET /admin/reqproxy/config", h.withFrontend(h.reqproxyConfigGet))
@@ -558,6 +569,21 @@ func (h *Handler) SetHaozhumaH5(c *haozhumah5.Client) {
 	// 顺便接上 SetHaozhumaH5Session：main 不需要单独注入，这里与
 	// SetHaozhumaSid 的自接线模式一致。
 	h.cfg.SetHaozhumaH5Session = c.Session
+}
+
+// H5Client 返回注入的 H5 客户端（main 组装 UIDWatcher 用；nil = 未配置）。
+func (h *Handler) H5Client() *haozhumah5.Client {
+	return h.cfg.HaozhumaH5
+}
+
+// SetUIDWatcher main 组装监控值班员后注入。
+func (h *Handler) SetUIDWatcher(w *UIDWatcher) {
+	h.cfg.UIDWatcher = w
+}
+
+// UIDWatcher 返回监控值班员（nil = 未组装）。
+func (h *Handler) UIDWatcher() *UIDWatcher {
+	return h.cfg.UIDWatcher
 }
 
 func (h *Handler) staticConsole() http.Handler {
@@ -2270,6 +2296,143 @@ func writeH5Error(w http.ResponseWriter, err error) {
 	default:
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 	}
+}
+
+// ---- 对接码监控（UID Watcher）----
+
+// haozhumaWatchGet GET /admin/account/sms/haozhuma/watch：配置 + 状态 +
+// 最近日志。watcher 未组装（豪猪 H5 或自动加号缺失）时回 503 + 原因，
+// 前端显示"监控不可用"而不是空白。
+func (h *Handler) haozhumaWatchGet(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.UIDWatcher == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":     "监控不可用：需配置豪猪接码账号并粘贴 H5 会话",
+			"available": false,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, h.cfg.UIDWatcher.Status())
+}
+
+// haozhumaWatchPut PUT /admin/account/sms/haozhuma/watch：整体更新监控
+// 配置。校验（WatchConfig.Validate）→ 落盘 config.json（autoenroll.watch
+// 节整体替换）→ 热生效（Reconfigure 重建 ticker）。
+func (h *Handler) haozhumaWatchPut(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.UIDWatcher == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":     "监控不可用：需配置豪猪接码账号并粘贴 H5 会话",
+			"available": false,
+		})
+		return
+	}
+	var req WatchConfig
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16384)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	clean, err := req.Validate()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	// 分组存在性（与手动启动同一规则：启动时校验比成功后失败好）。
+	if h.cfg.Groups != nil && len(clean.Groups) > 0 {
+		known := map[string]bool{}
+		for _, g := range h.cfg.Groups.List() {
+			known[g] = true
+		}
+		for _, g := range clean.Groups {
+			if !known[g] {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "分组 " + g + " 不存在"})
+				return
+			}
+		}
+	}
+	// 落盘：config.json 的 autoenroll.watch 整体替换（configMu 互斥，
+	// 与 saveAdminConfig 同一原子写链）。
+	if err := h.persistWatchConfig(clean); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败：" + err.Error()})
+		return
+	}
+	h.cfg.UIDWatcher.Reconfigure(clean)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "watch": h.cfg.UIDWatcher.Status()})
+}
+
+// haozhumaWatchBudget POST /admin/account/sms/haozhuma/watch/budget：
+// {add: 10} 充值 或 {set: 5} 重置。充值会清除"额度耗尽"暂停。
+func (h *Handler) haozhumaWatchBudget(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.UIDWatcher == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":     "监控不可用：需配置豪猪接码账号并粘贴 H5 会话",
+			"available": false,
+		})
+		return
+	}
+	var req struct {
+		Add *float64 `json:"add"`
+		Set *float64 `json:"set"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 512)).Decode(&req); err != nil || (req.Add == nil && req.Set == nil) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求需带 add（充值金额）或 set（重置额度）"})
+		return
+	}
+	rem, err := h.cfg.UIDWatcher.AddBudget(derefFloat(req.Add), req.Set)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "budget_remaining": rem})
+}
+
+func derefFloat(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// persistWatchConfig 把监控配置写进 config.json 的 autoenroll.watch 节。
+func (h *Handler) persistWatchConfig(cfg WatchConfig) error {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if h.cfg.ConfigPath == "" {
+		return errors.New("config 路径未配置（内存模式不支持持久化）")
+	}
+	raw, err := os.ReadFile(h.cfg.ConfigPath)
+	if err != nil {
+		return err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	ae, _ := doc["autoenroll"].(map[string]any)
+	if ae == nil {
+		ae = map[string]any{}
+	}
+	// 翻译成 JSON 形态（projects 的 null → []，避免 config 里出现 null）。
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	if err := enc.Encode(cfg); err != nil {
+		return err
+	}
+	var watchDoc map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &watchDoc); err != nil {
+		return err
+	}
+	if watchDoc["projects"] == nil {
+		watchDoc["projects"] = []any{}
+	}
+	if watchDoc["groups"] == nil {
+		watchDoc["groups"] = []any{}
+	}
+	ae["watch"] = watchDoc
+	doc["autoenroll"] = ae
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600)
 }
 
 // persistHaozhumaH5Session 把 h5_session 写进 config.json（复用 admin 配置

@@ -492,6 +492,20 @@ func (a *AutoEnroller) UpdateFetchOptions(author, uid string, uids []string, isp
 	hzm.ISP = strings.TrimSpace(isp)
 }
 
+// FetchSnapshot 当前取号参数快照（sid/author/单码/轮换池/isp）。
+// UIDWatcher 派活前快照、收工后恢复用——参数是"用户配置的资产"，
+// 值班轮临时覆盖必须原样还回来。
+func (a *AutoEnroller) FetchSnapshot() (sid, author, uid string, uids []string, isp string) {
+	a.mu.Lock()
+	hzm := a.hzm
+	sid = a.sid
+	a.mu.Unlock()
+	if hzm == nil {
+		return sid, "", "", nil, ""
+	}
+	return sid, hzm.Author, hzm.UID(), hzm.UIDs(), hzm.ISP
+}
+
 // AutoRunOptions 一次自动加号任务的参数。
 //
 // 零值成员一律取默认值，所以调用方只填用户显式给的部分即可——这样新增参数
