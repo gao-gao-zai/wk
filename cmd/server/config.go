@@ -161,6 +161,10 @@ type Config struct {
 			// ISP 取号运营商优先级：1=移动 2=联通 3=电信，逗号分隔依次降级，
 			// 最后自动退回"不限"。留空表示直接不限。
 			ISP string `json:"isp"`
+			// H5Session 豪猪网页版（h5.haozhuma.com）的 PHPSESSID Cookie。
+			// 只服务 WebUI 的项目搜索/对接码选择增强（P1）；未配置时选择器
+			// 退化为手填。与接码 API 的 token 无关，失效不影响任务链路。
+			H5Session string `json:"h5_session"`
 		} `json:"haozhuma"`
 	} `json:"sms"`
 

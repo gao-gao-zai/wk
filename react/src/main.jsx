@@ -1048,6 +1048,7 @@ function Console() {
               <AutoEnrollPage
                 api={api}
                 config={config}
+                refreshConfig={refresh}
                 onSaveHaozhuma={saveHaozhuma}
                 onSaveAutoEnroll={saveAutoEnroll}
                 onToggleGrowthTasks={checked => saveScheduleToggle('autoenroll_growth_tasks', checked)}

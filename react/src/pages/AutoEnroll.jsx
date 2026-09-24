@@ -60,7 +60,7 @@ function authSummary(auth) {
  * 布局四块（视觉设计文档 §1）：账户卡片 → 启动卡片（含统计条）→ 告警 → 日志。
  * 高级设置是 Drawer（AutoEnrollAdvanced），不在本文件。
  */
-export default function AutoEnroll({ api, config, onSaveHaozhuma, onSaveAutoEnroll, onToggleGrowthTasks }) {
+export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma, onSaveAutoEnroll, onToggleGrowthTasks }) {
   const hz = config.sms?.haozhuma || {};
   const auth = hz.auth || { mode: 'none' };
   const autoenrollCfg = config.autoenroll || {};
@@ -369,9 +369,11 @@ export default function AutoEnroll({ api, config, onSaveHaozhuma, onSaveAutoEnro
               <AuthPanel
                 api={api}
                 auth={auth}
+                h5={hz.h5}
                 running={running}
                 onSaveHaozhuma={onSaveHaozhuma}
                 onSaved={() => { loadSummary(); }}
+                onH5Saved={() => { refreshConfig?.(); }}
               />
             ),
           }]}
@@ -591,8 +593,10 @@ export default function AutoEnroll({ api, config, onSaveHaozhuma, onSaveAutoEnro
  *   - [保存并重连]：inline confirm（按钮原地变确认），onSaveHaozhuma 落盘
  *     并触发后端 ReplaceClient；失败 Alert 顶部常驻（回滚由后端保证）
  *   - 密码/token 框：已保存时留空 = 不修改（placeholder 说明）
+ *   - H5 会话（P1 增强）：粘贴 PHPSESSID 解锁项目搜索/对接码选择。
+ *     后端验证通过才落盘；失效（410）提示重贴。
  */
-function AuthPanel({ api, auth, running, onSaveHaozhuma, onSaved }) {
+function AuthPanel({ api, auth, h5, running, onSaveHaozhuma, onSaved, onH5Saved }) {
   const [mode, setMode] = useState(auth.mode === 'token' ? 'token' : 'userpass');
   const [userDraft, setUserDraft] = useState('');
   const [passDraft, setPassDraft] = useState('');
@@ -602,6 +606,49 @@ function AuthPanel({ api, auth, running, onSaveHaozhuma, onSaved }) {
   const [confirming, setConfirming] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState('');
+
+  const [h5Draft, setH5Draft] = useState('');
+  const [h5Saving, setH5Saving] = useState(false);
+
+  const h5Has = h5?.has === true;
+  const h5Expired = h5?.expired === true;
+
+  const pasteH5 = async () => {
+    const session = h5Draft.trim();
+    if (!session) { message.info('先粘贴 PHPSESSID（浏览器 F12 → 应用 → Cookie）'); return; }
+    setH5Saving(true);
+    try {
+      await api('/admin/account/sms/haozhuma/h5-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session }),
+      });
+      message.success('会话已保存，项目搜索/对接码选择已解锁');
+      setH5Draft('');
+      onH5Saved?.();
+    } catch (err) {
+      message.error(err.message);
+    } finally {
+      setH5Saving(false);
+    }
+  };
+
+  const clearH5 = async () => {
+    setH5Saving(true);
+    try {
+      await api('/admin/account/sms/haozhuma/h5-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: '' }),
+      });
+      message.success('H5 会话已清空，选择器退化为手填');
+      onH5Saved?.();
+    } catch (err) {
+      message.error(err.message);
+    } finally {
+      setH5Saving(false);
+    }
+  };
 
   const verify = async () => {
     setVerifying(true);
@@ -742,6 +789,34 @@ function AuthPanel({ api, auth, running, onSaveHaozhuma, onSaved }) {
       <Text type="secondary" style={{ fontSize: 12 }}>
         账密模式 token 失效可自动重登；只填 token 则失效后需手动更新。
         豪猪 API 账密在豪猪网页后台左侧「API」处获取。
+      </Text>
+
+      <Divider style={{ margin: '4px 0' }} plain />
+      <Space wrap size={12} align="center">
+        <Text type="secondary">H5 增强（项目搜索/对接码选择）</Text>
+        {h5Expired
+          ? <Tag color="red">会话已失效，请重贴</Tag>
+          : h5Has
+            ? <Tag color="green">已启用</Tag>
+            : <Tag>未配置</Tag>}
+        <Input.Password
+          value={h5Draft}
+          onChange={e => setH5Draft(e.target.value)}
+          placeholder={h5Has ? '粘贴新 PHPSESSID 覆盖' : '浏览器登录 h5.haozhuma.com 后 F12 复制 PHPSESSID'}
+          style={{ width: 340 }}
+          disabled={h5Saving}
+          visibilityToggle={false}
+        />
+        <Button loading={h5Saving} onClick={pasteH5}>保存会话</Button>
+        {h5Has && (
+          <Popconfirm title="清空 H5 会话？项目/对接码选择器将退化为手填。" onConfirm={clearH5}>
+            <Button danger type="text" loading={h5Saving}>清空</Button>
+          </Popconfirm>
+        )}
+      </Space>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        一次性操作：豪猪网页版登录后按 F12 → 应用/存储 → Cookie → 复制 PHPSESSID 的值粘到这里。
+        后端每 7 天自动保活（官方有效期 10 天滑动）。该会话只用于选择器数据源，与接码任务链路无关。
       </Text>
     </Space>
   );

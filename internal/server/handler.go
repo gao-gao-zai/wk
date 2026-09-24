@@ -29,6 +29,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
+	"workbuddy2api/internal/haozhumah5"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/reqproxy"
 	"workbuddy2api/internal/scheduler"
@@ -75,6 +76,14 @@ type Config struct {
 	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘
 	//（重启后生效）。
 	ReplaceHaozhumaClient func(c *haozhuma.Client) error
+	// HaozhumaH5 豪猪网页版只读客户端（可选，P1 增强）。main 在
+	// sms.haozhuma.h5_session 非空时创建并注入；nil = 未启用，项目搜索/
+	// 对接码选择端点返回 503，前端退化为手填。会话可随时热贴
+	//（SetHaozhumaH5Session），与任务链路完全无关。
+	HaozhumaH5 *haozhumah5.Client
+	// SetHaozhumaH5Session 运行时粘贴/清空 PHPSESSID。main 注入（指向
+	// HaozhumaH5.Session）；未注入时粘贴只落盘（重启后生效）。
+	SetHaozhumaH5Session func(session string)
 	// SetAutoEnrollLimits 运行时更新自动加号任务控制参数（余额阈值/熔断）。
 	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘。
 	SetAutoEnrollLimits func(minBalance float64, consecutiveFails int)
@@ -343,6 +352,11 @@ func NewHandler(cfg Config) *Handler {
 	// 豪猪凭据验证（不保存）+ 账户概览（余额/占用/账本）。
 	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/verify", h.withFrontend(h.haozhumaVerify))
 	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/summary", h.withFrontend(h.haozhumaSummary))
+	// 豪猪 H5 增强（P1，可选）：粘贴 PHPSESSID / 项目搜索 / 对接码列表。
+	// HaozhumaH5 为 nil 时三个端点统一 503（前端退化为手填模式）。
+	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/h5-session", h.withFrontend(h.haozhumaH5Session))
+	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/projects", h.withFrontend(h.haozhumaProjects))
+	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/uids", h.withFrontend(h.haozhumaUIDs))
 	h.mux.HandleFunc("GET /admin/proxy/status", h.withFrontend(h.proxyStatus))
 	// 请求代理模块（reqproxy）：与上面的登录代理池完全独立的新命名空间。
 	h.mux.HandleFunc("GET /admin/reqproxy/config", h.withFrontend(h.reqproxyConfigGet))
@@ -482,6 +496,15 @@ var (
 // main 需要在开始服务前调用 ReclaimOrphans 补释放上次遗留的号码。
 func (h *Handler) AutoEnroller() *AutoEnroller {
 	return h.cfg.AutoEnroll
+}
+
+// SetHaozhumaH5 main 启动时注入 H5 只读客户端（h5_session 已配置的
+// 部署）。main 专属：粘贴/热更走 haozhumaH5Session 端点内联处理。
+func (h *Handler) SetHaozhumaH5(c *haozhumah5.Client) {
+	h.cfg.HaozhumaH5 = c
+	// 顺便接上 SetHaozhumaH5Session：main 不需要单独注入，这里与
+	// SetHaozhumaSid 的自接线模式一致。
+	h.cfg.SetHaozhumaH5Session = c.Session
 }
 
 func (h *Handler) staticConsole() http.Handler {
@@ -954,13 +977,14 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		// 明文回显（非凭据）；user/token 做脱敏、pass/token 只回"有没有"。
 		SMS struct {
 			Haozhuma struct {
-				Sid    string `json:"sid"`
-				Author string `json:"author"`
-				UID    string `json:"uid"`
-				ISP    string `json:"isp"`
-				User   string `json:"user"`
-				Pass   string `json:"pass"`
-				Token  string `json:"token"`
+				Sid       string `json:"sid"`
+				Author    string `json:"author"`
+				UID       string `json:"uid"`
+				ISP       string `json:"isp"`
+				User      string `json:"user"`
+				Pass      string `json:"pass"`
+				Token     string `json:"token"`
+				H5Session string `json:"h5_session"`
 			} `json:"haozhuma"`
 		} `json:"sms"`
 		// AutoEnroll 任务控制参数（WebUI「高级设置」）。老配置没有该节时
@@ -1061,6 +1085,11 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 					"has_pass":  c.SMS.Haozhuma.Pass != "",
 					"has_token": c.SMS.Haozhuma.Token != "",
 				},
+				// H5 会话（P1 增强）：同样只回"有没有/是否失效"，值本体
+				// （PHPSESSID）绝不出接口。来源优先级：运行时 client 状态
+				// （含 last_seen/失效判定）> 配置文件（未启动 client 时
+				// 只知道配没配）。
+				"h5": h.h5SessionEcho(c.SMS.Haozhuma.H5Session),
 			},
 		},
 		AutoEnroll: h.autoenrollEcho(c.AutoEnroll),
@@ -1097,6 +1126,31 @@ func maskCredential(s string) string {
 		return strings.Repeat("*", len(rs))
 	}
 	return string(rs[:2]) + "***" + string(rs[len(rs)-2:])
+}
+
+// h5SessionEcho H5 会话回显（脱敏）：只报 has/expired/last_seen/last_error，
+// PHPSESSID 值本体绝不出接口（泄露 = 豪猪账号完全被盗，见设计文档 §6.2）。
+// configuredSession 来自配置文件（未启动 client 时只知道配没配）。
+func (h *Handler) h5SessionEcho(configuredSession string) map[string]any {
+	echo := map[string]any{"has": false}
+	if configuredSession != "" {
+		echo["has"] = true
+		echo["configured"] = true
+	}
+	if h.cfg.HaozhumaH5 != nil {
+		info := h.cfg.HaozhumaH5.Info()
+		if info.Has {
+			echo["has"] = true
+		}
+		echo["expired"] = info.Expired
+		if !info.LastSeen.IsZero() {
+			echo["last_seen"] = info.LastSeen.Format(time.RFC3339)
+		}
+		if info.LastError != "" {
+			echo["last_error"] = info.LastError
+		}
+	}
+	return echo
 }
 
 // autoenrollEcho 任务控制参数回显：配置文件显式值优先；没配的字段用
@@ -1907,6 +1961,155 @@ func (h *Handler) haozhumaSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s)
+}
+
+// haozhumaH5Session 粘贴/清空 PHPSESSID（WebUI 增强设置）。验证通过才
+// 落盘：立即用新会话真调一次项目搜索（gjc=腾讯——豪猪最主流的项目族，
+// 命中即视为会话有效）。清空（session=""）不验证直接落盘。
+// 运行中的任务不受任何影响：H5 只服务选择器，与接码 API 完全独立。
+func (h *Handler) haozhumaH5Session(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session string `json:"session"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	session := strings.TrimSpace(req.Session)
+	if session == "" {
+		// 显式清空。
+		if h.cfg.SetHaozhumaH5Session != nil {
+			h.cfg.SetHaozhumaH5Session("")
+		}
+		if err := h.persistHaozhumaH5Session(""); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败：" + err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": true})
+		return
+	}
+	// 验证：临时客户端真调一次 type=30。
+	probe := haozhumah5.New(session)
+	defer probe.Close()
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if _, err := probe.Projects(ctx, "腾讯"); err != nil {
+		// 会话无效/网络故障都拒绝保存（与鉴权 patch 同语义：坏值不落盘）。
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "会话验证失败：" + err.Error()})
+		return
+	}
+	// 验证通过：先落盘，再热更运行态（客户端不存在时按需创建——
+	// h5_session 是纯 WebUI 增强，允许在未配置接码 API 的部署上单独启用）。
+	if err := h.persistHaozhumaH5Session(session); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败：" + err.Error()})
+		return
+	}
+	if h.cfg.HaozhumaH5 == nil {
+		h.cfg.HaozhumaH5 = probe
+		probe = nil // 已转正，别被 defer Close
+		h.cfg.HaozhumaH5.StartKeepalive()
+	} else {
+		h.cfg.HaozhumaH5.Session(session)
+	}
+	if h.cfg.SetHaozhumaH5Session != nil {
+		h.cfg.SetHaozhumaH5Session(session)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// haozhumaProjects 项目搜索（代理 H5 type=30）。q 为搜索关键词。
+func (h *Handler) haozhumaProjects(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.HaozhumaH5 == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "项目搜索未启用（需在增强设置里粘贴 PHPSESSID）"})
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少搜索关键词 q"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	projects, err := h.cfg.HaozhumaH5.Projects(ctx, q)
+	if err != nil {
+		writeH5Error(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
+}
+
+// haozhumaUIDs 对接码列表（代理 H5 type=8）。sid 支持 16 位 hex 会话
+// 标识与数字项目 ID 两种（上游两者都收）。
+func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.HaozhumaH5 == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码列表未启用（需在增强设置里粘贴 PHPSESSID）"})
+		return
+	}
+	sid := strings.TrimSpace(r.URL.Query().Get("sid"))
+	if sid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少项目标识 sid"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	uids, err := h.cfg.HaozhumaH5.UIDs(ctx, sid)
+	if err != nil {
+		writeH5Error(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"uids": uids})
+}
+
+// writeH5Error H5 调用错误的统一出口：会话失效 410（前端据此弹"重新粘贴"
+// 并退化手填），网络/上游错误 502，参数问题 400。
+func writeH5Error(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, haozhumah5.ErrNoSession):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+	case errors.Is(err, haozhumah5.ErrSessionExpired):
+		writeJSON(w, http.StatusGone, map[string]string{"error": err.Error()})
+	default:
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+	}
+}
+
+// persistHaozhumaH5Session 把 h5_session 写进 config.json（复用 admin 配置
+// 的原子写链 + configMu 互斥）。与鉴权 patch 分开：h5_session 允许在
+// AutoEnroll 未启用的部署上单独配置（纯 WebUI 增强）。
+func (h *Handler) persistHaozhumaH5Session(session string) error {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if h.cfg.ConfigPath == "" {
+		return errors.New("config 路径未配置（内存模式不支持持久化）")
+	}
+	raw, err := os.ReadFile(h.cfg.ConfigPath)
+	if err != nil {
+		return err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	sms, _ := doc["sms"].(map[string]any)
+	if sms == nil {
+		sms = map[string]any{}
+	}
+	hz, _ := sms["haozhuma"].(map[string]any)
+	if hz == nil {
+		hz = map[string]any{}
+	}
+	if session == "" {
+		delete(hz, "h5_session")
+	} else {
+		hz["h5_session"] = session
+	}
+	sms["haozhuma"] = hz
+	doc["sms"] = sms
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600)
 }
 
 // applyRuntimeUpstreamTimeouts 把超时变更推到 upstream Client。
