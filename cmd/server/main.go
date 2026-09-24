@@ -798,6 +798,9 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 	setup := func(c *haozhuma.Client) *haozhuma.Client {
 		c.Author, c.ISP = author, isp
 		c.SetUID(uid)
+		if len(hz.UIDs) > 0 {
+			c.SetUIDs(hz.UIDs)
+		}
 		return c
 	}
 

@@ -41,6 +41,16 @@ type Client struct {
 	// lastUnknownUID 记录最近一次因失效被丢弃的对接码，供上层提示用户。
 	lastUnknownUID string
 
+	// uidPool 多对接码轮换池（2026-09 新增，豪猪侧「加入对接码」逆向
+	// 完成后的自动管理）。非空时 GetPhone 每次取下一个码（round-robin）；
+	// 某个码报「专属码不存在/没号」时自动出池，出池的码记进 drained
+	// 供上层通过 H5 从账户移除。池空后退回单 uid / 平台自动分配。
+	uidPool []string
+	// uidIdx round-robin 游标。
+	uidIdx int
+	// drained 已出池的对接码（等上层消费走 H5 type=41 移出账户）。
+	drained []string
+
 	// ISP 运营商优先级列表（取号参数 isp）。实测取值：1=移动 2=联通 3=电信，
 	// 逗号分隔表示依次降级，最后自动退回"不限"。
 	// 空字符串表示直接不限。腾讯短信通道对广电号支持不稳定。
@@ -69,6 +79,7 @@ func New(token string) *Client {
 }
 
 // SetUID 钉死一个对接码（专属码）。空字符串 = 不钉死，由平台自动分配。
+// 注意：配置了轮换池（SetUIDs）时池优先，单 uid 被忽略。
 func (c *Client) SetUID(uid string) {
 	c.mu.Lock()
 	c.uid = strings.TrimSpace(uid)
@@ -79,7 +90,85 @@ func (c *Client) SetUID(uid string) {
 func (c *Client) UID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(c.uidPool) > 0 {
+		return c.uidPool[c.uidIdx%len(c.uidPool)]
+	}
 	return c.uid
+}
+
+// SetUIDs 配置多对接码轮换池。列表为空 = 清空池（退回单 uid 语义）。
+// 重复项去重；顺序保留（round-robin 按配置顺序轮）。
+func (c *Client) SetUIDs(uids []string) {
+	clean := make([]string, 0, len(uids))
+	seen := map[string]bool{}
+	for _, u := range uids {
+		u = strings.TrimSpace(u)
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		clean = append(clean, u)
+	}
+	c.mu.Lock()
+	c.uidPool = clean
+	c.uidIdx = 0
+	c.mu.Unlock()
+}
+
+// UIDs 返回当前轮换池快照（空 = 未配置池）。
+func (c *Client) UIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.uidPool))
+	copy(out, c.uidPool)
+	return out
+}
+
+// TakeDrainedUIDs 返回并清空"已出池待移除"的对接码列表。
+// 上层消费后应通过 H5 type=41 从豪猪账户移除（自动生命周期管理的
+// "用完移出账户"一步），并从配置里删掉。
+func (c *Client) TakeDrainedUIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.drained
+	c.drained = nil
+	return out
+}
+
+// nextPoolUID 取轮换池的下一个码并推进游标。空池返回空串。
+func (c *Client) nextPoolUID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.uidPool) == 0 {
+		return ""
+	}
+	u := c.uidPool[c.uidIdx%len(c.uidPool)]
+	c.uidIdx++
+	return u
+}
+
+// dropPoolUID 把码从轮换池移除（「专属码不存在」或连番「没有号」时），
+// 记入 drained。返回池是否已空。
+func (c *Client) dropPoolUID(uid string) (empty bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.uidPool) > 0 && c.uidIdx >= len(c.uidPool) {
+		c.uidIdx = 0 // 防御：删过元素后游标越界
+	}
+	out := c.uidPool[:0]
+	for _, u := range c.uidPool {
+		if u != uid {
+			out = append(out, u)
+		}
+	}
+	if len(out) != len(c.uidPool) {
+		c.drained = append(c.drained, uid)
+		c.uidPool = out
+		if c.uidIdx >= len(c.uidPool) {
+			c.uidIdx = 0
+		}
+	}
+	return len(c.uidPool) == 0
 }
 
 // TakeUnknownUID 返回并清空"最近一次因失效被丢弃的对接码"。
@@ -403,8 +492,46 @@ func truncate(s string, n int) string {
 //
 // uid 钉死是可选的：对接码会被上游增删，钉死的那个可能整批失效。一旦
 // 报"专属码不存在"，就丢掉它退回平台自动分配，而不是让整个任务卡死。
+//
+// 多码轮换（2026-09）：配置了 SetUIDs 池时，每次调用从池里 round-robin
+// 取一个码用；某码报「专属码不存在」自动出池（记入 drained，上层负责
+// 从豪猪账户移除），换下一个码继续；池耗尽后退回平台自动分配。
 func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
-	phone, err := c.getPhoneRound(ctx, sid)
+	// 轮换池模式：逐码尝试（每码内部仍按 ISP 降级）。
+	if len(c.uidsSnapshot()) > 0 {
+		var lastErr error
+		for range c.uidsSnapshot() { // 最多试池大小的次数
+			uid := c.nextPoolUID()
+			if uid == "" {
+				break
+			}
+			phone, err := c.getPhoneRound(ctx, sid, uid)
+			if err == nil {
+				return phone, nil
+			}
+			lastErr = err
+			var ae *APIError
+			if errors.As(err, &ae) && ae.UnknownUID() {
+				c.dropPoolUID(uid)
+				continue // 这个码没了，换下一个
+			}
+			// 其它错误（没号/网络）不逐码轮——池里的码共享项目侧库存，
+			// 单码没号不代表其它码没号，但为了不放大请求量，先直接返回。
+			return "", err
+		}
+		// 池试空了或全部专属码失效：退回平台自动分配。
+		phone, err := c.getPhoneRound(ctx, sid, "")
+		if err == nil {
+			return phone, nil
+		}
+		if lastErr != nil {
+			return "", fmt.Errorf("%w（轮换池 %d 个码已试完，已退回平台自动分配）", err, len(c.uidsSnapshot()))
+		}
+		return "", err
+	}
+
+	// 单码/自动分配模式。
+	phone, err := c.getPhoneRound(ctx, sid, c.UID())
 
 	// 钉死的对接码失效：丢掉它，退回平台自动分配再试一轮。
 	var ae *APIError
@@ -414,7 +541,7 @@ func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
 		c.mu.Lock()
 		c.lastUnknownUID = bad
 		c.mu.Unlock()
-		if phone, retryErr := c.getPhoneRound(ctx, sid); retryErr == nil {
+		if phone, retryErr := c.getPhoneRound(ctx, sid, ""); retryErr == nil {
 			return phone, nil
 		} else {
 			return "", retryErr
@@ -423,9 +550,18 @@ func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
 	return phone, err
 }
 
-// getPhoneRound 跑一轮取号（按 ISP 优先级逐档降级）。
-func (c *Client) getPhoneRound(ctx context.Context, sid string) (string, error) {
-	uid := c.UID()
+// uidsSnapshot 池快照（只读）。
+func (c *Client) uidsSnapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.uidPool))
+	copy(out, c.uidPool)
+	return out
+}
+
+// getPhoneRound 跑一轮取号（按 ISP 优先级逐档降级）。uid 为本次用的
+// 对接码（空 = 平台自动分配）。
+func (c *Client) getPhoneRound(ctx context.Context, sid, uid string) (string, error) {
 	base := url.Values{"token": {c.Token}, "sid": {sid}}
 	if c.Author != "" {
 		base.Set("author", c.Author)
@@ -457,8 +593,12 @@ func (c *Client) getPhoneRound(ctx context.Context, sid string) (string, error) 
 			continue
 		}
 		// 平台自动分配时记下实际用的对接码，便于日志/诊断。
-		if u, _ := raw["uid"].(string); strings.TrimSpace(u) != "" && c.UID() == "" {
-			c.SetUID(strings.TrimSpace(u))
+		if u, _ := raw["uid"].(string); strings.TrimSpace(u) != "" && uid == "" {
+			c.mu.Lock()
+			if len(c.uidPool) == 0 {
+				c.uid = strings.TrimSpace(u)
+			}
+			c.mu.Unlock()
 		}
 		return phone, nil
 	}

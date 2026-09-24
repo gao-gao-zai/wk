@@ -93,6 +93,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       form.setFieldsValue({
         sid: hz.sid || '',
         uid: hz.uid || '',
+        uids: hz.uids || [],
         isp: (hz.isp || '').split(',').map(s => s.trim()).filter(Boolean),
         author: hz.author || '',
         min_balance: Number(ae.min_balance ?? DEFAULTS.min_balance),
@@ -140,7 +141,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
   };
 
   // 保存：diff 出显式改动的字段分两组提交。未变的字段不发（指针语义，
-  // 后端增量合并）。
+  // 后端增量合并）。uids（轮换池）数组 diff：排序后比较。
   const save = async () => {
     const values = await form.validateFields();
     setSaving(true);
@@ -149,6 +150,11 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       const haozhumaPatch = {};
       if ((values.sid || '') !== (hz.sid || '')) haozhumaPatch.sid = values.sid || '';
       if ((values.uid || '') !== (hz.uid || '')) haozhumaPatch.uid = values.uid || '';
+      const uidList = (values.uids || []).map(s => s.trim()).filter(Boolean);
+      const prevList = (hz.uids || []);
+      const sameSet = uidList.length === prevList.length
+        && [...uidList].sort().join('\n') === [...prevList].sort().join('\n');
+      if (!sameSet) haozhumaPatch.uids = uidList;
       const ispJoined = (values.isp || []).join(',');
       if (ispJoined !== (hz.isp || '')) haozhumaPatch.isp = ispJoined;
       if ((values.author || '') !== (hz.author || '')) haozhumaPatch.author = values.author || '';
@@ -198,7 +204,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
             description="只重置表单（不保存），仍需点「保存高级设置」提交。"
             onConfirm={() => {
               form.setFieldsValue({
-                sid: '', uid: '', isp: [], author: '',
+                sid: '', uid: '', uids: [], isp: [], author: '',
                 min_balance: DEFAULTS.min_balance,
                 consecutive_fails: DEFAULTS.consecutive_fails,
                 retry_delay_seconds: DEFAULTS.retry_delay_seconds,
@@ -278,34 +284,63 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           </Space.Compact>
         </Form.Item>
         <Form.Item
-          label="对接码"
+          label="对接码（多选轮换）"
           extra={
             uidError ? <Text type="danger">{uidError}（已退化为手填）</Text>
-              : h5Ready && uidItems != null && uidItems.length > 0 ? `点「浏览对接码」浮窗选择（${uidItems.length} 个，价格/库存可排序）。选中的码会钉死专属通道（成功率更高）。`
+              : h5Ready
+                ? <span>
+                    点「浏览对接码」浮窗勾选多个码组成<b>轮换池</b>：取号逐个轮着用，失效的码自动移出池和豪猪账户；
+                    保存时勾选状态会自动同步到豪猪侧（新勾选的加入账户、取消的移出）。
+                    池留空时用下方「备用单码」（都空 = 平台随机分配）。
+                  </span>
                 : '留空 = 平台随机分配。指定有号的对接码成功率更高（实测 6/6 vs 随机 3/6）。'
           }
-          validateTrigger={false}
-          rules={[{
-            validator: (_, v) => (!v || /^\d+-[A-Za-z0-9]+$/.test(v.trim()))
-              ? Promise.resolve()
-              : Promise.reject(new Error('格式形如 52283-WW9L2J4WOL')),
-          }]}
         >
-          <Space.Compact style={{ width: '100%' }}>
-            <Form.Item name="uid" noStyle>
-              <Input allowClear placeholder="留空自动分配，如 52283-WW9L2J4WOL" style={{ width: h5Ready && uidItems != null && uidItems.length > 0 ? '100%' : '100%' }} />
-            </Form.Item>
-            {h5Ready && (
+          <Space.Compact style={{ width: '100%', marginBottom: h5Ready ? 8 : 0 }}>
+            {h5Ready ? (
               <Button
                 icon={<TableOutlined />}
                 onClick={() => setUidPickerOpen(true)}
                 disabled={uidItems == null && !uidLoading}
                 loading={uidLoading && uidItems == null}
+                style={{ width: '100%' }}
               >
-                浏览对接码{uidItems != null && uidItems.length > 0 ? `（${uidItems.length}）` : ''}
+                浏览对接码{uidItems != null && uidItems.length > 0 ? `（${uidItems.length} 个挂牌）` : ''}
               </Button>
+            ) : (
+              <Form.Item name="uid" noStyle
+                rules={[{
+                  validator: (_, v) => (!v || /^\d+-[A-Za-z0-9]+$/.test(v.trim()))
+                    ? Promise.resolve()
+                    : Promise.reject(new Error('格式形如 52283-WW9L2J4WOL')),
+                }]}
+              >
+                <Input allowClear placeholder="如 52283-WW9L2J4WOL，留空自动分配" />
+              </Form.Item>
             )}
           </Space.Compact>
+          {h5Ready && (
+            <>
+              <Form.Item name="uids" noStyle>
+                <Select
+                  mode="multiple"
+                  allowClear
+                  placeholder="轮换池（从浮窗勾选，也可手动粘贴码）"
+                  tokenSeparators={[',', '\n', ' ']}
+                  style={{ width: '100%' }}
+                />
+              </Form.Item>
+              <Form.Item name="uid" noStyle
+                rules={[{
+                  validator: (_, v) => (!v || /^\d+-[A-Za-z0-9]+$/.test(v.trim()))
+                    ? Promise.resolve()
+                    : Promise.reject(new Error('格式形如 52283-WW9L2J4WOL')),
+                }]}
+              >
+                <Input allowClear placeholder="备用单码（池为空时用；如 52283-WW9L2J4WOL）" style={{ marginTop: 8 }} />
+              </Form.Item>
+            </>
+          )}
         </Form.Item>
         <Form.Item
           name="isp"
@@ -365,18 +400,18 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
         onPick={handlePickProject}
       />
 
-      {/* 浮窗式对接码选择器：Table 浏览（价格/库存排序），未加入的码
-          点选时先经后端在豪猪侧「加入对接码」（官方 API 只认已加入的码）。 */}
+      {/* 浮窗式对接码选择器：多选组成轮换池。勾选 → 确定：未加入账户的码
+          自动在豪猪侧加入（官方 API 只认已加入的码）；取消勾选的码在保存
+          配置时由后端 diff 自动移出账户。 */}
       <UIDPickerModal
         open={uidPickerOpen}
         onClose={() => setUidPickerOpen(false)}
         uidItems={uidItems}
         loading={uidLoading}
-        currentUid={form.getFieldValue('uid')}
+        selectedUids={form.getFieldValue('uids') || []}
         api={api}
-        onPick={(u) => {
-          if (!u || !u.uid) return;
-          form.setFieldValue('uid', u.uid);
+        onConfirm={(uids) => {
+          form.setFieldValue('uids', uids);
           setDirty(true);
         }}
       />

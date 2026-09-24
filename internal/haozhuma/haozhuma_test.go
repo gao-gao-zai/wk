@@ -2,6 +2,7 @@ package haozhuma
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -328,6 +329,123 @@ func TestGetPhoneStaleUIDThenNoNumbers(t *testing.T) {
 	}
 	if c.UID() != "" {
 		t.Fatalf("stale uid should stay cleared, got %q", c.UID())
+	}
+}
+
+// TestGetPhoneUIDPoolRotation 多对接码轮换池：round-robin 逐码取号；
+// 失效码自动出池并进 drained（上层据此从豪猪账户移除）；池空后退回
+// 平台自动分配。
+func TestGetPhoneUIDPoolRotation(t *testing.T) {
+	var autoAttempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uid := r.URL.Query().Get("uid")
+		switch uid {
+		case "52283-P1":
+			_, _ = w.Write([]byte(`{"code":"-1","msg":"没有这个[52283-P1]专属码"}`))
+		case "52283-P2":
+			_, _ = w.Write([]byte(`{"code":"0","msg":"成功","phone":"16711112222"}`))
+		case "":
+			autoAttempts++
+			_, _ = w.Write([]byte(`{"code":"0","msg":"成功","phone":"16733334444"}`))
+		default:
+			t.Errorf("unexpected uid %q", uid)
+			_, _ = w.Write([]byte(`{"code":"-1","msg":"bad"}`))
+		}
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	c := New("tok")
+	c.Base = u.String() + "/"
+	c.SetUIDs([]string{"52283-P1", "52283-P2"})
+
+	// 第一次：P1 失效出池 → P2 接上取到号。
+	phone, err := c.GetPhone(context.Background(), "52283")
+	if err != nil || phone != "16711112222" {
+		t.Fatalf("first: phone=%q err=%v (want P2's number)", phone, err)
+	}
+	// P1 进 drained（等上层移出账户）。
+	if d := c.TakeDrainedUIDs(); len(d) != 1 || d[0] != "52283-P1" {
+		t.Fatalf("drained=%v want [52283-P1]", d)
+	}
+	// 池里只剩 P2。
+	if got := c.UIDs(); len(got) != 1 || got[0] != "52283-P2" {
+		t.Fatalf("pool after drop=%v", got)
+	}
+
+	// 第二次：P2 还在池里，round-robin 继续用它。
+	phone, err = c.GetPhone(context.Background(), "52283")
+	if err != nil || phone != "16711112222" {
+		t.Fatalf("second: phone=%q err=%v", phone, err)
+	}
+	if autoAttempts != 0 {
+		t.Fatalf("pool mode must not leak to auto-assign while pool has live codes, auto=%d", autoAttempts)
+	}
+}
+
+// TestGetPhoneUIDPoolExhausted 池全部失效：退回平台自动分配而不是报错。
+func TestGetPhoneUIDPoolExhausted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if uid := r.URL.Query().Get("uid"); uid != "" {
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"code":"-1","msg":"没有这个[%s]专属码"}`, uid)))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":"0","msg":"成功","phone":"16755556666"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	c := New("tok")
+	c.Base = u.String() + "/"
+	c.SetUIDs([]string{"52283-DEAD1", "52283-DEAD2"})
+
+	phone, err := c.GetPhone(context.Background(), "52283")
+	if err != nil || phone != "16755556666" {
+		t.Fatalf("phone=%q err=%v (want auto-assign fallback)", phone, err)
+	}
+	if d := c.TakeDrainedUIDs(); len(d) != 2 {
+		t.Fatalf("drained=%v want both dead codes", d)
+	}
+	if got := c.UIDs(); len(got) != 0 {
+		t.Fatalf("pool should be empty, got %v", got)
+	}
+}
+
+// TestGetPhoneUIDPoolNoNumbers 池里的码没失效但项目没号：如实报错
+//（不逐码放大请求量）。
+func TestGetPhoneUIDPoolNoNumbers(t *testing.T) {
+	var uidCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("uid") != "" {
+			uidCalls++
+			_, _ = w.Write([]byte(`{"code":"-1","msg":"没有取到号码，请重新尝试"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":"-1","msg":"没有取到号码，请重新尝试"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	c := New("tok")
+	c.Base = u.String() + "/"
+	c.SetUIDs([]string{"52283-A", "52283-B", "52283-C"})
+
+	_, err := c.GetPhone(context.Background(), "52283")
+	if err == nil {
+		t.Fatal("want no-numbers error")
+	}
+	// 没号不是码失效：只试了一个码（+池耗尽后的自动分配一次），drained 为空。
+	if uidCalls > 1 {
+		t.Fatalf("no-numbers must not rotate through the whole pool, uid calls=%d", uidCalls)
+	}
+	if d := c.TakeDrainedUIDs(); len(d) != 0 {
+		t.Fatalf("no-numbers must not drain codes, got %v", d)
+	}
+}
+
+// TestSetUIDsDedup 池配置去重去空。
+func TestSetUIDsDedup(t *testing.T) {
+	c := New("tok")
+	c.SetUIDs([]string{" 52283-A ", "", "52283-A", "52283-B"})
+	if got := c.UIDs(); len(got) != 2 || got[0] != "52283-A" || got[1] != "52283-B" {
+		t.Fatalf("pool=%v", got)
 	}
 }
 

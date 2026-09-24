@@ -1395,7 +1395,8 @@ func TestReplaceClientBusy(t *testing.T) {
 	}
 }
 
-// TestUpdateFetchOptions 热改取号参数：Author/ISP 即时生效，UID 走 SetUID 语义。
+// TestUpdateFetchOptions 热改取号参数：Author/ISP 即时生效，UID 走 SetUID
+// 语义；uids 轮换池优先于单 uid。
 func TestUpdateFetchOptions(t *testing.T) {
 	f := newFakeHZM(t)
 	c := f.client()
@@ -1403,13 +1404,34 @@ func TestUpdateFetchOptions(t *testing.T) {
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
 		nil,
 		nil)
-	en.UpdateFetchOptions("someone", "52283-ABC123", "2,1")
+	en.UpdateFetchOptions("someone", "52283-ABC123", nil, "2,1")
 	if c.Author != "someone" || c.ISP != "2,1" || c.UID() != "52283-ABC123" {
 		t.Fatalf("author=%q isp=%q uid=%q", c.Author, c.ISP, c.UID())
 	}
 	// 清空 uid = 退回平台自动分配。
-	en.UpdateFetchOptions("", "", "")
+	en.UpdateFetchOptions("", "", nil, "")
 	if c.UID() != "" {
 		t.Fatalf("uid=%q want empty", c.UID())
+	}
+	// 配置轮换池：池优先，单 uid 被忽略。
+	en.UpdateFetchOptions("", "52283-SINGLE", []string{"52283-P1", "52283-P2"}, "")
+	if got := c.UIDs(); len(got) != 2 || got[0] != "52283-P1" || got[1] != "52283-P2" {
+		t.Fatalf("pool=%v want [P1 P2]", got)
+	}
+	if c.UID() != "52283-P1" {
+		t.Fatalf("pool mode uid=%q want first pool item", c.UID())
+	}
+	// nil 池 = 保持现值（未提供语义）。
+	en.UpdateFetchOptions("", "", nil, "")
+	if got := c.UIDs(); len(got) != 2 {
+		t.Fatalf("pool should persist, got %v", got)
+	}
+	// 空切片 = 清池退回单 uid。
+	en.UpdateFetchOptions("", "52283-SINGLE", []string{}, "")
+	if got := c.UIDs(); len(got) != 0 {
+		t.Fatalf("pool should be cleared, got %v", got)
+	}
+	if c.UID() != "52283-SINGLE" {
+		t.Fatalf("uid=%q want single after pool clear", c.UID())
 	}
 }

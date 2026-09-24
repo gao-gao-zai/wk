@@ -227,3 +227,8 @@ button, input, textarea, select { font: inherit; }
 .uid-row-mine > td {
   background: #f6ffed !important;
 }
+
+/* 对接码浮窗：已勾选（待入池）的行淡蓝底 */
+.uid-row-picked > td {
+  background: #e6f4ff !important;
+}

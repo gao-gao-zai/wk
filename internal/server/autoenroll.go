@@ -43,6 +43,10 @@ type AutoEnroller struct {
 	// onAccountEnrolled 加号成功后的联动回调（handler 注入；nil = 未启用）。
 	// 用于「注册后自动跑成长任务」：异步执行，不阻塞加号流水线。
 	onAccountEnrolled func(uid string)
+	// onUIDsDrained 对接码池自动生命周期回调（handler 注入；nil = 未启用）。
+	// GetPhone 把失效码移出轮换池后调用：上层负责从 config.json 的
+	// sms.haozhuma.uids 删掉它们 + 经 H5 type=41 从豪猪账户移出。
+	onUIDsDrained func(uids []string)
 
 	mu      sync.Mutex
 	running bool
@@ -320,6 +324,22 @@ func (a *AutoEnroller) enrolledCallback() func(uid string) {
 	return a.onAccountEnrolled
 }
 
+// SetOnUIDsDrained 注入对接码池出池回调（自动生命周期管理）。
+// GetPhone 移出失效码后调用；nil = 关闭（码只退出本地轮换池，不动
+// config 与豪猪账户）。mu 保护（运行期可换）。
+func (a *AutoEnroller) SetOnUIDsDrained(fn func(uids []string)) {
+	a.mu.Lock()
+	a.onUIDsDrained = fn
+	a.mu.Unlock()
+}
+
+// uidsDrainedCallback 读取出池回调快照。
+func (a *AutoEnroller) uidsDrainedCallback() func(uids []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.onUIDsDrained
+}
+
 // SetSid 运行时切换豪猪项目 ID（WebUI「豪猪项目」设置）。
 // 对在途任务的影响：已取到的号继续按 tryOne 开头快照的旧 sid 收码/
 // 释放/拉黑（号码归属项目，跨 sid 释放报"手机号不存在"——releaseAllHeld
@@ -451,10 +471,13 @@ func (a *AutoEnroller) ReplaceClient(c *haozhuma.Client) error {
 	return nil
 }
 
-// UpdateFetchOptions 更新取号策略（对接方标识/对接码/运营商优先级）。
+// UpdateFetchOptions 更新取号策略（对接方标识/对接码/轮换池/运营商优先级）。
 // 任务运行中允许（与 SetSid 同语义）：在途号码按 tryOne 开头快照的旧值
 // 收尾，新取号立刻用新值。
-func (a *AutoEnroller) UpdateFetchOptions(author, uid, isp string) {
+//
+// uids 非空时轮换池优先（单 uid 忽略）；uids 为 nil 保持池现值（未提供），
+// 空切片清空池退回单 uid。
+func (a *AutoEnroller) UpdateFetchOptions(author, uid string, uids []string, isp string) {
 	a.mu.Lock()
 	hzm := a.hzm
 	a.mu.Unlock()
@@ -463,6 +486,9 @@ func (a *AutoEnroller) UpdateFetchOptions(author, uid, isp string) {
 	}
 	hzm.Author = strings.TrimSpace(author)
 	hzm.SetUID(strings.TrimSpace(uid))
+	if uids != nil {
+		hzm.SetUIDs(uids)
+	}
 	hzm.ISP = strings.TrimSpace(isp)
 }
 
@@ -1192,6 +1218,14 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 	usedPhone = true
 	// 记进账本：任务收尾时会按它兜底释放，保证不会把号留在豪猪那边占额度。
 	a.trackHeld(phone)
+	// 对接码池自动生命周期：GetPhone 已把失效的码移出轮换池（drained），
+	// 这里消费走——更新 config + 从豪猪账户移出（handler 注入的回调）。
+	if drained := a.hzm.TakeDrainedUIDs(); len(drained) > 0 {
+		a.logf("对接码 %v 已用完/失效，自动移出轮换池（池剩 %d 个）", drained, len(a.hzm.UIDs()))
+		if cb := a.uidsDrainedCallback(); cb != nil {
+			go cb(drained) // 异步：H5 慢，不挡取号流水线
+		}
+	}
 	// 配置里钉死的对接码被上游删掉了：已经自动退回平台分配，但要让你知道
 	// 配置里的值已经没用了（否则会以为号段变化是别的原因）。
 	if bad := a.hzm.TakeUnknownUID(); bad != "" {

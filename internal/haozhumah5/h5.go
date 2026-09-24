@@ -333,15 +333,47 @@ func (c *Client) AddUID(ctx context.Context, uid string) error {
 	return nil
 }
 
+// RemoveUIDs 从我的账户移除对接码（type=41&open=del&uid=<逗号分隔>）。
+//
+// 用途（自动生命周期管理）：对接码「用完」（库存耗尽/专属码失效）或
+// 用户取消勾选时自动移出账户——留在账户里的码会持续占用豪猪侧的
+// 对接位（且官方 SDK 的 cancelAllRecv 语义与它们纠缠）。
+//
+// 实测语义：删除不存在的码也返回 code=200 "对接码状态:已删除"
+// （天然幂等）；批量删用逗号拼接一次请求。
+func (c *Client) RemoveUIDs(ctx context.Context, uids []string) error {
+	clean := make([]string, 0, len(uids))
+	for _, u := range uids {
+		if u = strings.TrimSpace(u); u != "" {
+			clean = append(clean, u)
+		}
+	}
+	if len(clean) == 0 {
+		return nil
+	}
+	var raw struct {
+		Code any    `json:"code"`
+		Msg  string `json:"msg"`
+		Data any    `json:"data"`
+	}
+	q := map[string]string{"type": "41", "open": "del", "uid": strings.Join(clean, ",")}
+	if err := c.call(ctx, "GET", "/api.php", q, &raw); err != nil {
+		return err
+	}
+	c.InvalidateMyUIDs()
+	return nil
+}
+
 // MyUIDItem 我的对接码列表项（type=3 data 元素）。
 //
-// 与 UIDItem 不同：type=3 返回的是账户视角的字段（open 状态等），
-// 价格/库存信息较全的格式与 type=8 相同（实测同一批字段）。
+// 与 UIDItem 不同：type=3 是账户视角，多一个对接状态（djzt：已对接/
+// 已暂停），没有置顶字段。
 type MyUIDItem struct {
 	UID         string   `json:"uid"`
 	Name        string   `json:"name"`
 	Price       float64  `json:"price"`
 	Stock       int      `json:"stock"`
+	State       string   `json:"state"` // 已对接 / 已暂停
 	ISPs        []string `json:"isps"`
 	Provinces   []string `json:"provinces"`
 	SegmentType string   `json:"segment_type"`
@@ -370,10 +402,11 @@ func (c *Client) MyUIDs(ctx context.Context, keyword string) ([]MyUIDItem, error
 			UID     string `json:"uid"`
 			YHJ     string `json:"yhj"`
 			ZXKY    string `json:"zxky"`
-			YYY     string `json:"yyy"`
+			DJZT    string `json:"djzt"`
+			YYY     any    `json:"yyy"`
 			Sheng   string `json:"sheng"`
 			HaoDuan string `json:"haoduan"`
-			Time    string `json:"time"`
+			Time    any    `json:"time"`
 		} `json:"data"`
 	}
 	if err := c.call(ctx, "GET", "/api.php", q, &raw); err != nil {
@@ -384,15 +417,17 @@ func (c *Client) MyUIDs(ctx context.Context, keyword string) ([]MyUIDItem, error
 		if d.UID == "" {
 			continue
 		}
+		ts, _ := d.Time.(string)
 		items = append(items, MyUIDItem{
 			UID:         d.UID,
 			Name:        strings.TrimSpace(d.MC),
 			Price:       parsePrice(d.YHJ),
 			Stock:       parseStock(d.ZXKY),
-			ISPs:        splitPipe(d.YYY),
+			State:       strings.TrimSpace(d.DJZT),
+			ISPs:        splitAny(d.YYY),
 			Provinces:   splitPipe(d.Sheng),
 			SegmentType: strings.TrimSpace(d.HaoDuan),
-			UpdatedAt:   strings.TrimSpace(d.Time),
+			UpdatedAt:   strings.TrimSpace(ts),
 		})
 	}
 	// 会话侧列表变化频率低，缓存 5 分钟足够。

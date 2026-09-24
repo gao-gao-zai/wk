@@ -69,9 +69,9 @@ type Config struct {
 	// 自动接上（见 NewHandler）；main 无需注入。nil = 自动加号未启用，
 	// WebUI 改 sid 只落盘（重启后生效）。
 	SetHaozhumaSid func(sid string)
-	// SetHaozhumaFetch 运行时更新豪猪取号策略（author/uid/isp）。
+	// SetHaozhumaFetch 运行时更新豪猪取号策略（author/uid/uids/isp）。
 	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘。
-	SetHaozhumaFetch func(author, uid, isp string)
+	SetHaozhumaFetch func(author, uid string, uids []string, isp string)
 	// ReplaceHaozhumaClient 运行时更换豪猪客户端（WebUI 改鉴权）。
 	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘
 	//（重启后生效）。
@@ -457,9 +457,60 @@ func NewHandler(cfg Config) *Handler {
 		// WebUI 运行时切换项目 ID 直接推给 AutoEnroll（组装在 NewHandler
 		// 内部，main 拿不到指针，这里自接回调最省事）。
 		h.cfg.SetHaozhumaSid = h.cfg.AutoEnroll.SetSid
-		// 取号策略热改（author/uid/isp）与任务控制参数同理；ReplaceClient
+		// 取号策略热改（author/uid/uids/isp）与任务控制参数同理；ReplaceClient
 		// 的运行态保护（ErrBusyAuth）在 AutoEnroller 内部。
 		h.cfg.SetHaozhumaFetch = h.cfg.AutoEnroll.UpdateFetchOptions
+		// 对接码池自动生命周期：失效码出池后，从 config 的 uids 删掉 +
+		// 经 H5 type=41 从豪猪账户移出（"用完自动移出账户"）。
+		h.cfg.AutoEnroll.SetOnUIDsDrained(func(uids []string) {
+			if len(uids) == 0 {
+				return
+			}
+			// 1) config.json：从 sms.haozhuma.uids 里剔除。
+			if h.cfg.ConfigPath != "" {
+				h.configMu.Lock()
+				raw, err := os.ReadFile(h.cfg.ConfigPath)
+				if err == nil {
+					var doc map[string]any
+					if json.Unmarshal(raw, &doc) == nil {
+						if sms, _ := doc["sms"].(map[string]any); sms != nil {
+							if hz, _ := sms["haozhuma"].(map[string]any); hz != nil {
+								if cur, _ := hz["uids"].([]any); cur != nil {
+									drop := map[string]bool{}
+									for _, u := range uids {
+										drop[u] = true
+									}
+									next := []any{}
+									for _, u := range cur {
+										if s, ok := u.(string); ok && !drop[s] {
+											next = append(next, s)
+										}
+									}
+									hz["uids"] = next
+									if out, err := json.MarshalIndent(doc, "", "  "); err == nil {
+										if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
+											log.Printf("[haozhuma] 对接码池出池后写回 config 失败: %v", err)
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				h.configMu.Unlock()
+			}
+			// 2) 豪猪账户：H5 type=41 移出（H5 未配置时跳过——账户侧残留
+			// 无害，用户下次保存配置时同步逻辑会清掉）。
+			if h.cfg.HaozhumaH5 != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := h.cfg.HaozhumaH5.RemoveUIDs(ctx, uids); err != nil {
+					log.Printf("[haozhuma] 对接码 %v 从账户移出失败: %v", uids, err)
+				} else {
+					log.Printf("[haozhuma] 对接码 %v 已自动移出豪猪账户（用完/失效）", uids)
+				}
+			}
+		})
 		h.cfg.ReplaceHaozhumaClient = h.cfg.AutoEnroll.ReplaceClient
 		h.cfg.SetAutoEnrollLimits = h.cfg.AutoEnroll.SetLimits
 		h.cfg.SetAutoEnrollRetry = func(seconds int) {
@@ -979,14 +1030,15 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		// 明文回显（非凭据）；user/token 做脱敏、pass/token 只回"有没有"。
 		SMS struct {
 			Haozhuma struct {
-				Sid       string `json:"sid"`
-				Author    string `json:"author"`
-				UID       string `json:"uid"`
-				ISP       string `json:"isp"`
-				User      string `json:"user"`
-				Pass      string `json:"pass"`
-				Token     string `json:"token"`
-				H5Session string `json:"h5_session"`
+				Sid       string   `json:"sid"`
+				Author    string   `json:"author"`
+				UID       string   `json:"uid"`
+				UIDs      []string `json:"uids"`
+				ISP       string   `json:"isp"`
+				User      string   `json:"user"`
+				Pass      string   `json:"pass"`
+				Token     string   `json:"token"`
+				H5Session string   `json:"h5_session"`
 			} `json:"haozhuma"`
 		} `json:"sms"`
 		// AutoEnroll 任务控制参数（WebUI「高级设置」）。老配置没有该节时
@@ -1078,6 +1130,7 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 				"sid":    c.SMS.Haozhuma.Sid,
 				"author": c.SMS.Haozhuma.Author,
 				"uid":    c.SMS.Haozhuma.UID,
+				"uids":   c.SMS.Haozhuma.UIDs,
 				"isp":    c.SMS.Haozhuma.ISP,
 				// 凭据脱敏：user 前后各 2 位（不足 5 位全 *）；pass/token
 				// 只回"有没有"，值本体绝不出接口。
@@ -1214,16 +1267,17 @@ type upstreamPatch struct {
 
 // smsPatch 豪猪接码设置的可选字段组（WebUI「自动加号」页）。凭据字段
 // （user/pass/token）走"验证通过才落盘 + ReplaceClient"链路（见
-// saveAdminConfig 内的处理），取号字段（sid/author/uid/isp）直接热改。
+// saveAdminConfig 内的处理），取号字段（sid/author/uid/uids/isp）直接热改。
 type smsPatch struct {
 	Haozhuma struct {
-		Sid    *string `json:"sid"`
-		Author *string `json:"author"`
-		UID    *string `json:"uid"`
-		ISP    *string `json:"isp"`
-		User   *string `json:"user"`
-		Pass   *string `json:"pass"`
-		Token  *string `json:"token"`
+		Sid    *string   `json:"sid"`
+		Author *string   `json:"author"`
+		UID    *string   `json:"uid"`
+		UIDs   *[]string `json:"uids"`
+		ISP    *string   `json:"isp"`
+		User   *string   `json:"user"`
+		Pass   *string   `json:"pass"`
+		Token  *string   `json:"token"`
 	} `json:"haozhuma"`
 }
 
@@ -1383,6 +1437,16 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		if uid != "" && !haozhumaUIDPattern.MatchString(uid) {
 			writeJSON(w, 400, map[string]string{"error": "对接码格式形如 52283-WW9L2J4WOL（留空 = 平台自动分配）"})
 			return
+		}
+	}
+	// 轮换池：逐项校验格式（空项静默丢弃）。
+	if req.SMS != nil && req.SMS.Haozhuma.UIDs != nil {
+		for _, u := range *req.SMS.Haozhuma.UIDs {
+			u = strings.TrimSpace(u)
+			if u != "" && !haozhumaUIDPattern.MatchString(u) {
+				writeJSON(w, 400, map[string]string{"error": "对接码池里的 " + u + " 格式形如 52283-WW9L2J4WOL"})
+				return
+			}
 		}
 	}
 	// 运营商优先级：只允许 1（移动）/2（联通）/3（电信）的逗号组合，不重复。
@@ -1579,6 +1643,18 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		if req.SMS.Haozhuma.UID != nil {
 			hz["uid"] = strings.TrimSpace(*req.SMS.Haozhuma.UID)
 		}
+		if req.SMS.Haozhuma.UIDs != nil {
+			clean := []string{}
+			for _, u := range *req.SMS.Haozhuma.UIDs {
+				if u = strings.TrimSpace(u); u != "" {
+					clean = append(clean, u)
+				}
+			}
+			if len(clean) == 0 {
+				clean = []string{} // 显式空数组也要落（= 清空池），保持 JSON [] 而非 null
+			}
+			hz["uids"] = clean
+		}
 		if req.SMS.Haozhuma.ISP != nil {
 			hz["isp"] = strings.TrimSpace(*req.SMS.Haozhuma.ISP)
 		}
@@ -1703,6 +1779,65 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
+	// 对接码池自动生命周期（H5 账户侧同步）：uids 显式提供时，把"新勾选
+	// 的码"在豪猪侧加入账户、"取消勾选的已加入码"移出账户（type=4/41）。
+	// 异步执行——豪猪 H5 慢，不该拖住配置保存响应；失败只进响应字段提示
+	//（配置本身已落盘，取号不受影响——没加入的码 GetPhone 自动跳过）。
+	if req.SMS != nil && req.SMS.Haozhuma.UIDs != nil && h.cfg.HaozhumaH5 != nil {
+		// 从落盘后的最终值取（已 clean 过的），避免直接用请求指针。
+		var mergedDoc struct {
+			SMS struct {
+				Haozhuma struct {
+					UIDs []string `json:"uids"`
+				} `json:"haozhuma"`
+			} `json:"sms"`
+		}
+		_ = json.Unmarshal(out, &mergedDoc)
+		want := mergedDoc.SMS.Haozhuma.UIDs
+		h5 := h.cfg.HaozhumaH5
+		go func(want []string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			wantSet := map[string]bool{}
+			for _, u := range want {
+				wantSet[u] = true
+			}
+			// 1) 取消勾选的已加入码 → 移出账户。
+			mine, err := h5.MyUIDs(ctx, "")
+			if err == nil {
+				var toRemove []string
+				for _, m := range mine {
+					if !wantSet[m.UID] {
+						toRemove = append(toRemove, m.UID)
+					}
+				}
+				if len(toRemove) > 0 {
+					if err := h5.RemoveUIDs(ctx, toRemove); err == nil {
+						log.Printf("[haozhuma] 对接码自动清理：%d 个取消勾选的码已移出豪猪账户（%v）", len(toRemove), toRemove)
+					} else {
+						log.Printf("[haozhuma] 对接码自动清理失败（%d 个）：%v", len(toRemove), err)
+					}
+				}
+			}
+			// 2) 新勾选的码 → 加入账户（幂等，已加入的吸收掉）。
+			mine2, err := h5.MyUIDs(ctx, "")
+			if err == nil {
+				have := map[string]bool{}
+				for _, m := range mine2 {
+					have[m.UID] = true
+				}
+				for _, u := range want {
+					if !have[u] {
+						if err := h5.AddUID(ctx, u); err == nil {
+							log.Printf("[haozhuma] 对接码自动加入：%s 已加入豪猪账户", u)
+						} else {
+							log.Printf("[haozhuma] 对接码自动加入失败（%s）：%v", u, err)
+						}
+					}
+				}
+			}
+		}(want)
+	}
 	restartRequired := h.cfg.UpdateSchedule == nil
 	// 完整排程热更新：新字段（travel/activity/blackcat/开关）齐备时走
 	// ReconfigureSchedule 即时生效；老调用只给 checkin/keepalive 时退回
@@ -1760,22 +1895,34 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 			updated["haozhuma_sid_restart_required"] = true
 		}
 	}
-	// 取号策略热改：author/uid/isp。任一显式提供就整体推一次（UpdateFetchOptions
-	// 是幂等赋值，未变的字段推现值无害）。
-	if req.SMS != nil && (req.SMS.Haozhuma.Author != nil || req.SMS.Haozhuma.UID != nil || req.SMS.Haozhuma.ISP != nil) {
+	// 取号策略热改：author/uid/uids/isp。任一显式提供就整体推一次
+	//（UpdateFetchOptions 是幂等赋值，未变的字段推现值无害）。
+	if req.SMS != nil && (req.SMS.Haozhuma.Author != nil || req.SMS.Haozhuma.UID != nil ||
+		req.SMS.Haozhuma.UIDs != nil || req.SMS.Haozhuma.ISP != nil) {
 		if h.cfg.SetHaozhumaFetch != nil {
 			// 基准 = 落盘后的合并值（out），未显式提供的字段自动带现值。
 			var merged struct {
 				SMS struct {
 					Haozhuma struct {
-						Author string `json:"author"`
-						UID    string `json:"uid"`
-						ISP    string `json:"isp"`
+						Author string   `json:"author"`
+						UID    string   `json:"uid"`
+						UIDs   []string `json:"uids"`
+						ISP    string   `json:"isp"`
 					} `json:"haozhuma"`
 				} `json:"sms"`
 			}
 			_ = json.Unmarshal(out, &merged)
-			h.cfg.SetHaozhumaFetch(merged.SMS.Haozhuma.Author, merged.SMS.Haozhuma.UID, merged.SMS.Haozhuma.ISP)
+			// uids 只在本次（或落盘文件）显式提供时下发 nil-语义区分：
+			// merged 拿不到"是否提供"——用 req 是否提供判定，未提供推 nil
+			// 保持池现值。
+			var uids []string
+			if req.SMS.Haozhuma.UIDs != nil || len(merged.SMS.Haozhuma.UIDs) > 0 {
+				uids = merged.SMS.Haozhuma.UIDs
+			}
+			if req.SMS.Haozhuma.UIDs != nil {
+				uids = merged.SMS.Haozhuma.UIDs
+			}
+			h.cfg.SetHaozhumaFetch(merged.SMS.Haozhuma.Author, merged.SMS.Haozhuma.UID, uids, merged.SMS.Haozhuma.ISP)
 			updated["haozhuma_fetch"] = true
 		} else {
 			updated["haozhuma_fetch_restart_required"] = true
