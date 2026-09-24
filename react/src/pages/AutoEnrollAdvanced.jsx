@@ -2,9 +2,10 @@ import React, { useEffect, useState } from 'react';
 import {
   Alert, Button, Divider, Drawer, Form, Input, InputNumber, message, Modal, Popconfirm, Select, Space, Tag, Typography,
 } from 'antd';
-import { SearchOutlined } from '@ant-design/icons';
+import { SearchOutlined, TableOutlined } from '@ant-design/icons';
 
 import ProjectPickerModal from './ProjectPickerModal';
+import UIDPickerModal from './UIDPickerModal';
 
 const { Text, Paragraph } = Typography;
 
@@ -40,6 +41,8 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
 
   // —— 项目搜索（H5 type=30 代理）——浮窗选择器（ProjectPickerModal）——
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+  // —— 对接码列表（H5 type=8）——浮窗选择器（UIDPickerModal）——
+  const [uidPickerOpen, setUidPickerOpen] = useState(false);
 
   // —— 对接码列表（H5 type=8 代理，按选中的项目 sid 拉取） ——
   // 注意：type=8 只认 16 位 hex 项目标识（type=30 返回的 sid），不认
@@ -275,11 +278,10 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           </Space.Compact>
         </Form.Item>
         <Form.Item
-          name="uid"
           label="对接码"
           extra={
             uidError ? <Text type="danger">{uidError}（已退化为手填）</Text>
-              : uidItems != null ? '带价格/库存/运营商标签，置顶款标星。选中的码会钉死专属通道（成功率更高）。'
+              : h5Ready && uidItems != null && uidItems.length > 0 ? `点「浏览对接码」浮窗选择（${uidItems.length} 个，价格/库存可排序）。选中的码会钉死专属通道（成功率更高）。`
                 : '留空 = 平台随机分配。指定有号的对接码成功率更高（实测 6/6 vs 随机 3/6）。'
           }
           validateTrigger={false}
@@ -289,36 +291,21 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
               : Promise.reject(new Error('格式形如 52283-WW9L2J4WOL')),
           }]}
         >
-          {h5Ready && uidItems != null && uidItems.length > 0 ? (
-            <Select
-              showSearch
-              allowClear
-              placeholder="选择对接码"
-              optionFilterProp="value"
-              loading={uidLoading}
-              options={uidItems.map(u => ({
-                value: u.uid,
-                label: (
-                  <div>
-                    <Space size={4} wrap>
-                      {u.pinned && <Tag color="gold" style={{ marginRight: 0 }}>置顶</Tag>}
-                      <Text strong>{u.uid}</Text>
-                      <Text type="secondary">{Number(u.price).toFixed(2)}元</Text>
-                      <Tag style={{ marginRight: 0 }}>{u.stock >= 0 ? `库存 ${u.stock}` : '库存未知'}</Tag>
-                      {(u.isps || []).length > 0 && <Tag style={{ marginRight: 0 }}>{u.isps.join('/')}</Tag>}
-                      {u.segment_type && u.segment_type !== '未知号段' && (
-                        <Tag color="orange" style={{ marginRight: 0 }}>{u.segment_type}</Tag>
-                      )}
-                    </Space>
-                  </div>
-                ),
-              }))}
-            />
-          ) : h5Ready && uidLoading ? (
-            <Select loading placeholder="对接码列表加载中…" />
-          ) : (
-            <Input allowClear placeholder="如 52283-WW9L2J4WOL，留空自动分配" />
-          )}
+          <Space.Compact style={{ width: '100%' }}>
+            <Form.Item name="uid" noStyle>
+              <Input allowClear placeholder="留空自动分配，如 52283-WW9L2J4WOL" style={{ width: h5Ready && uidItems != null && uidItems.length > 0 ? '100%' : '100%' }} />
+            </Form.Item>
+            {h5Ready && (
+              <Button
+                icon={<TableOutlined />}
+                onClick={() => setUidPickerOpen(true)}
+                disabled={uidItems == null && !uidLoading}
+                loading={uidLoading && uidItems == null}
+              >
+                浏览对接码{uidItems != null && uidItems.length > 0 ? `（${uidItems.length}）` : ''}
+              </Button>
+            )}
+          </Space.Compact>
         </Form.Item>
         <Form.Item
           name="isp"
@@ -376,6 +363,20 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
         onClose={() => setProjectPickerOpen(false)}
         api={api}
         onPick={handlePickProject}
+      />
+
+      {/* 浮窗式对接码选择器：Table 浏览（价格/库存排序），点选回填。 */}
+      <UIDPickerModal
+        open={uidPickerOpen}
+        onClose={() => setUidPickerOpen(false)}
+        uidItems={uidItems}
+        loading={uidLoading}
+        currentUid={form.getFieldValue('uid')}
+        onPick={(u) => {
+          if (!u || !u.uid) return;
+          form.setFieldValue('uid', u.uid);
+          setDirty(true);
+        }}
       />
     </Drawer>
   );
