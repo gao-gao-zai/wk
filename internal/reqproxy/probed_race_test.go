@@ -16,7 +16,7 @@ func TestProbedFlagRace(t *testing.T) {
 		specs[i] = NodeSpec{
 			ID: nodeIDN(i), Name: nodeIDN(i), Protocol: "http",
 			Source: "manual",
-			Spec: map[string]any{"host": "127.0.0.1", "port": 8080},
+			Spec:   map[string]any{"host": "127.0.0.1", "port": 8080},
 		}
 	}
 	p.SetNodes(specs)

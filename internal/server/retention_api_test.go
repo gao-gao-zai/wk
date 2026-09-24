@@ -51,13 +51,13 @@ func TestAdminConfigRequestLogRetention(t *testing.T) {
 	for _, bad := range []map[string]*int{
 		{"days": intPtr(-1)},
 		{"days": intPtr(4000)},
-		{"rows": intPtr(50)},  // < 100 下限
+		{"rows": intPtr(50)}, // < 100 下限
 		{"rows": intPtr(-5)},
 		{"rows": intPtr(2000000)},
 	} {
 		body, _ := json.Marshal(map[string]any{
-			"checkin_hours":          []int{3},
-			"keepalive_hours":        []int{9},
+			"checkin_hours":         []int{3},
+			"keepalive_hours":       []int{9},
 			"request_log_retention": bad,
 		})
 		req := httptest.NewRequest(http.MethodPost, "/admin/config", strings.NewReader(string(body)))
@@ -149,5 +149,3 @@ func TestAdminConfigRetentionNoHook(t *testing.T) {
 }
 
 func intPtr(v int) *int { return &v }
-
-

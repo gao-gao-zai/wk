@@ -5,12 +5,19 @@
 package upstream
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
 
 	"workbuddy2api/internal/auth"
 )
+
+// ErrNoProxyNode 代理层没有可用节点（reqproxy D4）。
+// 这是池级故障：请求必须失败，但调用方不应把它记成账号的错
+// （不喂熔断、不禁用）。reqproxy 侧用 errors.Is 可识别的同名错误包装进来。
+var ErrNoProxyNode = errors.New("无可用代理节点")
 
 // DialProxyFunc 返回该账号应走的本地代理（reqproxy 槽位端口）。
 //
@@ -70,7 +77,9 @@ func (c *Client) proxyClientFor(a *auth.Auth) (*http.Client, error) {
 	}
 	proxy, err := c.DialProxy(ao.uid, ao.region)
 	if err != nil {
-		return nil, err // D4：无可用节点，调用方必须让请求失败
+		// D4：无可用节点，调用方必须让请求失败。
+		// 包一层哨兵：账号侧可以识别出"这是代理池的错"，不惩罚账号。
+		return nil, fmt.Errorf("%w: %w", ErrNoProxyNode, err)
 	}
 	if proxy == nil {
 		return c.HTTP, nil // 直连

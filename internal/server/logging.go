@@ -515,49 +515,49 @@ type sseStatsChunk struct {
 // sseStatsUsage 覆盖上游/兼容层用过的全部 token 计数字段命名。
 // nested details 与平级字段并存时取 max（对齐旧 map 实现的 maxInts 口径）。
 type sseStatsUsage struct {
-	PromptTokens    int `json:"prompt_tokens"`
-	InputTokens     int `json:"input_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	InputTokens      int `json:"input_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
-	OutputTokens    int `json:"output_tokens"`
-	TotalTokens     int `json:"total_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 
-	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
-	CacheReadInputTokens  int `json:"cache_read_input_tokens"`
-	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	PromptCacheHitTokens     int `json:"prompt_cache_hit_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	PromptCacheMissTokens    int `json:"prompt_cache_miss_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 
 	PromptTokensDetails struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
 	InputTokensDetails struct {
-		CachedTokens          int `json:"cached_tokens"`
+		CachedTokens             int `json:"cached_tokens"`
 		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-		CacheWriteTokens      int `json:"cache_write_tokens"`
+		CacheWriteTokens         int `json:"cache_write_tokens"`
 	} `json:"input_tokens_details"`
 
 	// credit 裸名优先（WorkBuddy 真实字段），长名兜底（兼容层/参考实现）。
 	// 用 *float64 而非裸 float64：credit=0 是合法观测（费用舍入到 0），
 	// 必须与"字段缺失"（nil）区分，语义对齐 map 版 extractCreditUsage 的
 	// 键序契约（见 credit_field_test.go）。
-	Credit            *float64 `json:"credit"`
-	CreditsConsumed   *float64 `json:"credits_consumed"`
-	CreditConsumed    *float64 `json:"credit_consumed"`
-	CreditsUsed       *float64 `json:"credits_used"`
-	CreditUsed        *float64 `json:"credit_used"`
-	UsedCredits       *float64 `json:"used_credits"`
-	ConsumedCredits   *float64 `json:"consumed_credits"`
-	CostCredits       *float64 `json:"cost_credits"`
-	BillableCredits   *float64 `json:"billable_credits"`
-	CreditCost        *float64 `json:"credit_cost"`
-	CreditsConsumedC  *float64 `json:"creditsConsumed"`
-	CreditConsumedC   *float64 `json:"creditConsumed"`
-	CreditsUsedC      *float64 `json:"creditsUsed"`
-	CreditUsedC       *float64 `json:"creditUsed"`
-	UsedCreditsC      *float64 `json:"usedCredits"`
-	ConsumedCreditsC  *float64 `json:"consumedCredits"`
-	CostCreditsC      *float64 `json:"costCredits"`
-	BillableCreditsC  *float64 `json:"billableCredits"`
-	CreditCostC       *float64 `json:"creditCost"`
+	Credit           *float64 `json:"credit"`
+	CreditsConsumed  *float64 `json:"credits_consumed"`
+	CreditConsumed   *float64 `json:"credit_consumed"`
+	CreditsUsed      *float64 `json:"credits_used"`
+	CreditUsed       *float64 `json:"credit_used"`
+	UsedCredits      *float64 `json:"used_credits"`
+	ConsumedCredits  *float64 `json:"consumed_credits"`
+	CostCredits      *float64 `json:"cost_credits"`
+	BillableCredits  *float64 `json:"billable_credits"`
+	CreditCost       *float64 `json:"credit_cost"`
+	CreditsConsumedC *float64 `json:"creditsConsumed"`
+	CreditConsumedC  *float64 `json:"creditConsumed"`
+	CreditsUsedC     *float64 `json:"creditsUsed"`
+	CreditUsedC      *float64 `json:"creditUsed"`
+	UsedCreditsC     *float64 `json:"usedCredits"`
+	ConsumedCreditsC *float64 `json:"consumedCredits"`
+	CostCreditsC     *float64 `json:"costCredits"`
+	BillableCreditsC *float64 `json:"billableCredits"`
+	CreditCostC      *float64 `json:"creditCost"`
 }
 
 func (u sseStatsUsage) empty() bool {

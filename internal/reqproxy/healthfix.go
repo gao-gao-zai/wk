@@ -58,7 +58,7 @@ func (m *Manager) nodeIsBad(nodeID string) bool {
 			bad = true
 			return
 		}
-		if st.Rules.MaxLatencyMs > 0 && h.LatencyMs >= 0 && h.LatencyMs > int64(st.Rules.MaxLatencyMs) {
+		if st.Rules.MaxLatencyMs > 0 && latencyOverLimit(h, st.Rules) {
 			bad = true
 		}
 	})

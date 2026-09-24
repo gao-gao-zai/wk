@@ -103,6 +103,8 @@ func (p *Pool) ResetSlots() (pins map[string]string, removeOps []KernelOp) {
 	p.slots = map[string]*Slot{}
 	p.bindngs = map[string]Binding{}
 	p.nextPort = p.portMin // 端口从头分配（内核 remove 后即释放）
+	// 测速占用的端口不在这次清空范围内（内核 probe 槽还活着），保留登记，
+	// 否则从头分配会把正在测速的端口再发出去。
 	p.persistLocked()
 	return pins, removeOps
 }

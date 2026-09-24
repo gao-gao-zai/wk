@@ -12,12 +12,12 @@ import (
 // Job 任务记录。
 type Job struct {
 	ID        string    `json:"id"`
-	Kind      string    `json:"kind"`   // health-run | rebalance | sub-refresh | prewarm
-	Label     string    `json:"label"`  // 展示名（"全量测速"）
-	State     string    `json:"state"`  // running | done | error
+	Kind      string    `json:"kind"`  // health-run | rebalance | sub-refresh | prewarm
+	Label     string    `json:"label"` // 展示名（"全量测速"）
+	State     string    `json:"state"` // running | done | error
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at,omitempty"`
-	Note      string    `json:"note,omitempty"`  // 结果摘要 / 错误信息
+	Note      string    `json:"note,omitempty"` // 结果摘要 / 错误信息
 }
 
 // jobTracker 任务登记簿。

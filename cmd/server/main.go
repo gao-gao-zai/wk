@@ -236,7 +236,11 @@ func main() {
 	var metricsDB metricsstore.Backend
 	if cfg.Postgres.DSN != "" {
 		metricsDB, err = metricsstore.OpenPostgres(cfg.Postgres.DSN, cfg.Postgres.MaxOpenConns, cfg.Postgres.MaxIdleConns, cfg.PostgresMaxLifetime, cfg.PostgresMaxIdleTime)
-		if ps, ok := metricsDB.(*metricsstore.PostgresStore); ok {
+		if err != nil {
+			// 失败时返回的是带类型的 nil。留在接口里会被当成非 nil，
+			// 紧接着的类型断言和后面的 metricsDB != nil 都会踩空指针。
+			metricsDB = nil
+		} else if ps, ok := metricsDB.(*metricsstore.PostgresStore); ok {
 			ps.SetRetention(retention)
 		}
 		if err != nil && cfg.Postgres.FallbackToSQLite {

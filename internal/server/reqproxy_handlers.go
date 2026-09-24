@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/reqproxy"
 )
 
@@ -33,12 +35,12 @@ func (h *Handler) reqproxyConfigGet(w http.ResponseWriter, r *http.Request) {
 	h.cfg.ReqProxy.View(func(st *reqproxy.State) {
 		rules := st.Rules
 		writeJSON(w, http.StatusOK, map[string]any{
-			"enabled":           st.Enabled,
-			"rules":             rules,
-			"subscriptions":     len(st.Subscriptions),
-			"manual_nodes":      len(st.ManualNodes),
-			"slots":             len(st.Slots),
-			"bindings":          len(st.Bindings),
+			"enabled":       st.Enabled,
+			"rules":         rules,
+			"subscriptions": len(st.Subscriptions),
+			"manual_nodes":  len(st.ManualNodes),
+			"slots":         len(st.Slots),
+			"bindings":      len(st.Bindings),
 		})
 	})
 }
@@ -48,12 +50,19 @@ func (h *Handler) reqproxyConfigPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Enabled *bool          `json:"enabled"`
+		Enabled *bool           `json:"enabled"`
 		Rules   *reqproxy.Rules `json:"rules"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
 		return
+	}
+	if req.Rules != nil {
+		// 节奏参数越界直接拒绝（Normalize 只兜旧数据，不兜手写 payload）。
+		if err := reqproxy.ValidateTTFBRules(*req.Rules); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 	wasEnabled := false
 	h.cfg.ReqProxy.View(func(st *reqproxy.State) { wasEnabled = st.Enabled })
@@ -72,6 +81,7 @@ func (h *Handler) reqproxyConfigPut(w http.ResponseWriter, r *http.Request) {
 			if rr.RegionRules == nil {
 				rr.RegionRules = map[string][]string{}
 			}
+			rr.NormalizeTTFB()
 			st.Rules = rr
 		}
 	})
@@ -227,6 +237,7 @@ func (h *Handler) reqproxyNodesGet(w http.ResponseWriter, r *http.Request) {
 	}
 	nodes := h.cfg.ReqProxy.NodesSnapshot()
 	slots, _ := h.cfg.ReqProxy.Views()
+	ttfb := h.cfg.ReqProxy.TTFBResults()
 	pointed := map[string]int{}
 	for _, s := range slots {
 		if s.NodeID != "" {
@@ -237,16 +248,29 @@ func (h *Handler) reqproxyNodesGet(w http.ResponseWriter, r *http.Request) {
 	loads := h.cfg.ReqProxy.NodeLoads()
 	for _, n := range nodes {
 		health := h.cfg.ReqProxy.HealthOf(n.ID)
-		out = append(out, map[string]any{
+		row := map[string]any{
 			"id": n.ID, "name": n.Name, "protocol": n.Protocol,
 			"source": n.Source, "region": n.Region,
-			"probed": n.Probed,
+			"probed":        n.Probed,
 			"pointed_slots": pointed[n.ID],
 			"requests":      loads[n.ID], // 累计请求数（真实负载）
 			"latency_ms":    health.LatencyMs, "checked_at": health.CheckedAt,
-			"unhealthy":     health.Unhealthy, "unhealthy_until": health.UnhealthyUntil,
-			"fail_streak":   health.FailStreak, // >0 且非 unhealthy = 测过但失败（UI 区分"未测"与"失败"）
-		})
+			"unhealthy": health.Unhealthy, "unhealthy_until": health.UnhealthyUntil,
+			"fail_streak": health.FailStreak, // >0 且非 unhealthy = 测过但失败（UI 区分"未测"与"失败"）
+		}
+		if health.TTFBChecked.IsZero() {
+			if t, ok := ttfb[n.ID]; ok {
+				row["ttfb_ms"] = t.TTFBMs
+				row["ttfb_error"] = t.Error
+				row["ttfb_checked_at"] = t.CheckedAt
+				row["ttfb_skipped"] = t.Skipped
+			}
+		} else {
+			row["ttfb_ms"] = health.TTFBMs
+			row["ttfb_error"] = health.TTFBError
+			row["ttfb_checked_at"] = health.TTFBChecked
+		}
+		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": out})
 }
@@ -295,6 +319,7 @@ func (h *Handler) reqproxySlotsGet(w http.ResponseWriter, r *http.Request) {
 		nodes[n.ID] = map[string]any{
 			"name": n.Name, "region": n.Region, "protocol": n.Protocol,
 			"latency_ms": health.LatencyMs, "unhealthy": health.Unhealthy,
+			"ttfb_ms": health.TTFBMs,
 		}
 	}
 	out := make([]map[string]any, 0, len(slots))
@@ -384,6 +409,89 @@ func (h *Handler) reqproxyHealthRun(w http.ResponseWriter, r *http.Request) {
 	// 任务化：立即返回任务 ID，前端轮询驱动 loading（刷新不丢）
 	id := h.cfg.ReqProxy.RunHealthOnce()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job_id": id, "note": "全量测速已开始（结束后自动预热+再平衡）"})
+}
+
+// reqproxyTTFBRun 用指定分组的账号对全部节点打一次最小对话，量真实首字。
+//
+// 与连通性测速分开：结果只供查看，不写健康状态、不参与摘除。
+// body: {"group": "测速", "model": "glm-5.3", "concurrency": 4, "timeout_seconds": 60}
+func (h *Handler) reqproxyTTFBRun(w http.ResponseWriter, r *http.Request) {
+	if !h.reqproxyEnabled(w) {
+		return
+	}
+	var req struct {
+		Group          string `json:"group"`
+		Model          string `json:"model"`
+		Concurrency    int    `json:"concurrency"`
+		TimeoutSeconds int    `json:"timeout_seconds"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil && err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	if req.Concurrency <= 0 {
+		req.Concurrency = 4
+	}
+	if req.Concurrency > 16 {
+		req.Concurrency = 16
+	}
+	if req.TimeoutSeconds <= 0 {
+		req.TimeoutSeconds = 60
+	}
+	if req.TimeoutSeconds > 180 {
+		req.TimeoutSeconds = 180
+	}
+	id, err := h.cfg.ReqProxy.RunTTFB(req.Group, req.Model, req.Concurrency, time.Duration(req.TimeoutSeconds)*time.Second)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job_id": id, "note": "真实首字测速已开始"})
+}
+
+// ttfbAccountSource 把分组存储 + 账号池适配成 reqproxy 的测速账号来源。
+type ttfbAccountSource struct{ h *Handler }
+
+func (s ttfbAccountSource) AccountsForGroup(group string) []reqproxy.TTFBAccount {
+	var allow map[string]bool
+	if group != "" && s.h.cfg.Groups != nil {
+		allow = s.h.cfg.Groups.AccountsInGroup(group)
+	}
+	var out []reqproxy.TTFBAccount
+	for _, uid := range s.h.cfg.Pool.UIDs() {
+		if allow != nil && !allow[uid] {
+			continue
+		}
+		a := s.h.cfg.Pool.AuthByUID(uid)
+		if a == nil {
+			continue
+		}
+		out = append(out, reqproxy.TTFBAccount{Auth: a, Region: a.Region()})
+	}
+	return out
+}
+
+// ttfbTokenRefresher 探测前按需刷新账号 token（自动/手动首字测速共用）。
+type ttfbTokenRefresher struct{ h *Handler }
+
+func (s ttfbTokenRefresher) EnsureFresh(a *auth.Auth) error {
+	if a == nil {
+		return fmt.Errorf("nil auth")
+	}
+	if s.h.cfg.Upstream == nil {
+		return fmt.Errorf("upstream client 未配置")
+	}
+	if !a.NeedsRefresh(s.h.cfg.RefreshSkew) {
+		return nil // 未到期：不打刷新接口
+	}
+	if err := s.h.cfg.Upstream.RefreshToken(a); err != nil {
+		return err
+	}
+	// 刷新成功落盘（与线上请求路径同一份持久化）。
+	if err := a.SaveAtomic(); err != nil {
+		return fmt.Errorf("刷新成功但落盘失败: %w", err)
+	}
+	return nil
 }
 
 // reqproxyRebalancePost 手动触发负载再平衡（任务化）。

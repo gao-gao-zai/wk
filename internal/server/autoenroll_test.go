@@ -1281,4 +1281,3 @@ func waitDone(t *testing.T, en *AutoEnroller) {
 	}
 	t.Fatal("auto-enroll did not finish in 30s")
 }
-

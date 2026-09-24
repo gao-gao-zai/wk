@@ -5,18 +5,19 @@ package reqproxy
 import (
 	"fmt"
 	"net/url"
+	"sort"
 	"sync"
 	"time"
 )
 
 // Config reqproxy 模块配置（config.json 的 reqproxy 块）。
 type Config struct {
-	StateFile          string        // 默认 ./data/reqproxy/state.json
-	HealthInterval     time.Duration // 默认 15m
-	LatencyTimeout     time.Duration // 默认 5s
-	UnhealthyCooldown  time.Duration // 默认 10m
-	PortMin            int           // 槽位端口段，默认 31080
-	PortMax            int           // 默认 31999
+	StateFile         string        // 默认 ./data/reqproxy/state.json
+	HealthInterval    time.Duration // 默认 15m
+	LatencyTimeout    time.Duration // 默认 5s
+	UnhealthyCooldown time.Duration // 默认 10m
+	PortMin           int           // 槽位端口段，默认 31080
+	PortMax           int           // 默认 31999
 }
 
 // DefaultConfig 默认配置。
@@ -59,6 +60,13 @@ type Manager struct {
 	// 账号清单（预热用；main 注入，nil = 关闭预热）
 	acctSrc AccountSource
 
+	// 真实首字测速（用指定分组的账号打最小对话）。
+	ttfb *TTFBProber
+
+	// 自动首字扫描循环（ttfb_group 非空时取代周期连通性测速）
+	scanStop chan struct{}
+	scanDone chan struct{}
+
 	// 内核热替换期间的槽位出站保护
 	kernMu sync.Mutex
 }
@@ -73,13 +81,19 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		cfg:     cfg,
-		store:   store,
-		kernel:  kernel,
-		subStop: make(chan struct{}),
-		subDone: make(chan struct{}),
+		cfg:      cfg,
+		store:    store,
+		kernel:   kernel,
+		subStop:  make(chan struct{}),
+		subDone:  make(chan struct{}),
+		scanStop: make(chan struct{}),
+		scanDone: make(chan struct{}),
 	}
 	m.pool = NewPool(store, cfg.PortMin, cfg.PortMax)
+	if cfg.UnhealthyCooldown > 0 {
+		m.pool.SetUnhealthyCooldown(cfg.UnhealthyCooldown)
+	}
+	m.ttfb = NewTTFBProber(m.pool, m)
 
 	hcfg := HealthConfig{
 		Interval:          cfg.HealthInterval,
@@ -92,6 +106,14 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 	}
 	m.health = NewHealth(hcfg, m.pool, m)
 
+	// 自动首字测速开启（ttfb_group 非空）时，周期连通性 HEAD 让位：
+	// 健康维护（摘除/预热/再平衡）改由扫描循环一圈结束后触发。
+	m.health.SetSkipRound(func() bool {
+		var group string
+		m.store.View(func(st *State) { group = st.Rules.TTFBGroup })
+		return group != ""
+	})
+
 	// 启动时的槽位内核恢复延后到订阅刷新完成（节点池就绪后才有 outbound
 	// 可接），见下面的启动 goroutine。
 	// 每轮测速结束后：修正坏节点槽位 → 预热未绑定账号 → 负载再平衡
@@ -103,6 +125,7 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 	})
 	m.health.Start()
 	go m.subscriptionLoop()
+	go m.autoTTFBScanLoop()
 	// 启动恢复：订阅的节点池是内存态（state.json 不存节点定义），
 	// 启动时刷新全部订阅拉回节点，然后恢复槽位指向 + 预热。
 	// 顺序：refresh（节点入池）→ restoreSlots（内核接回）→ prewarm。
@@ -138,11 +161,153 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 func (m *Manager) Close() {
 	close(m.subStop)
 	<-m.subDone
+	close(m.scanStop)
+	<-m.scanDone
 	m.health.Stop()
 	if m.kernel != nil {
 		m.kernel.Close()
 	}
 	m.store.Close()
+}
+
+// autoTTFBScanLoop 自动真实首字扫描：ttfb_group 非空时，按规则里的节奏
+// 参数（间隔/并发/超时/模型）慢慢扫完全池，取代周期连通性 HEAD。
+//
+// 设计取向（见 rules.TTFBGroup 注释）：自动测速时效性要求不高——一次只
+// 测一小批节点，批间停顿，账号额度和代理压力摊开。一轮扫完做一次
+// 摘除/预热/再平衡（与健康测速的 after 回调同一组动作）。
+//
+// 游标 cursor 是节点 ID 排序后的数组下标，扫到尾回卷。分组或参数变更
+// 下一拍即生效（每拍重读规则），游标不重置。
+func (m *Manager) autoTTFBScanLoop() {
+	defer close(m.scanDone)
+	var (
+		cursor                        int // 节点数组游标（下标，非节点 ID）
+		acctIdx                       int // 账号轮转游标
+		roundDone                     bool
+		roundOK, roundFail, roundSkip int
+	)
+	const idlePoll = 5 * time.Second // 分组为空时的空转周期
+	for {
+		var rules Rules
+		m.store.View(func(st *State) { rules = st.Rules })
+		if rules.TTFBGroup == "" {
+			cursor, acctIdx, roundDone = 0, 0, false
+			select {
+			case <-time.After(idlePoll):
+			case <-m.scanStop:
+				return
+			}
+			continue
+		}
+		// 到点跑一批。批之间停 interval 秒（第一拍之前也停，避免启动
+		// 瞬间/规则刚保存就打出去）。
+		select {
+		case <-time.After(time.Duration(rules.TTFBIntervalSeconds) * time.Second):
+		case <-m.scanStop:
+			return
+		}
+		cursor, acctIdx, roundDone, roundOK, roundFail, roundSkip =
+			m.scanOneTick(rules, cursor, acctIdx, roundDone, roundOK, roundFail, roundSkip)
+	}
+}
+
+// scanOneTick 扫描循环的一拍：取批 → 探测 → 记账 → 圈尾联动。
+// 抽成方法便于测试（不睡真实间隔）。返回更新后的游标与轮内计数。
+func (m *Manager) scanOneTick(rules Rules, cursor, acctIdx int, roundDone bool, roundOK, roundFail, roundSkip int) (int, int, bool, int, int, int) {
+	// 手动测速在跑：让路（共用账号池，叠加会打满额度）。不排队补测。
+	if m.ttfb.Running() {
+		return cursor, acctIdx, roundDone, roundOK, roundFail, roundSkip
+	}
+	// 取一批节点（按 ID 排序，游标推进；池变化时游标按 ID 重新对齐）。
+	nodes := m.pool.NodesSnapshot()
+	if len(nodes) == 0 {
+		return cursor, acctIdx, roundDone, roundOK, roundFail, roundSkip
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	if cursor >= len(nodes) {
+		cursor = 0
+	}
+	batch := make([]Node, 0, rules.TTFBConcurrency)
+	for len(batch) < rules.TTFBConcurrency && cursor < len(nodes) {
+		batch = append(batch, nodes[cursor])
+		cursor++
+	}
+	// 一圈扫完的边界：cursor 回卷前记录，下一拍从 0 开始。
+	wrapped := cursor >= len(nodes)
+
+	// 取分组账号（每拍重取：账号池/分组会变），按 acctIdx 轮转。
+	accounts := m.ttfbAccountsLocked(rules.TTFBGroup)
+	if len(accounts) == 0 {
+		m.emitScanWarnOnce("分组 %q 里没有可用账号，自动首字测速暂停", rules.TTFBGroup)
+		return cursor, acctIdx, roundDone, roundOK, roundFail, roundSkip
+	}
+	m.clearScanWarn()
+	picked := make([]TTFBAccount, len(batch))
+	for i := range batch {
+		picked[i] = accounts[(acctIdx+i)%len(accounts)]
+	}
+	acctIdx = (acctIdx + len(batch)) % len(accounts)
+
+	results := m.ttfb.ProbeBatch(batch, picked, rules.TTFBModel, time.Duration(rules.TTFBTimeoutSeconds)*time.Second)
+	for _, r := range results {
+		switch {
+		case r.Error == "":
+			roundOK++
+		case r.Skipped:
+			roundSkip++
+		default:
+			roundFail++
+		}
+	}
+
+	if wrapped && !roundDone {
+		// 一圈结束：汇总 + after（摘除坏槽 → 预热 → 再平衡），与
+		// 健康测速轮的 after 完全同一组动作。
+		m.emit("info", fmt.Sprintf("自动首字测速完成一轮：%d 成功 / %d 失败 / %d 跳过（账号侧）", roundOK, roundFail, roundSkip))
+		roundOK, roundFail, roundSkip = 0, 0, 0
+		roundDone = true
+		m.afterProbeRound()
+	}
+	if wrapped {
+		cursor = 0
+		roundDone = false
+	}
+	return cursor, acctIdx, roundDone, roundOK, roundFail, roundSkip
+}
+
+// ttfbAccountsLocked 取分组账号（src 注入的来源）。独立小函数便于测试替换。
+func (m *Manager) ttfbAccountsLocked(group string) []TTFBAccount {
+	return m.ttfb.accounts(group)
+}
+
+// afterProbeRound 一轮探测后的联动（与健康测速的 after 相同）。
+func (m *Manager) afterProbeRound() {
+	m.fixupUnhealthySlots()
+	m.PrewarmIfDue()
+	m.Rebalance()
+}
+
+// scanWarnMu / scanWarnState：分组无账号的告警去重（同一状态只发一次）。
+var scanWarnMu sync.Mutex
+var scanWarnState string
+
+func (m *Manager) emitScanWarnOnce(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	scanWarnMu.Lock()
+	if scanWarnState == msg {
+		scanWarnMu.Unlock()
+		return
+	}
+	scanWarnState = msg
+	scanWarnMu.Unlock()
+	m.emit("warn", msg+"（恢复后自动继续）")
+}
+
+func (m *Manager) clearScanWarn() {
+	scanWarnMu.Lock()
+	scanWarnState = ""
+	scanWarnMu.Unlock()
 }
 
 // DialProxy upstream 钩子：返回该账号应走的本地代理端口。
@@ -164,6 +329,9 @@ func (m *Manager) DialProxy(uid, region string) (*url.URL, error) {
 	// 新建槽位 → 内核开槽（锁外）
 	if op != nil && m.kernel != nil {
 		if err := m.applyKernelOp(*op); err != nil {
+			// 绑定已经落盘，但端口没监听。不回滚的话，这个账号以后每次
+			// 请求都命中这条绑定，打到一个没有 inbound 的端口，永远 connection refused。
+			m.rollbackKernelSlot(uid, op.SlotID)
 			return nil, fmt.Errorf("内核开槽失败: %w", err)
 		}
 		m.emit("info", fmt.Sprintf("账号 %s 新建槽位 %s (port %d) 指向节点 %s", uid, op.SlotID, op.Port, op.NodeSpec.Name))
@@ -171,6 +339,36 @@ func (m *Manager) DialProxy(uid, region string) (*url.URL, error) {
 	// 负载计数：真实请求数是均衡的依据（账号数会骗人）
 	m.pool.CountRequest(uid)
 	return mustParseURL(fmt.Sprintf("http://127.0.0.1:%d", port)), nil
+}
+
+// rollbackSlotBindings 撤掉所有指向该槽位的绑定并删除槽位记录。
+// 用于重分配/再平衡：一次建槽可能承接了多个账号，建槽失败时整槽回滚。
+func (m *Manager) rollbackSlotBindings(slotID string) {
+	if m.kernel != nil {
+		m.kernMu.Lock()
+		_ = m.kernel.RemoveSlot(slotID)
+		m.kernMu.Unlock()
+	}
+	slots, views := m.pool.Views()
+	_ = slots
+	for _, v := range views {
+		if v.SlotID == slotID {
+			m.pool.RollbackAssign(v.UID, slotID)
+		}
+	}
+	m.pool.RemoveSlotRecord(slotID)
+}
+
+// rollbackKernelSlot 内核开槽失败后撤掉刚写下的绑定和槽位记录。
+// 内核侧也清一次：AddSlot 可能已经建了 inbound/路由、只在出站那一步失败，
+// 不删的话残留 inbound 会占着端口，下次重试还是失败。
+func (m *Manager) rollbackKernelSlot(uid, slotID string) {
+	if m.kernel != nil {
+		m.kernMu.Lock()
+		_ = m.kernel.RemoveSlot(slotID)
+		m.kernMu.Unlock()
+	}
+	m.pool.RollbackAssign(uid, slotID)
 }
 
 // applyKernelOp 执行内核操作（add-slot / retarget）。
@@ -403,10 +601,12 @@ func (m *Manager) TempPort(node NodeSpec, region string) (int, func(), error) {
 		return 0, nil, err
 	}
 	if err := m.kernel.AddSlot(tag, port, node); err != nil {
+		m.pool.releaseProbePort(port)
 		return 0, nil, err
 	}
 	release := func() {
 		_ = m.kernel.RemoveSlot(tag)
+		m.pool.releaseProbePort(port)
 	}
 	return port, release, nil
 }

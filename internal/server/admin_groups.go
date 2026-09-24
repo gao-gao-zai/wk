@@ -36,10 +36,10 @@ func (h *Handler) adminGroups(w http.ResponseWriter, r *http.Request) {
 		items := make([]map[string]any, 0)
 		for _, g := range h.cfg.Groups.List() {
 			items = append(items, map[string]any{
-				"name":         g,
-				"default":      g == groups.DefaultGroup,
-				"accounts":     counts[g],
-				"keys":         keyCounts[g],
+				"name":     g,
+				"default":  g == groups.DefaultGroup,
+				"accounts": counts[g],
+				"keys":     keyCounts[g],
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"groups": items})

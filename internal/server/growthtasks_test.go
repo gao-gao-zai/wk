@@ -383,13 +383,13 @@ func TestGrowthLedgerRecordsClaimsAndOverview(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.mux.ServeHTTP(rec, req)
 	var ov struct {
-		TotalAccounts  int `json:"total_accounts"`
-		DoneAccounts   int `json:"done_accounts"`
-		PartialAccounts int `json:"partial_accounts"`
-		NotStarted     int `json:"not_started"`
-		TotalCredit    int64 `json:"total_credit"`
-		TotalEnergy    int64 `json:"total_energy"`
-		Accounts       []struct {
+		TotalAccounts   int   `json:"total_accounts"`
+		DoneAccounts    int   `json:"done_accounts"`
+		PartialAccounts int   `json:"partial_accounts"`
+		NotStarted      int   `json:"not_started"`
+		TotalCredit     int64 `json:"total_credit"`
+		TotalEnergy     int64 `json:"total_energy"`
+		Accounts        []struct {
 			UID       string `json:"uid"`
 			Status    string `json:"status"`
 			DoneCount int    `json:"done_count"`

@@ -42,8 +42,8 @@ type ledgerAccount struct {
 
 // growthLedger 内存态 + 落盘。启动读入；领取时追加并原子写回。
 type growthLedger struct {
-	mu   sync.Mutex
-	path string
+	mu    sync.Mutex
+	path  string
 	byUID map[string]*ledgerAccount // key: uid
 	order []string                  // 首次记录顺序（落盘保留，读回恢复）
 }
@@ -128,26 +128,26 @@ func (l *growthLedger) flushLocked() {
 
 // ledgerSummary 单账号的台账汇总（查询端点用）。
 type ledgerSummary struct {
-	UID        string   `json:"uid"`
-	Nickname   string   `json:"nickname,omitempty"`
-	Status     string   `json:"status"`            // done | partial | not_started
-	DoneCount  int      `json:"done_count"`        // 已领取任务数（台账 + 上游对账）
-	TotalCount int      `json:"total_count"`       // 该账号可自动任务总数（growthActions）
-	Credit     int64    `json:"credit"`            // 台账记录的积分收益
-	Energy     int64    `json:"energy"`            // 台账记录的能量收益
-	LastAt     string   `json:"last_at,omitempty"` // 最近一次领取时间
-	Tasks      []ledgerClaim `json:"tasks,omitempty"` // 逐任务明细（可展开）
+	UID        string        `json:"uid"`
+	Nickname   string        `json:"nickname,omitempty"`
+	Status     string        `json:"status"`            // done | partial | not_started
+	DoneCount  int           `json:"done_count"`        // 已领取任务数（台账 + 上游对账）
+	TotalCount int           `json:"total_count"`       // 该账号可自动任务总数（growthActions）
+	Credit     int64         `json:"credit"`            // 台账记录的积分收益
+	Energy     int64         `json:"energy"`            // 台账记录的能量收益
+	LastAt     string        `json:"last_at,omitempty"` // 最近一次领取时间
+	Tasks      []ledgerClaim `json:"tasks,omitempty"`   // 逐任务明细（可展开）
 }
 
 // ledgerOverview 全局统计 + 三态账号列表。
 type ledgerOverview struct {
-	TotalAccounts int   `json:"total_accounts"`
-	DoneAccounts  int   `json:"done_accounts"`
-	PartialAccounts int `json:"partial_accounts"`
-	NotStarted    int   `json:"not_started"`
-	TotalCredit   int64 `json:"total_credit"` // 台账口径的额外积分收益
-	TotalEnergy   int64 `json:"total_energy"`
-	Accounts      []ledgerSummary `json:"accounts"`
+	TotalAccounts   int             `json:"total_accounts"`
+	DoneAccounts    int             `json:"done_accounts"`
+	PartialAccounts int             `json:"partial_accounts"`
+	NotStarted      int             `json:"not_started"`
+	TotalCredit     int64           `json:"total_credit"` // 台账口径的额外积分收益
+	TotalEnergy     int64           `json:"total_energy"`
+	Accounts        []ledgerSummary `json:"accounts"`
 }
 
 // ledgerCacheTTL 上游对账结果的缓存时长。三态判定是低频慢变数据：
@@ -158,13 +158,13 @@ const ledgerCacheTTL = 10 * time.Minute
 // ledgerCache 上游 ListTasks 对账结果的 TTL 缓存（账号集 + 结果快照）。
 // key = 账号 uid 列表（池变化 = 不同 key，自动失效）。
 type ledgerCache struct {
-	mu       sync.Mutex
-	key      string   // 参与对账的 uid 逗号串（签名）
-	fetched  time.Time
-	results  [][]upstream.Task
+	mu      sync.Mutex
+	key     string // 参与对账的 uid 逗号串（签名）
+	fetched time.Time
+	results [][]upstream.Task
 	// byUID 单账号索引（与 results 同源同 TTL）：批跑预跳过按号查快，
 	// 不必线性扫描。填充于 set；invalidate 清空。
-	byUID    map[string][]upstream.Task
+	byUID map[string][]upstream.Task
 }
 
 // signature 账号集签名（uid 顺序拼接）。

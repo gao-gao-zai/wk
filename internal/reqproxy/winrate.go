@@ -11,6 +11,7 @@
 package reqproxy
 
 import "time"
+
 type WinRate struct {
 	bucketLen time.Duration // 单桶时长
 	n         int           // 桶数（窗口 = bucketLen × n）

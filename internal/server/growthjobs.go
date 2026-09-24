@@ -247,7 +247,7 @@ type growthJobMark struct {
 func (h *Handler) growthJobMarkPath() string { return h.cfg.GrowthJobMarkPath }
 
 // writeGrowthJobMark 原子写标记文件（待跑清单快照）。空清单不写文件
-//（避免残留 {"pending":[]}——恢复读不到即视为无任务，与删除语义一致）。
+// （避免残留 {"pending":[]}——恢复读不到即视为无任务，与删除语义一致）。
 func (h *Handler) writeGrowthJobMark(pending []string) {
 	path := h.growthJobMarkPath()
 	if path == "" || len(pending) == 0 {

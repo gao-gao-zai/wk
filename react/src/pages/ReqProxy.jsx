@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Alert, Button, Card, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Space,
+  Alert, Button, Card, Divider, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Space,
   Switch, Table, Tabs, Tag, Timeline, Tooltip, Typography, message,
 } from 'antd';
 import { ReloadOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons';
@@ -20,6 +20,16 @@ const PROTO_COLORS = {
   vmess: 'geekblue', vless: 'purple', trojan: 'volcano', ss: 'cyan',
   socks: 'green', http: 'default', wireguard: 'orange',
 };
+
+// latencyLabel 按当前规则显示延迟：选了真实首字就显示秒，否则显示连通性毫秒。
+// 没测过返回空串，调用方自己决定占位。
+function latencyLabel(n, cfg) {
+  if (cfg?.rules?.latency_source === 'ttfb') {
+    if (!n.ttfb_ms || n.ttfb_ms <= 0) return '';
+    return `${(n.ttfb_ms / 1000).toFixed(1)}秒`;
+  }
+  return n.latency_ms >= 0 ? `${n.latency_ms}ms` : '';
+}
 
 function nodeStatus(n) {
   if (n.unhealthy) return <Tag color="red">不健康</Tag>;
@@ -361,6 +371,34 @@ export default function ReqProxy({ api }) {
   };
 
   // 单节点测速：后端同步探测（秒级），按钮动画持续到结果返回。
+  // 真实首字测速：用指定分组的账号打最小对话，量到第一帧的时间。
+  const [ttfbOpen, setTtfbOpen] = useState(false);
+  const [ttfbGroup, setTtfbGroup] = useState('');
+  const [groups, setGroups] = useState([]);
+  const probeTTFB = async () => {
+    startingRef.current['ttfb-run'] = true;
+    setRunningJobs(p => ({ ...p, 'ttfb-run': { kind: 'ttfb-run', state: 'running' } }));
+    setTtfbOpen(false);
+    try {
+      const body = await api('/admin/reqproxy/ttfb/run', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group: ttfbGroup, concurrency: 4, timeout_seconds: 60 }),
+      });
+      delete startingRef.current['ttfb-run'];
+      if (body.job_id) {
+        optimisticRef.current[body.job_id] = { kind: 'ttfb-run', at: Date.now() };
+        message.success('真实首字测速已开始');
+      } else {
+        message.info('首字测速已在进行中');
+      }
+      pollJobs();
+    } catch (err) {
+      delete startingRef.current['ttfb-run'];
+      setRunningJobs(p => { const q = { ...p }; delete q['ttfb-run']; return q; });
+      message.error(err.message);
+    }
+  };
+
   const [probingID, setProbingID] = useState(null);
   const probeOne = async id => {
     setProbingID(id);
@@ -447,6 +485,16 @@ export default function ReqProxy({ api }) {
     { title: '累计请求', dataIndex: 'requests', width: 100, sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: v => (Number(v || 0) > 0 ? <Text>{Number(v).toLocaleString()}</Text> : <Text type="secondary">-</Text>) },
     { title: '延迟', width: 110, render: (_, n) => nodeStatus(n) },
     {
+      title: '真实首字', width: 120,
+      sorter: (a, b) => (a.ttfb_ms ?? 1e12) - (b.ttfb_ms ?? 1e12),
+      render: (_, n) => {
+        if (n.ttfb_ms == null) return <Text type="secondary">-</Text>;
+        if (n.ttfb_ms < 0) return <Tooltip title={n.ttfb_error}><Tag color="red">失败</Tag></Tooltip>;
+        const color = n.ttfb_ms < 5000 ? 'green' : n.ttfb_ms < 15000 ? 'orange' : 'red';
+        return <Tag color={color}>{(n.ttfb_ms / 1000).toFixed(1)} 秒</Tag>;
+      },
+    },
+    {
       title: '操作', width: 130,
       render: (_, n) => (
         <Space size={4}>
@@ -468,7 +516,7 @@ export default function ReqProxy({ api }) {
     {
       title: '当前出口节点', width: 200,
       render: (_, s) => (s.node
-        ? <Space size={4}><Text strong>{s.node.name}</Text>{s.node.unhealthy ? <Tag color="red">不健康</Tag> : <Tag color="green">{s.node.latency_ms >= 0 ? `${s.node.latency_ms}ms` : ''}</Tag>}</Space>
+        ? <Space size={4}><Text strong>{s.node.name}</Text>{s.node.unhealthy ? <Tag color="red">不健康</Tag> : <Tag color="green">{latencyLabel(s.node, cfg)}</Tag>}</Space>
         : <Tag>空槽</Tag>),
     },
     {
@@ -482,7 +530,7 @@ export default function ReqProxy({ api }) {
           size="small" style={{ minWidth: 130 }} placeholder="手动换指向"
           disabled={busy}
           showSearch optionFilterProp="label"
-          options={nodes.filter(n => !n.unhealthy).map(n => ({ value: n.id, label: `${n.name}（${n.latency_ms >= 0 ? `${n.latency_ms}ms` : '未测'}）` }))}
+          options={nodes.filter(n => !n.unhealthy).map(n => ({ value: n.id, label: `${n.name}（${latencyLabel(n, cfg) || '未测'}）` }))}
           onChange={async nodeID => {
             try {
               await api(`/admin/reqproxy/slots/${s.id}`, {
@@ -505,8 +553,9 @@ export default function ReqProxy({ api }) {
   // 删节点→探测悬空；重分配中途导入→槽位错乱）。
   const busy = !!(runningJobs['health-run'] || runningJobs.rebalance ||
     runningJobs.compact || runningJobs.reassign || runningJobs.prewarm ||
-    runningJobs['sub-refresh'] || probingID);
+    runningJobs['sub-refresh'] || runningJobs['ttfb-run'] || probingID);
   const busyLabel = runningJobs['health-run'] ? '全量测速'
+    : runningJobs['ttfb-run'] ? '真实首字测速'
     : runningJobs.rebalance ? '负载再平衡'
     : runningJobs.compact ? '整合槽位'
     : runningJobs.reassign ? '重新分配'
@@ -538,6 +587,16 @@ export default function ReqProxy({ api }) {
           <Space wrap>
             {guard(<Button type="primary" disabled={busy} onClick={() => setImportOpen(true)}>批量导入</Button>)}
             <Button icon={<ThunderboltOutlined />} loading={!!runningJobs['health-run']} disabled={busy && !runningJobs['health-run']} onClick={probeAll}>全量测速</Button>
+            <Tooltip title="用指定分组的账号经每个节点发一次最小对话，量到第一个字的时间。不改变节点健康状态。">
+              <Button loading={!!runningJobs['ttfb-run']} disabled={busy && !runningJobs['ttfb-run']}
+                onClick={async () => {
+                  try {
+                    const body = await api('/admin/groups');
+                    setGroups((body.groups || []).map(g => g.name));
+                  } catch { setGroups([]); }
+                  setTtfbOpen(true);
+                }}>真实首字测速</Button>
+            </Tooltip>
             <Button loading={!!runningJobs.rebalance} disabled={busy && !runningJobs.rebalance} onClick={rebalance}>负载再平衡</Button>
             <Tooltip title="合并同节点的重复槽位、删除空槽位。不动节点选择，只收敛拓扑。">
               <Button loading={!!runningJobs.compact} disabled={busy && !runningJobs.compact} onClick={compactSlots}>整合槽位</Button>
@@ -662,6 +721,18 @@ export default function ReqProxy({ api }) {
         </Space>
       </Modal>
 
+      {/* 真实首字测速 */}
+      <Modal open={ttfbOpen} title="真实首字测速" okText="开始" onOk={probeTTFB} onCancel={() => setTtfbOpen(false)}>
+        <Space direction="vertical" size={8} style={{ width: '100%' }}>
+          <Text type="secondary">
+            经每个节点发一次最小对话（max_tokens 16），量到第一帧内容的时间。
+            这会真实消耗所选分组账号的额度，并发 4 路，单节点上限 60 秒。
+          </Text>
+          <Select style={{ width: '100%' }} value={ttfbGroup} onChange={setTtfbGroup}
+            options={[{ value: '', label: '不限分组（全池账号）' }, ...groups.map(g => ({ value: g, label: g }))]} />
+        </Space>
+      </Modal>
+
       {/* 手动导入弹窗 */}
       <Modal open={importOpen} title="批量导入节点" onCancel={() => setImportOpen(false)} onOk={doImport} okText="导入">
         <Space direction="vertical" size={8} style={{ width: '100%' }}>
@@ -682,6 +753,14 @@ function RulesTab({ api, cfg, onSaved }) {
   const [preview, setPreview] = useState(null);
   const [previewing, setPreviewing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [groups, setGroups] = useState([]);
+  const [nodeCount, setNodeCount] = useState(0);
+
+  // 分组列表 + 节点数（自动首字测速的分组下拉和一轮耗时估算用）
+  useEffect(() => {
+    api('/admin/groups').then(b => setGroups((b.groups || []).map(g => g.name || g))).catch(() => {});
+    api('/admin/reqproxy/nodes').then(b => setNodeCount((b.data || []).length)).catch(() => {});
+  }, [api, cfg]);
 
   useEffect(() => {
     if (cfg?.rules) {
@@ -689,9 +768,15 @@ function RulesTab({ api, cfg, onSaved }) {
         include_keywords: (cfg.rules.include_keywords || []).join(','),
         exclude_keywords: (cfg.rules.exclude_keywords || []).join(','),
         max_latency_ms: cfg.rules.max_latency_ms || 0,
+        latency_source: cfg.rules.latency_source === 'ttfb' ? 'ttfb' : 'connect',
         accounts_per_node: cfg.rules.accounts_per_node || 0,
         region_cn: (cfg.rules.region_rules?.cn || []).join(','),
         region_global: (cfg.rules.region_rules?.global || []).join(','),
+        ttfb_group: cfg.rules.ttfb_group || '',
+        ttfb_interval_seconds: cfg.rules.ttfb_interval_seconds ?? 60,
+        ttfb_concurrency: cfg.rules.ttfb_concurrency ?? 1,
+        ttfb_timeout_seconds: cfg.rules.ttfb_timeout_seconds ?? 60,
+        ttfb_model: cfg.rules.ttfb_model || '',
       });
     }
   }, [cfg, form]);
@@ -702,11 +787,17 @@ function RulesTab({ api, cfg, onSaved }) {
       include_keywords: (v.include_keywords || '').split(',').map(s => s.trim()).filter(Boolean),
       exclude_keywords: (v.exclude_keywords || '').split(',').map(s => s.trim()).filter(Boolean),
       max_latency_ms: Number(v.max_latency_ms || 0),
+      latency_source: v.latency_source === 'ttfb' ? 'ttfb' : 'connect',
       accounts_per_node: Number(v.accounts_per_node || 0),
       region_rules: {
         ...(v.region_cn ? { cn: v.region_cn.split(',').map(s => s.trim()).filter(Boolean) } : {}),
         ...(v.region_global ? { global: v.region_global.split(',').map(s => s.trim()).filter(Boolean) } : {}),
       },
+      ttfb_group: v.ttfb_group || '',
+      ttfb_interval_seconds: Number(v.ttfb_interval_seconds ?? 60),
+      ttfb_concurrency: Number(v.ttfb_concurrency ?? 1),
+      ttfb_timeout_seconds: Number(v.ttfb_timeout_seconds ?? 60),
+      ttfb_model: (v.ttfb_model || '').trim(),
     };
   };
 
@@ -728,11 +819,15 @@ function RulesTab({ api, cfg, onSaved }) {
   const apply = async () => {
     setSaving(true);
     try {
+      const draft = draftRules();
       await api('/admin/reqproxy/config', {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rules: draftRules() }),
+        body: JSON.stringify({ rules: draft }),
       });
       message.success('规则已应用');
+      if (draft.ttfb_group && draft.latency_source === 'ttfb' && draft.max_latency_ms > 0 && draft.max_latency_ms < 5000) {
+        message.warning(`延迟上限 ${draft.max_latency_ms}ms 将按真实首字比较：首字中位数约 9 秒，多数节点会被排除，请确认上限已调大`);
+      }
       onSaved?.();
     } catch (err) {
       message.error(err.message);
@@ -755,6 +850,12 @@ function RulesTab({ api, cfg, onSaved }) {
             <Form.Item name="max_latency_ms" label="延迟上限 ms（0 = 不限）">
               <InputNumber min={0} step={100} style={{ width: 120 }} />
             </Form.Item>
+            <Form.Item name="latency_source" label="分配依据的延迟">
+              <Select style={{ width: 220 }} options={[
+                { value: 'connect', label: '连通性测速（首页 HEAD）' },
+                { value: 'ttfb', label: '真实首字测速' },
+              ]} />
+            </Form.Item>
             <Form.Item name="accounts_per_node" label="共享度：账号/节点（0 = 不限）">
               <InputNumber min={0} step={1} style={{ width: 120 }} />
             </Form.Item>
@@ -767,7 +868,51 @@ function RulesTab({ api, cfg, onSaved }) {
               <Input placeholder="US" style={{ width: 220 }} />
             </Form.Item>
           </Space>
-          <Space>
+
+          <Divider orientation="left" plain>自动真实首字测速</Divider>
+          <Form.Item noStyle shouldUpdate={(prev, cur) => prev.ttfb_group !== cur.ttfb_group}>
+            {() => {
+              const g = form.getFieldValue('ttfb_group');
+              const interval = Number(form.getFieldValue('ttfb_interval_seconds') ?? 60);
+              const conc = Number(form.getFieldValue('ttfb_concurrency') ?? 1);
+              const batches = Math.ceil(nodeCount / Math.max(1, conc));
+              const estMin = nodeCount > 0 ? Math.max(1, Math.round(batches * interval / 60)) : 0;
+              return (
+                <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                  <Text type="secondary">
+                    选定分组后，周期连通性测速（首页 HEAD）停止，改用该分组的账号按下面的节奏
+                    慢慢扫完全池量真实首字。留空 = 关闭（保持连通性测速）。
+                    每次探测是一次真实对话（max_tokens 16），消耗分组账号额度。
+                  </Text>
+                  {g ? (
+                    <Text type="secondary">
+                      {nodeCount > 0 && <>当前 {nodeCount} 个节点 ≈ 每批 {conc} 个、批间隔 {interval}s，一轮约 {estMin} 分钟。</>}
+                      一轮扫完做一次摘除/预热/再平衡。
+                    </Text>
+                  ) : null}
+                </Space>
+              );
+            }}
+          </Form.Item>
+          <Space size={16} wrap>
+            <Form.Item name="ttfb_group" label="测速分组（空 = 关闭）">
+              <Select style={{ width: 200 }} allowClear placeholder="关闭"
+                options={[{ value: '', label: '关闭（用连通性测速）' }, ...groups.map(g => ({ value: g, label: g }))]} />
+            </Form.Item>
+            <Form.Item name="ttfb_interval_seconds" label="批间隔秒（0–3600）">
+              <InputNumber min={0} max={3600} step={5} style={{ width: 110 }} />
+            </Form.Item>
+            <Form.Item name="ttfb_concurrency" label="每批节点数（1–8）">
+              <InputNumber min={1} max={8} step={1} style={{ width: 90 }} />
+            </Form.Item>
+            <Form.Item name="ttfb_timeout_seconds" label="单节点超时秒（5–180）">
+              <InputNumber min={5} max={180} step={5} style={{ width: 120 }} />
+            </Form.Item>
+            <Form.Item name="ttfb_model" label="探测模型（空 = glm-5.3）">
+              <Input placeholder="glm-5.3" style={{ width: 180 }} />
+            </Form.Item>
+          </Space>
+          <Space size={16} wrap>
             <Button onClick={doPreview} loading={previewing}>预览模拟结果</Button>
             <Button type="primary" onClick={apply} loading={saving}>应用规则</Button>
           </Space>

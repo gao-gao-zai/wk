@@ -939,13 +939,13 @@ func (h *Handler) runSchool(w http.ResponseWriter, r *http.Request) {
 // 供前端状态卡展示（只读；活动期外 in_period=false 全量返回）。
 func (h *Handler) schoolStatus(w http.ResponseWriter, r *http.Request) {
 	type accountStatus struct {
-		UID       string                 `json:"uid"`
-		Nickname  string                 `json:"nickname,omitempty"`
-		InPeriod  bool                   `json:"in_period"`
-		Tasks     []upstream.SchoolTask  `json:"tasks,omitempty"`
-		Chances   int                    `json:"chances"`
-		Vouchers  []upstream.SchoolVoucher `json:"vouchers,omitempty"`
-		Error     string                 `json:"error,omitempty"`
+		UID      string                   `json:"uid"`
+		Nickname string                   `json:"nickname,omitempty"`
+		InPeriod bool                     `json:"in_period"`
+		Tasks    []upstream.SchoolTask    `json:"tasks,omitempty"`
+		Chances  int                      `json:"chances"`
+		Vouchers []upstream.SchoolVoucher `json:"vouchers,omitempty"`
+		Error    string                   `json:"error,omitempty"`
 	}
 	var accounts []*auth.Auth
 	for _, st := range h.cfg.Pool.List() {

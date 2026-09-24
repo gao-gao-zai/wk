@@ -226,6 +226,7 @@ func (m *Manager) Rebalance() int {
 		if m.kernel != nil {
 			if err := m.applyKernelOp(op); err != nil {
 				m.emit("warn", fmt.Sprintf("再平衡新建槽位 %s 失败: %v", op.SlotID, err))
+				m.rollbackSlotBindings(op.SlotID)
 			}
 		}
 	}

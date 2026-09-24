@@ -92,7 +92,7 @@ type Config struct {
 	// 记录每账号每任务的领取时间与积分/能量收益，重启不丢；查询端点合并
 	// 上游 claimed 对账产出三态视图（完成/部分/未开始）。
 	GrowthLedgerPath string
-	UpdateSchedule    func(checkinHours, keepaliveHours []int)
+	UpdateSchedule   func(checkinHours, keepaliveHours []int)
 	// ReconfigureSchedule 完整排程热更新（五类任务时点 + 开关）。控制台保存
 	// schedule 卡片时调用；nil = 走 UpdateSchedule（老部署语义）。
 	ReconfigureSchedule func(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
@@ -177,15 +177,15 @@ type Handler struct {
 	// featuresMu 保护运行时可变的特性开关与费率（WebUI 保存即时生效，
 	// 同时落盘 config.json 供重启后保持）。读侧在请求热路径，写侧仅管理
 	// 端点，锁竞争可忽略。
-	featuresMu    sync.RWMutex
-	passthrough   bool
-	responsesOff  bool
-	creditPolicy  CreditPolicy
+	featuresMu   sync.RWMutex
+	passthrough  bool
+	responsesOff bool
+	creditPolicy CreditPolicy
 	// maxRequestBody 请求体大小上限（字节）。WebUI「请求体大小限制」卡片
 	// 保存后即时生效（下一个请求按新上限判定）。与特性开关共用 featuresMu：
 	// 读侧在每条 chat/responses 请求的入口，纯内存读，锁开销可忽略。
 	maxRequestBody int
-	sanitizeHooks struct {
+	sanitizeHooks  struct {
 		// upstream SetSanitizeFingerprints / SetCodexCompat 回调；nil 时
 		// （如单测直接构造 Handler）仅更新本地副本，不外呼。
 		setSanitize func(bool)
@@ -241,8 +241,8 @@ const (
 	minWebRequestBodyBytes = 1 << 20
 	maxWebRequestBodyBytes = 64 << 20
 	unlockFailureLimit     = 5
-	unlockFailureWindow     = time.Minute
-	unlockBlockDuration     = 5 * time.Minute
+	unlockFailureWindow    = time.Minute
+	unlockBlockDuration    = 5 * time.Minute
 	// 全局解锁上限：per-IP 锁定挡不住换 IP 的暴力破解，这一层让整体速率有上界。
 	unlockGlobalFailureLimit  = 50
 	unlockGlobalWindow        = 5 * time.Minute
@@ -273,6 +273,11 @@ func NewHandler(cfg Config) *Handler {
 	h.maxRequestBody = cfg.MaxRequestBodyBytes
 	if h.maxRequestBody <= 0 {
 		h.maxRequestBody = defaultMaxRequestBodyBytes
+	}
+	// 真实首字测速的账号来源：分组存储 + 账号池都在 Handler 手里，这里注入。
+	if cfg.ReqProxy != nil && cfg.Pool != nil {
+		cfg.ReqProxy.SetTTFBAccounts(ttfbAccountSource{h: h})
+		cfg.ReqProxy.SetTTFBRefresher(ttfbTokenRefresher{h: h})
 	}
 	h.featuresMu.Lock()
 	h.sanitizeHooks.setSanitize = cfg.SetSanitizeFingerprints
@@ -338,6 +343,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("PUT /admin/reqproxy/bindings/{uid}", h.withFrontend(h.reqproxyBindingPut))
 	h.mux.HandleFunc("POST /admin/reqproxy/health/run", h.withFrontend(h.reqproxyHealthRun))
 	h.mux.HandleFunc("POST /admin/reqproxy/health/run/{node_id}", h.withFrontend(h.reqproxyHealthRun))
+	h.mux.HandleFunc("POST /admin/reqproxy/ttfb/run", h.withFrontend(h.reqproxyTTFBRun))
 	h.mux.HandleFunc("POST /admin/reqproxy/rebalance", h.withFrontend(h.reqproxyRebalancePost))
 	h.mux.HandleFunc("POST /admin/reqproxy/prewarm", h.withFrontend(h.reqproxyPrewarmPost))
 	h.mux.HandleFunc("POST /admin/reqproxy/compact", h.withFrontend(h.reqproxyCompactPost))
@@ -1069,20 +1075,20 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		KeepaliveHours []int `json:"keepalive_hours"`
 		// Schedule 完整排程补丁（五类任务时点 + 开关）。指针语义：nil = 未提供
 		// （保留 config.json 现值），给出数组 = 整体替换该时点集。
-		TravelHours           *[]int          `json:"travel_hours"`
-		ActivityHours         *[]int          `json:"activity_hours"`
-		BlackcatHours         *[]int          `json:"blackcat_hours"`
-		CheckinEnabled        *bool           `json:"checkin_enabled"`
-		TravelEnabled         *bool           `json:"travel_enabled"`
-		ActivityEnabled       *bool           `json:"activity_enabled"`
-		KeepaliveEnabled      *bool           `json:"keepalive_enabled"`
-		BlackcatEnabled       *bool           `json:"blackcat_enabled"`
-		AutoenrollGrowthTasks *bool           `json:"autoenroll_growth_tasks"`
-		Features              *featuresPatch  `json:"features"`
-		Billing               *billingPatch   `json:"billing"`
-		Upstream              *upstreamPatch  `json:"upstream"`
-		SMS                   *smsPatch       `json:"sms"`
-		Retention             *retentionPatch `json:"request_log_retention"`
+		TravelHours           *[]int               `json:"travel_hours"`
+		ActivityHours         *[]int               `json:"activity_hours"`
+		BlackcatHours         *[]int               `json:"blackcat_hours"`
+		CheckinEnabled        *bool                `json:"checkin_enabled"`
+		TravelEnabled         *bool                `json:"travel_enabled"`
+		ActivityEnabled       *bool                `json:"activity_enabled"`
+		KeepaliveEnabled      *bool                `json:"keepalive_enabled"`
+		BlackcatEnabled       *bool                `json:"blackcat_enabled"`
+		AutoenrollGrowthTasks *bool                `json:"autoenroll_growth_tasks"`
+		Features              *featuresPatch       `json:"features"`
+		Billing               *billingPatch        `json:"billing"`
+		Upstream              *upstreamPatch       `json:"upstream"`
+		SMS                   *smsPatch            `json:"sms"`
+		Retention             *retentionPatch      `json:"request_log_retention"`
 		MaxRequestBody        *maxRequestBodyPatch `json:"max_request_body"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
@@ -2659,8 +2665,11 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
-		h.cfg.Pool.NoteError(acct.UID)
+		// 代理池没有可用节点是池级故障，不是这个账号的错：惩罚它只会让
+		// 健康账号因为代理不足被熔断。全局负缓存仍然生效，避免反复打上游。
+		if !errors.Is(err, upstream.ErrNoProxyNode) {
+			h.cfg.Pool.NoteError(acct.UID)
+		}
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
@@ -3469,10 +3478,10 @@ type responsesStreamWriter struct {
 	reasoningText    strings.Builder
 	reasoningStarted bool
 	reasoningIndex   int
-	nextIndex   int
-	usage       map[string]any
-	calls       map[int]*responseStreamCall
-	onComplete  func(string, map[string]any)
+	nextIndex        int
+	usage            map[string]any
+	calls            map[int]*responseStreamCall
+	onComplete       func(string, map[string]any)
 	// seq 是 SSE 事件的单调递增序号（sequence_number）。OpenAI Responses
 	// 规范要求每个事件携带；移植自 responses-proxy 的 next_sequence_number。
 	seq int64
@@ -3937,9 +3946,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
 				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				switch {
+				case errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead:
 					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
-				} else {
+				case errors.Is(err, upstream.ErrNoProxyNode):
+					// 代理池没有可用节点：换号重试（别的 region 可能还有节点），
+					// 但不喂熔断——账号本身没问题，代理恢复后应立即可用。
+				default:
 					h.cfg.Pool.NoteError(acct.UID)
 				}
 				fail(acct.UID)

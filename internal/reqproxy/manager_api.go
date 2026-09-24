@@ -321,6 +321,8 @@ func (m *Manager) reassignAll() (int, string) {
 		if m.kernel != nil {
 			if err := m.applyKernelOp(op); err != nil {
 				m.emit("warn", fmt.Sprintf("重分配：建槽 %s 失败: %v", op.SlotID, err))
+				// 槽位建失败就撤掉指向它的绑定，账号回到未绑定，下次请求重新分配。
+				m.rollbackSlotBindings(op.SlotID)
 			}
 		}
 	}
@@ -351,6 +353,54 @@ func (m *Manager) RefreshSubscriptionJob(subID string) string {
 // Jobs 最近任务列表（前端恢复动画/历史展示）。
 func (m *Manager) Jobs(limit int) []Job { return RecentJobs(limit) }
 
+// SetTTFBAccounts 注入真实首字测速的账号来源（按分组取号）。
+func (m *Manager) SetTTFBAccounts(src TTFBAccountSource) {
+	if m.ttfb != nil {
+		m.ttfb.SetAccountSource(src)
+	}
+}
+
+// SetTTFBRefresher 注入账号 token 刷新（探测前按需刷新）。
+func (m *Manager) SetTTFBRefresher(r TokenRefresher) {
+	if m.ttfb != nil {
+		m.ttfb.SetTokenRefresher(r)
+	}
+}
+
+// RunTTFB 启动一轮真实首字测速（任务化，立即返回任务 ID）。
+// 已有一轮在跑时返回空 ID。
+func (m *Manager) RunTTFB(group, model string, concurrency int, timeout time.Duration) (string, error) {
+	if m.ttfb == nil {
+		return "", fmt.Errorf("首字测速未初始化")
+	}
+	if RunningJob("ttfb-run") != nil {
+		return "", nil
+	}
+	id := StartJob("ttfb-run", "真实首字测速")
+	go func() {
+		ok, fail, err := m.ttfb.Run(group, model, concurrency, timeout)
+		if err != nil {
+			FinishJob(id, "", err.Error())
+			return
+		}
+		note := fmt.Sprintf("首字测速完成：%d 个测出首字 / %d 个失败", ok, fail)
+		errText := ""
+		if ok == 0 && fail > 0 {
+			errText = note
+		}
+		FinishJob(id, note, errText)
+	}()
+	return id, nil
+}
+
+// TTFBResults 最近一轮真实首字测速的结果。
+func (m *Manager) TTFBResults() map[string]TTFBResult {
+	if m.ttfb == nil {
+		return map[string]TTFBResult{}
+	}
+	return m.ttfb.Results()
+}
+
 // ProbeNode 单节点测速（同步执行：单次探测秒级完成，同步返回结果
 // 供按钮动画与结果提示共用一条时序）。
 func (m *Manager) ProbeNode(nodeID string) (int64, error) {
@@ -374,9 +424,9 @@ func (m *Manager) ProbeNode(nodeID string) (int64, error) {
 type RulesPreview struct {
 	Total         int            `json:"total"`
 	Qualified     int            `json:"qualified"`
-	FilteredOut   map[string]int `json:"filtered_out"` // 原因分布
-	BySource      map[string]int `json:"by_source"`    // 按订阅分组合格数
-	Regions       map[string]int `json:"regions"`      // 各 region 合格节点数
+	FilteredOut   map[string]int `json:"filtered_out"`    // 原因分布
+	BySource      map[string]int `json:"by_source"`       // 按订阅分组合格数
+	Regions       map[string]int `json:"regions"`         // 各 region 合格节点数
 	SharedPerNode map[string]int `json:"shared_per_node"` // 各 region 每节点账号数预估
 	Notes         []string       `json:"notes"`
 }
@@ -410,7 +460,7 @@ func (m *Manager) PreviewRules(draft *Rules) *RulesPreview {
 		case h.Unhealthy:
 			out.FilteredOut["unhealthy"]++
 			continue
-		case draft.MaxLatencyMs > 0 && h.LatencyMs >= 0 && h.LatencyMs > int64(draft.MaxLatencyMs):
+		case draft.MaxLatencyMs > 0 && latencyOverLimit(&h, *draft):
 			out.FilteredOut["latency"]++
 			continue
 		case matchKeywords(n.Name, draft.ExcludeKeywords):

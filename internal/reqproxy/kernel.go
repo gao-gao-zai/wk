@@ -130,19 +130,28 @@ func (k *Kernel) AddSlot(slotID string, port int, node NodeSpec) error {
 	rc.RuleList = []json.RawMessage{json.RawMessage(ruleJSON)}
 	routedCfg, err := rc.Build()
 	if err != nil {
+		k.removeInboundLocked(slotID)
 		return fmt.Errorf("路由规则 Build: %w", err)
 	}
 	rm, ok := k.inst.GetFeature(routing.RouterType()).(routing.Router)
 	if !ok {
+		k.removeInboundLocked(slotID)
 		return fmt.Errorf("Xray 路由模块不可用")
 	}
 	if err := rm.AddRule(serial.ToTypedMessage(routedCfg), true); err != nil {
+		k.removeInboundLocked(slotID)
 		return fmt.Errorf("AddRule(%s): %w", slotID, err)
 	}
 	k.rules[slotID] = true
 
-	// 槽位 outbound（定义 = 节点拷贝）
-	return k.addOutboundLocked(slotID, node)
+	// 槽位 outbound（定义 = 节点拷贝）。失败时把刚建的 inbound/路由清掉：
+	// 否则 HasSlot 为真，restoreSlots 会跳过它，槽位永久没有出站。
+	if err := k.addOutboundLocked(slotID, node); err != nil {
+		k.removeRuleLocked(slotID)
+		k.removeInboundLocked(slotID)
+		return err
+	}
+	return nil
 }
 
 // RetargetSlot 换槽位指向：只替换 slot_id 的 outbound。inbound/路由不动。
@@ -163,20 +172,27 @@ func (k *Kernel) RemoveSlot(slotID string) error {
 	if k.inst == nil {
 		return fmt.Errorf("内核已关闭")
 	}
-	// outbound
 	k.removeOutboundLocked(slotID)
-	// 路由
+	k.removeRuleLocked(slotID)
+	k.removeInboundLocked(slotID)
+	return nil
+}
+
+// removeRuleLocked / removeInboundLocked 拆开是为了 AddSlot 失败时能按
+// 已建成的部分回滚。调用方须持 k.mu。
+func (k *Kernel) removeRuleLocked(slotID string) {
 	if k.rules[slotID] {
 		if rm, ok := k.inst.GetFeature(routing.RouterType()).(routing.Router); ok {
 			_ = rm.RemoveRule(slotID)
 		}
 		delete(k.rules, slotID)
 	}
-	// inbound
+}
+
+func (k *Kernel) removeInboundLocked(slotID string) {
 	if im, ok := k.inst.GetFeature(inbound.ManagerType()).(inbound.Manager); ok {
 		_ = im.RemoveHandler(k.ctx, slotID)
 	}
-	return nil
 }
 
 // ---- 节点 outbound（非槽位） ----
@@ -292,7 +308,7 @@ func outboundParts(n NodeSpec) (settings, stream map[string]any, err error) {
 		settings = map[string]any{
 			"servers": []map[string]any{{
 				"address": spec["host"], "port": spec["port"],
-				"method":  spec["method"], "password": spec["password"],
+				"method": spec["method"], "password": spec["password"],
 			}},
 		}
 	case "socks", "http":
@@ -311,7 +327,7 @@ func outboundParts(n NodeSpec) (settings, stream map[string]any, err error) {
 			"endpoint":  fmt.Sprintf("%v:%v", spec["host"], spec["port"]),
 		}}
 		settings = map[string]any{
-			"secretKey":  orDefault(spec["privateKey"], ""),
+			"secretKey": orDefault(spec["privateKey"], ""),
 			"address":   orDefault(spec["localAddress"], []string{"172.16.0.2/32"}),
 			"peers":     peers,
 			"reserved":  []int{1, 2, 3},

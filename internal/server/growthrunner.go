@@ -188,7 +188,7 @@ func (h *Handler) growthSubmitAccount(job *growthJob, a *auth.Auth) bool {
 //
 // 注意：入队方（growthSubmitAll 调用侧）不做入队后补写——drain 的本调用
 // 是标记文件的唯一同步点。若入队方也写，会与 drain 的 clear/write 竞争
-//（实测：u2 瞬间跑完 clear 后，入队方的滞后 write 会复活已删的标记）。
+// （实测：u2 瞬间跑完 clear 后，入队方的滞后 write 会复活已删的标记）。
 // 入队前的初始快照由调用方在 SubmitAll 之前写入（此时 drain 必然没跑）。
 func (h *Handler) syncGrowthMark() {
 	pending := h.growthRunner.pending()

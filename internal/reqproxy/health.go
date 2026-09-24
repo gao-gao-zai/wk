@@ -20,9 +20,9 @@ func mustParseURL(raw string) *url.URL {
 
 // HealthConfig 测速参数。
 type HealthConfig struct {
-	Interval          time.Duration // 周期，默认 15m
-	Timeout           time.Duration // 单次，默认 5s
-	UnhealthyCooldown time.Duration // 摘除冷却，默认 10m
+	Interval          time.Duration     // 周期，默认 15m
+	Timeout           time.Duration     // 单次，默认 5s
+	UnhealthyCooldown time.Duration     // 摘除冷却，默认 10m
 	RegionTargets     map[string]string // region → 测速 URL
 }
 
@@ -50,6 +50,10 @@ type Health struct {
 	roundMu sync.Mutex // RunOnce 串行化：周期轮与手动轮绝不并发（临时槽位 tag 冲突 + 完成语义）
 	stop    chan struct{}
 	done    chan struct{}
+
+	// skipRound 返回 true 时本轮跳过（自动首字测速开启后 HEAD 让位）。
+	// nil = 永不让位。每拍（含启动首轮）都会询问。
+	skipRound func() bool
 }
 
 // TempPortDialer 为测速提供节点的本地端口。
@@ -84,6 +88,9 @@ func NewHealth(cfg HealthConfig, pool *Pool, dial TempPortDialer) *Health {
 	}
 }
 
+// SetSkipRound 注入让位判断（自动首字测速开启 → HEAD 周期轮跳过）。
+func (h *Health) SetSkipRound(fn func() bool) { h.skipRound = fn }
+
 // SetAfterRound 每轮测速结束后的回调（预热挂点）。nil = 无。
 func (h *Health) SetAfterRound(fn func()) { h.after = fn }
 
@@ -93,16 +100,29 @@ func (h *Health) Start() {
 		defer close(h.done)
 		t := time.NewTicker(h.cfg.Interval)
 		defer t.Stop()
-		h.RunOnce() // 启动立即测一轮（首轮隔离需要数据）
+		if !h.shouldSkip() {
+			h.RunOnce() // 启动立即测一轮（首轮隔离需要数据；让位时跳过）
+		}
 		for {
 			select {
 			case <-t.C:
+				if h.shouldSkip() {
+					continue // 自动首字测速在管健康：HEAD 让位
+				}
 				h.RunOnce()
 			case <-h.stop:
 				return
 			}
 		}
 	}()
+}
+
+// shouldSkip 自动首字测速是否接管了健康维护。
+func (h *Health) shouldSkip() bool {
+	if h.skipRound == nil {
+		return false
+	}
+	return h.skipRound()
 }
 
 // Stop 停止。

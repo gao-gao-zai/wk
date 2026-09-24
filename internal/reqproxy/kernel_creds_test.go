@@ -34,6 +34,7 @@ func buildClientSettings(t *testing.T, n NodeSpec) (protoMsg any) {
 	}
 	return msg
 }
+
 // TestHTTPOutboundCarriesCredentials 回归：http outbound 的凭据必须到达
 // 协议层 ClientConfig.Server.User。旧构造把 user/pass 平铺在 servers[] 里，
 // Xray 的 HTTPClientConfig 只认 servers[].users 数组——凭据被静默丢弃，

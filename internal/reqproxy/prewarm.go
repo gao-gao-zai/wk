@@ -54,6 +54,9 @@ func (m *Manager) PrewarmAll() (bound, failed int) {
 		if op != nil && op.Kind == "add-slot" {
 			if m.kernel != nil {
 				if err := m.applyKernelOp(*op); err != nil {
+					// 绑定已落盘但内核没槽：回滚，否则这个账号被钉死在死端口上，
+					// 下次预热还因为它"已绑定"直接跳过。
+					m.rollbackKernelSlot(uid, op.SlotID)
 					failed++
 					continue
 				}

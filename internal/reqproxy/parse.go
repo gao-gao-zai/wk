@@ -14,13 +14,13 @@ import (
 
 // NodeSpec 解析后的节点规格（kernel 无关）。
 type NodeSpec struct {
-	ID       string            `json:"id"`       // 稳定 ID（来源前缀 + 名称哈希/导入ID）
-	Name     string            `json:"name"`
-	Protocol string            `json:"protocol"` // vmess|vless|trojan|ss|wireguard|socks|http
-	Source   string            `json:"source"`  // 订阅ID 或 "manual"
-	Region   string            `json:"region"`   // HK|JP|SG|US|...|other（按名称识别）
-	Spec     map[string]any    `json:"spec"`    // 协议参数（kernel 层消费）
-	Raw      string            `json:"-"`        // 原始链接（定义变更检测用）
+	ID       string         `json:"id"` // 稳定 ID（来源前缀 + 名称哈希/导入ID）
+	Name     string         `json:"name"`
+	Protocol string         `json:"protocol"` // vmess|vless|trojan|ss|wireguard|socks|http
+	Source   string         `json:"source"`   // 订阅ID 或 "manual"
+	Region   string         `json:"region"`   // HK|JP|SG|US|...|other（按名称识别）
+	Spec     map[string]any `json:"spec"`     // 协议参数（kernel 层消费）
+	Raw      string         `json:"-"`        // 原始链接（定义变更检测用）
 }
 
 // ParseText 解析多行文本：每行一个 share-link 或 host:port:user:pass，或整体 Base64。
@@ -64,7 +64,8 @@ func ParseText(text, source string) ([]NodeSpec, []error) {
 type ErrUnsupportedProtocol struct{ Proto string }
 
 func (e *ErrUnsupportedProtocol) Error() string {
-	return fmt.Sprintf("协议不支持: %s", e.Proto) }
+	return fmt.Sprintf("协议不支持: %s", e.Proto)
+}
 
 // ParseLink 解析单条链接。返回 (nil, nil) 表示空行/注释。
 func ParseLink(line string) (*NodeSpec, error) {
@@ -132,13 +133,13 @@ func parseVmess(raw string) (*NodeSpec, error) {
 			ID   string `json:"id"`
 			Aid  any    `json:"aid"`
 			Net  string `json:"net"`
-		Type string `json:"type"`
-		Host string `json:"host"`
-		Path string `json:"path"`
-		TLS  string `json:"tls"`
-		Sni  string `json:"sni"`
-		Alpn string `json:"alpn"`
-		Fp   string `json:"fp"`
+			Type string `json:"type"`
+			Host string `json:"host"`
+			Path string `json:"path"`
+			TLS  string `json:"tls"`
+			Sni  string `json:"sni"`
+			Alpn string `json:"alpn"`
+			Fp   string `json:"fp"`
 		}
 		if err := json.Unmarshal([]byte(decoded), &v); err != nil {
 			return nil, fmt.Errorf("vmess Base64 JSON 不合法: %w", err)

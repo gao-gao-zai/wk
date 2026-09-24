@@ -216,12 +216,12 @@ func TestParseTextClashYAMLRejected(t *testing.T) {
 
 func TestDetectRegion(t *testing.T) {
 	cases := map[string]string{
-		"香港 IEPL 01":    "HK",
-		"日本 Tokyo BGP":  "JP",
+		"香港 IEPL 01":     "HK",
+		"日本 Tokyo BGP":   "JP",
 		"US Los Angeles": "US",
-		"新加坡 沪新专线":     "SG",
-		"韩国首尔":          "KR",
-		"专线 A":          "other",
+		"新加坡 沪新专线":       "SG",
+		"韩国首尔":           "KR",
+		"专线 A":           "other",
 		"":               "other",
 	}
 	for name, want := range cases {
