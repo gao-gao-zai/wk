@@ -143,6 +143,12 @@ function Console() {
   const windowSeconds = key => ({ '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800, '30d': 2592000 }[key] || 0);
 
   const refresh = async () => {
+    // 锁定期间不请求任何数据：弹窗输入框与 apiKey 是同一个 state，
+    // 若此时轮询，每敲一个字符都会带着半截密钥打 /status —— 密钥恰好
+    // 有效的那次会让 refresh 成功路径 setLocked(false)，弹窗在用户点
+    // 「解锁」前就自动关闭，且 /admin/unlock 从未被调用、cookie 从未
+    // 签发（下次刷新又锁回去）。锁定状态唯一的出口是 unlock() 成功。
+    if (locked) return;
     const serial = ++refreshSerial.current;
     refreshController.current?.abort();
     const controller = new AbortController();
@@ -173,8 +179,9 @@ function Console() {
       // 鉴权失效判定只看 HTTP 状态码：后端的 401 是确定信号，而错误文案
       // 随端点变化（/status 是 "missing or invalid API key"，/admin/config
       // 是 "admin credential required"），靠正则匹配文案曾导致会话过期后
-      // 解锁弹窗时隐时现甚至永不出现。
-      if (error.status === 401) setLocked(true);
+      // 解锁弹窗时隐时现甚至永不出现。serial 校验：只认最新一轮刷新的
+      // 401，防止解锁成功后旧请求的迟到 401 把弹窗重新炸开。
+      if (error.status === 401 && serial === refreshSerial.current) setLocked(true);
       return;
     }
     try {
@@ -199,8 +206,8 @@ function Console() {
       // 401 单独处理：/status 能过（比如输入了分组密钥）但 /admin/* 拒绝时，
       // 说明当前凭据进不了管理面——必须重新弹解锁框，而不是静默吞掉
       // 让用户看着"正常"的仪表盘却处处失败。其他错误（老后端没有该端点
-      // 等）仍静默：仪表盘数据可以照常刷新。
-      if (error.status === 401) {
+      // 等）仍静默：仪表盘数据可以照常刷新。serial 校验同上。
+      if (error.status === 401 && serial === refreshSerial.current) {
         setLocked(true);
         return;
       }
@@ -208,10 +215,13 @@ function Console() {
   };
 
   useEffect(() => {
+    // locked 加入依赖：解锁成功后立即恢复轮询；锁定期间 refresh 自身
+    // 会直接 return（见函数头注释），不会带着半截密钥打接口。
+    if (locked) return;
     refresh();
     const timer = setInterval(refresh, 30000);
     return () => clearInterval(timer);
-  }, [apiKey, dashboardWindow]);
+  }, [apiKey, dashboardWindow, locked]);
 
   useEffect(() => {
     form.setFieldsValue({
