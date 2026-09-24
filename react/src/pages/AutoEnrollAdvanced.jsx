@@ -365,13 +365,15 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
         onPick={handlePickProject}
       />
 
-      {/* 浮窗式对接码选择器：Table 浏览（价格/库存排序），点选回填。 */}
+      {/* 浮窗式对接码选择器：Table 浏览（价格/库存排序），未加入的码
+          点选时先经后端在豪猪侧「加入对接码」（官方 API 只认已加入的码）。 */}
       <UIDPickerModal
         open={uidPickerOpen}
         onClose={() => setUidPickerOpen(false)}
         uidItems={uidItems}
         loading={uidLoading}
         currentUid={form.getFieldValue('uid')}
+        api={api}
         onPick={(u) => {
           if (!u || !u.uid) return;
           form.setFieldValue('uid', u.uid);

@@ -222,3 +222,8 @@ button, input, textarea, select { font: inherit; }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* 对接码浮窗：已加入账户的行淡绿底（官方 API 只有已加入的码能取号） */
+.uid-row-mine > td {
+  background: #f6ffed !important;
+}

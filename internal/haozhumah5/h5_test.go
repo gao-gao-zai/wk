@@ -2,6 +2,7 @@ package haozhumah5
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +35,36 @@ func newFakeH5(t *testing.T) *fakeH5 {
 				fmt.Fprint(w, f.type30)
 			case "8":
 				fmt.Fprint(w, f.type8)
+			case "4":
+				// type=4 加入对接码。重复加入实测返回
+				// code:-1 msg="已添加过了..."。
+				if f.added == nil {
+					f.added = map[string]bool{}
+				}
+				djm := q.Get("djm")
+				if djm == "" {
+					fmt.Fprint(w, `{"code":-1,"data":null,"msg":"缺少对接码"}`)
+					return
+				}
+				if f.added[djm] {
+					fmt.Fprintf(w, `{"code":"-1","data":null,"msg":"已添加过了,如果找不到可以通过底部搜索查询"}`)
+					return
+				}
+				f.added[djm] = true
+				fmt.Fprint(w, `{"code":1,"data":null,"msg":"添加成功"}`)
+			case "3":
+				// type=3 我的对接码。成功返回 code=200（与 30/8 的 1 不同）。
+				if len(f.added) == 0 {
+					fmt.Fprint(w, `{"code":200,"data":[],"msg":"成功拉取列表"}`)
+					return
+				}
+				var items []string
+				for djm := range f.added {
+					items = append(items, fmt.Sprintf(
+						`{"mc":"[52283]腾讯科技[限对接]","uid":"%s","yhj":"16.500","zxky":"可用数量:23","yyy":"移动|","sheng":"","haoduan":"未知号段","time":"2026-09-22 23:24:18"}`,
+						djm))
+				}
+				fmt.Fprintf(w, `{"code":200,"data":[%s],"msg":"成功拉取列表"}`, strings.Join(items, ","))
 			default:
 				fmt.Fprint(w, `{"code":-1,"data":null,"msg":"unknown type"}`)
 			}
@@ -56,6 +87,7 @@ type fakeH5 struct {
 	cookie string
 	type30 string
 	type8  string
+	added  map[string]bool
 }
 
 const sampleType30 = `{"code":1,"data":[
@@ -279,5 +311,63 @@ func TestRedactURL(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "type=30") {
 		t.Fatalf("query leaked in error: %v", err)
+	}
+}
+
+// TestAddUIDAndMyUIDs 加入对接码（type=4）+ 我的列表（type=3, code=200）：
+// 加入成功 → 我的列表出现该码；重复加入（上游 code:-1 "已添加过了"）
+// 必须当成功吸收，不能报错。
+func TestAddUIDAndMyUIDs(t *testing.T) {
+	f := newFakeH5(t)
+	f.cookie = "sess-1"
+	c := New("sess-1")
+	defer c.Close()
+
+	// 初始为空
+	mine, err := c.MyUIDs(context.Background(), "")
+	if err != nil {
+		t.Fatalf("MyUIDs empty: %v", err)
+	}
+	if len(mine) != 0 {
+		t.Fatalf("want 0, got %d", len(mine))
+	}
+
+	// 加入
+	if err := c.AddUID(context.Background(), "52283-WW9L2J4WOL"); err != nil {
+		t.Fatalf("AddUID: %v", err)
+	}
+	// 加入后缓存作废，重拉应出现
+	mine, err = c.MyUIDs(context.Background(), "")
+	if err != nil {
+		t.Fatalf("MyUIDs after add: %v", err)
+	}
+	if len(mine) != 1 || mine[0].UID != "52283-WW9L2J4WOL" {
+		t.Fatalf("want [52283-WW9L2J4WOL], got %+v", mine)
+	}
+	if mine[0].Price != 16.5 || mine[0].Stock != 23 {
+		t.Fatalf("parse fields wrong: %+v", mine[0])
+	}
+
+	// 重复加入：上游 code:-1 + "已添加过了"——AddUID 必须当成功
+	if err := c.AddUID(context.Background(), "52283-WW9L2J4WOL"); err != nil {
+		t.Fatalf("duplicate AddUID must be absorbed as success, got: %v", err)
+	}
+
+	// 空码拒绝
+	if err := c.AddUID(context.Background(), "  "); err == nil {
+		t.Fatal("empty uid must error")
+	}
+}
+
+// TestAddUIDSessionExpired 会话失效时加入必须返回 ErrSessionExpired。
+func TestAddUIDSessionExpired(t *testing.T) {
+	f := newFakeH5(t)
+	f.cookie = "sess-1"
+	c := New("sess-1")
+	defer c.Close()
+	c.Session("wrong-session") // 会话换掉但 cookie 校验要求 sess-1
+	err := c.AddUID(context.Background(), "52283-WW9L2J4WOL")
+	if !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("want ErrSessionExpired, got %v", err)
 	}
 }

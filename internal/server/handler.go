@@ -357,6 +357,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/h5-session", h.withFrontend(h.haozhumaH5Session))
 	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/projects", h.withFrontend(h.haozhumaProjects))
 	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/uids", h.withFrontend(h.haozhumaUIDs))
+	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/add-uid", h.withFrontend(h.haozhumaAddUID))
+	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/my-uids", h.withFrontend(h.haozhumaMyUIDs))
 	h.mux.HandleFunc("GET /admin/proxy/status", h.withFrontend(h.proxyStatus))
 	// 请求代理模块（reqproxy）：与上面的登录代理池完全独立的新命名空间。
 	h.mux.HandleFunc("GET /admin/reqproxy/config", h.withFrontend(h.reqproxyConfigGet))
@@ -2053,6 +2055,56 @@ func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	uids, err := h.cfg.HaozhumaH5.UIDs(ctx, sid)
+	if err != nil {
+		writeH5Error(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"uids": uids})
+}
+
+// haozhumaAddUID 把对接码加入豪猪账户（代理 H5 type=4）。POST 防止
+// 被当链接点/预取——这是写操作。
+//
+// 背景：官方 getPhone?uid= 只认**已加入账户**的对接码；市场列表里
+// 看到的码必须先加入才能取号（否则报「没有这个[xxx]专属码」）。
+// 前端选码后调用本端点完成"加入"，再保存配置。
+func (h *Handler) haozhumaAddUID(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.HaozhumaH5 == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码增强未启用（需粘贴 PHPSESSID）"})
+		return
+	}
+	var req struct {
+		UID string `json:"uid"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体必须是 JSON"})
+		return
+	}
+	uid := strings.TrimSpace(req.UID)
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少对接码 uid"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := h.cfg.HaozhumaH5.AddUID(ctx, uid); err != nil {
+		writeH5Error(w, err)
+		return
+	}
+	// AddUID 内部已作废"我的对接码"缓存，前端下次拉取即见新状态。
+	writeJSON(w, http.StatusOK, map[string]any{"added": uid})
+}
+
+// haozhumaMyUIDs 我账户已加入的对接码（代理 H5 type=3）。前端用它
+// 标注市场列表里哪些码"已加入可直接取号"。
+func (h *Handler) haozhumaMyUIDs(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.HaozhumaH5 == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码增强未启用（需粘贴 PHPSESSID）"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	uids, err := h.cfg.HaozhumaH5.MyUIDs(ctx, strings.TrimSpace(r.URL.Query().Get("q")))
 	if err != nil {
 		writeH5Error(w, err)
 		return

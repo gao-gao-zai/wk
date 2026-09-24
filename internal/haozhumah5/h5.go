@@ -1,17 +1,24 @@
-// Package haozhumah5 访问豪猪 H5 网页后端（h5.haozhuma.com）的只读接口。
+// Package haozhumah5 访问豪猪 H5 网页后端（h5.haozhuma.com）。
 //
 // 与 internal/haozhuma（官方接码 API，token 鉴权）平行：这里走的是网页
 // 版逆向所得的 api.php，唯一凭证是登录时下发的 PHPSESSID Cookie。
-// 只封装三个只读端点：
+// 封装五个端点：
 //
 //	GET api.php?type=30&gjc=<关键词>   搜索项目（名称+16位hex会话标识）
 //	GET api.php?type=8&sid=<会话标识>  列出项目的对接码（价格/库存/运营商）
+//	GET api.php?type=4&djm=<对接码>    把对接码加入我的账户（写操作）
+//	GET api.php?type=3&gjc=<关键词>    我的对接码列表（含暂停/恢复/删除，见 myxmlist.html）
 //	GET time.php                       服务器时间（用于会话保活）
 //
+// 关于 type=4（加入对接码）：官方接码 API 的 getPhone?uid= 只认**已加入
+// 账户**的对接码；H5 市场列表（type=8）里的码只是"挂牌"，看得见 ≠ 拥有。
+// 实测（2026-09-24）：H5 type=4&djm=52283-4PM8WKUBKJ → "添加成功" →
+// 官方 getPhone 立即能取到号。所以选码之后必须先加入再取号。
+//
 // 风险边界（设计文档 §6）：H5 接口非官方公开 API，豪猪随时可改。因此
-// 本包只做增强能力（项目/对接码选择器数据源），核心加号链路（取号/
-// 收码）永远只依赖官方接码 API；PHPSESSID 未配置或失效时上层自动退化
-// 为手填模式，不影响任务。
+// 本包只做增强能力（项目/对接码选择器数据源 + 一键加入），核心加号
+// 链路（取号/收码）永远只依赖官方接码 API；PHPSESSID 未配置或失效时
+// 上层自动退化为手填模式，不影响任务。
 //
 // 会话生命周期：PHPSESSID 10 天滑动过期（每次请求自动顺延）。保活由
 // 后台 ticker 每 7 天调一次 time.php（留 3 天余量）。
@@ -294,10 +301,121 @@ func (c *Client) UIDs(ctx context.Context, sid string) ([]UIDItem, error) {
 	return items, nil
 }
 
+// AddUID 把对接码加入我的账户（type=4&djm=<对接码>）。
+//
+// 为什么需要它：官方接码 API getPhone?uid= 只认已加入账户的对接码，
+// 市场列表里的码直接用会报「没有这个[xxx]专属码」。WebUI 选码后
+// 调这个加入，取号链路才真正通。
+//
+// 语义说明（实测）：重复加入返回 code=-1 msg="已添加过了,如果找不到
+// 可以通过底部搜索查询"——不是错误，调用方把"已添加"当成功处理（目的
+// 已达成）。上游也可能回"请先登录"（会话失效），统一映射到
+// ErrSessionExpired 由上层提示重贴。
+func (c *Client) AddUID(ctx context.Context, uid string) error {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return errors.New("对接码不能为空")
+	}
+	var raw struct {
+		Code any    `json:"code"`
+		Msg  string `json:"msg"`
+		Data any    `json:"data"`
+	}
+	if err := c.call(ctx, "GET", "/api.php", map[string]string{"type": "4", "djm": uid}, &raw); err != nil {
+		// "已添加"在 call() 里会走到 code=-1 分支变成业务错误，这里吸收掉。
+		if strings.Contains(err.Error(), "已添加") {
+			c.InvalidateMyUIDs()
+			return nil
+		}
+		return err
+	}
+	c.InvalidateMyUIDs()
+	return nil
+}
+
+// MyUIDItem 我的对接码列表项（type=3 data 元素）。
+//
+// 与 UIDItem 不同：type=3 返回的是账户视角的字段（open 状态等），
+// 价格/库存信息较全的格式与 type=8 相同（实测同一批字段）。
+type MyUIDItem struct {
+	UID         string   `json:"uid"`
+	Name        string   `json:"name"`
+	Price       float64  `json:"price"`
+	Stock       int      `json:"stock"`
+	ISPs        []string `json:"isps"`
+	Provinces   []string `json:"provinces"`
+	SegmentType string   `json:"segment_type"`
+	UpdatedAt   string   `json:"updated_at"`
+}
+
+// MyUIDs 列出我账户已加入的对接码（type=3，成功返回 code=200）。gjc
+// 关键词可空（空=全量）。用于：WebUI 标注哪些码"已加入"（可直接取号），
+// 以及加号前的自检。
+func (c *Client) MyUIDs(ctx context.Context, keyword string) ([]MyUIDItem, error) {
+	keyword = strings.TrimSpace(keyword)
+	key := "3:" + keyword
+	if v, ok := c.cached(key); ok {
+		u := v.(myUIDItems)
+		return []MyUIDItem(u), nil
+	}
+	q := map[string]string{"type": "3"}
+	if keyword != "" {
+		q["gjc"] = keyword
+	}
+	var raw struct {
+		Code any    `json:"code"`
+		Msg  string `json:"msg"`
+		Data []struct {
+			MC      string `json:"mc"`
+			UID     string `json:"uid"`
+			YHJ     string `json:"yhj"`
+			ZXKY    string `json:"zxky"`
+			YYY     string `json:"yyy"`
+			Sheng   string `json:"sheng"`
+			HaoDuan string `json:"haoduan"`
+			Time    string `json:"time"`
+		} `json:"data"`
+	}
+	if err := c.call(ctx, "GET", "/api.php", q, &raw); err != nil {
+		return nil, err
+	}
+	items := make([]MyUIDItem, 0, len(raw.Data))
+	for _, d := range raw.Data {
+		if d.UID == "" {
+			continue
+		}
+		items = append(items, MyUIDItem{
+			UID:         d.UID,
+			Name:        strings.TrimSpace(d.MC),
+			Price:       parsePrice(d.YHJ),
+			Stock:       parseStock(d.ZXKY),
+			ISPs:        splitPipe(d.YYY),
+			Provinces:   splitPipe(d.Sheng),
+			SegmentType: strings.TrimSpace(d.HaoDuan),
+			UpdatedAt:   strings.TrimSpace(d.Time),
+		})
+	}
+	// 会话侧列表变化频率低，缓存 5 分钟足够。
+	c.store(key, myUIDItems(items))
+	return items, nil
+}
+
+// InvalidateMyUIDs 作废"我的对接码"缓存（加入新码后调用，让下次重拉）。
+func (c *Client) InvalidateMyUIDs() {
+	c.cacheMu.Lock()
+	for k := range c.cache {
+		if strings.HasPrefix(k, "3:") {
+			delete(c.cache, k)
+		}
+	}
+	c.cacheMu.Unlock()
+}
+
 // ---- 内部：缓存值类型（避免 any 里存指针再解引用的类型断言噪音） ----
 
 type projects []Project
 type uidItems []UIDItem
+type myUIDItems []MyUIDItem
 
 // ---- 内部：HTTP 与解析 ----
 
@@ -328,7 +446,7 @@ func (c *Client) call(ctx context.Context, method, path string, query map[string
 	_ = json.Unmarshal(body, &probe)
 	code := codeString(probe.Code)
 	switch code {
-	case "1": // 成功
+	case "1", "200": // 成功（type=30/8 用 1，type=3 用 200）
 	case "0": // 无数据：不是错误，落回空列表
 	default: // -1 等：失败
 		msg := strings.TrimSpace(probe.Msg)
