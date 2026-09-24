@@ -276,6 +276,25 @@ type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
 }
 
+// StatePersister 池状态的数据库持久化契约（statestore.Store 满足；单测注入
+// fake）。与本地 state.json 文件模式并存：注入后落盘切到增量写库（只写
+// 变更过的账号行），文件模式保留为回退形态。
+type StatePersister interface {
+	// UpsertPoolAccounts 单事务批量写入账号状态行（uid → JSON blob）。
+	UpsertPoolAccounts(rows map[string][]byte) error
+	// DeletePoolAccounts 单事务删除给定账号的状态行。
+	DeletePoolAccounts(uids []string) error
+	// LoadPoolAccounts 全量读取账号状态行（仅启动时调用）。
+	LoadPoolAccounts() (map[string][]byte, error)
+}
+
+// dirtyOp 单账号的待写操作（增量脏跟踪）。version 是标记时的内存版本号：
+// flush 事务期间该账号又被改动（版本变了）则本轮不清除，下轮重写。
+type dirtyOp struct {
+	op      uint32 // 0 = upsert, 1 = delete
+	version uint64
+}
+
 // flushInterval 后台落盘周期。
 var flushInterval = 5 * time.Second
 
@@ -295,8 +314,22 @@ type Pool struct {
 	mu         sync.RWMutex
 	byUID      map[string]*entry
 	stateFp    string
-	lastPickAt time.Time   // monotonic tie-breaker for coarse system clocks
-	dirty      atomic.Bool // 内存有变更待落盘
+	lastPickAt time.Time // monotonic tie-breaker for coarse system clocks
+
+	// 落盘脏标记（双模式）：
+	//   - 文件模式（persister == nil）：dirty（任意变更）触发全量重写 state.json。
+	//   - DB 模式（persister != nil）：dirtySet 按 uid 记增量操作 + 版本号，
+	//     flush 时只写变更过的账号行；dirty 仍同步置位（DB 崩溃回退文件模式
+	//     时全量兜底）。
+	dirty     atomic.Bool        // 内存有变更待落盘（文件模式主标记）
+	dirtySet  map[string]dirtyOp // uid → 待写操作（DB 模式；受 p.mu 保护）
+	versionC  uint64             // 全局版本计数器（受 p.mu 保护；dirtyOp.version 的来源）
+	persister StatePersister     // DB 后端；nil = 文件模式
+	// dbFreshAt DB 最后成功写入的时间（loadFromPersister 记录）。Redis
+	// 择新比较用：DB 模式下 state.json 不再更新，mtime 恒旧，比较基准
+	// 必须换成 DB 的新鲜度，否则旧的 Redis 快照会被误采用。零值 = 未记录
+	//（退回 mtime 比较，与文件模式一致）。
+	dbFreshAt time.Time
 
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
@@ -362,22 +395,123 @@ const (
 )
 
 // New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。
-func New(stateFp string) *Pool {
+// New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。
+// 可变参注入 DB 后端（照 metricsstore.Open(retention ...Retention) 先例，
+// 现有 New(fp) 调用点不改一行）。注入时恢复顺序：本地 state.json 加载后
+// 立即用 DB 行覆盖（DB 是更持久的源）。生产路径 main 用 SetStatePersister
+// 在 Redis 择新之后注入，见其注释。
+func New(stateFp string, persister ...StatePersister) *Pool {
 	p := &Pool{
-		byUID:               map[string]*entry{},
-		stateFp:             stateFp,
+		byUID:                map[string]*entry{},
+		stateFp:              stateFp,
+		dirtySet:             map[string]dirtyOp{},
 		breakerThreshold:     defaultBreakerThreshold,
 		breakerCooldown:      defaultBreakerCooldown,
 		riskDisableThreshold: defaultRiskDisableThreshold,
-		breakerCooldownMax: defaultBreakerCooldownMax,
-		idleWeightPerHour:  defaultIdleWeightPerHour,
-		idleWeightMax:      defaultIdleWeightMax,
+		breakerCooldownMax:   defaultBreakerCooldownMax,
+		idleWeightPerHour:    defaultIdleWeightPerHour,
+		idleWeightMax:        defaultIdleWeightMax,
+	}
+	if len(persister) > 0 && persister[0] != nil {
+		p.persister = persister[0]
 	}
 	if stateFp != "" {
 		p.load()
+		if p.persister != nil {
+			p.loadFromPersister()
+		}
 		p.startFlusher()
 	}
 	return p
+}
+
+// PoolFreshnessChecker 可选的 DB 新鲜度探针（statestore.Store 满足）。
+// RestoreFromSnapshot 用 DB 的最后写入时间代替 state.json 的 mtime 做
+// 择新比较——DB 模式下本地文件不再更新，mtime 恒旧，会导致 Redis 快照
+// （可能比 DB 旧）被误采用。
+type PoolFreshnessChecker interface {
+	MaxPoolUpdatedAt() (int64, error)
+}
+
+// SetStatePersister 注入/替换 DB 后端。必须在 RestoreFromSnapshot 之前
+// 调用（main 的装配顺序：New → SetStatePersister → RestoreFromSnapshot
+// → SyncToDir）：DB 先恢复成基础状态，Redis 快照只在比 DB 新时覆盖。
+func (p *Pool) SetStatePersister(s StatePersister) {
+	p.mu.Lock()
+	p.persister = s
+	p.mu.Unlock()
+	if s != nil {
+		p.loadFromPersister()
+	}
+}
+
+// loadFromPersister DB 模式启动恢复：DB 行覆盖内存状态。
+// 空库且本地 state.json 存在时一次性导入（文件保留，可回滚到旧版本）。
+func (p *Pool) loadFromPersister() {
+	s := p.persister
+	if s == nil {
+		return
+	}
+	rows, err := s.LoadPoolAccounts()
+	if err != nil {
+		log.Printf("pool: state.db 加载失败: %v（沿用本地/快照恢复的状态）", err)
+		return
+	}
+	if len(rows) == 0 {
+		p.importLegacyFile(s)
+		return
+	}
+	applied := 0
+	p.mu.Lock()
+	for uid, raw := range rows {
+		var sa stateAccount
+		if json.Unmarshal(raw, &sa) != nil {
+			log.Printf("pool: state.db 行损坏 uid=%s，跳过（该账号从 auths 重新入场，冷却态自愈）", uid)
+			continue
+		}
+		p.applyAccountsLocked(map[string]stateAccount{uid: sa})
+		applied++
+	}
+	p.mu.Unlock()
+	log.Printf("pool: 恢复来源=state.db（%d 个账号）", applied)
+	// 记录 DB 新鲜度供 Redis 择新比较（探针失败时退回文件 mtime）。
+	if fc, ok := s.(PoolFreshnessChecker); ok {
+		if ts, err := fc.MaxPoolUpdatedAt(); err == nil && ts > 0 {
+			p.mu.Lock()
+			p.dbFreshAt = time.Unix(ts, 0)
+			p.mu.Unlock()
+		}
+	}
+}
+
+// importLegacyFile 空库时把本地 state.json 一次性导入 DB（文件原样保留）。
+// 导入失败只打日志：DB 空着从 auths 重新入场，冷却态自愈，不算事故。
+func (p *Pool) importLegacyFile(s StatePersister) {
+	if p.stateFp == "" {
+		return
+	}
+	raw, err := os.ReadFile(p.stateFp)
+	if err != nil {
+		return // 无旧文件：全新部署
+	}
+	var sf stateFile
+	if json.Unmarshal(raw, &sf) != nil || len(sf.Accounts) == 0 {
+		return
+	}
+	rows := make(map[string][]byte, len(sf.Accounts))
+	for uid, sa := range sf.Accounts {
+		if blob, err := json.Marshal(sa); err == nil {
+			rows[uid] = blob
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	if err := s.UpsertPoolAccounts(rows); err != nil {
+		log.Printf("pool: state.json 导入 state.db 失败: %v（空库继续，冷却态自愈）", err)
+		return
+	}
+	log.Printf("pool: 已从 state.json 迁移 %d 个账号到 state.db（原文件保留，可回滚）", len(rows))
 }
 
 // SetBreaker 注入熔断器参数（main 从 config 解析后调用）。非正值保留原值（用默认）。
@@ -433,38 +567,54 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 	p.store = s
 }
 
-// RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
+// RestoreFromSnapshot 择新恢复：比较本地状态与 Redis 快照，采用较新者。
 // 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
 // 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
+//
+// "本地"的新鲜度基准：DB 模式（dbFreshAt 非零）用 DB 的最后写入时间，
+// 文件模式用 state.json 的 mtime——DB 模式下本地文件不再更新，mtime 恒旧。
 func (p *Pool) RestoreFromSnapshot() {
 	store := p.store
 	if store == nil || p.stateFp == "" {
 		return
 	}
+	p.mu.RLock()
+	dbFresh := p.dbFreshAt
+	p.mu.RUnlock()
 	localInfo, localErr := os.Stat(p.stateFp)
+	// localFresh：择新比较用的"本地"时刻。DB 模式优先 DB 新鲜度；探针失败
+	// 或文件模式退回 mtime。
+	localFresh := time.Time{}
+	if localErr == nil {
+		localFresh = localInfo.ModTime()
+	}
+	if !dbFresh.IsZero() && dbFresh.After(localFresh) {
+		localFresh = dbFresh
+	}
 	raw, ok := store.LoadState()
 	if !ok {
-		if localErr == nil {
-			log.Printf("pool: 恢复来源=本地 state.json（无 Redis 快照）")
+		if localErr == nil || !dbFresh.IsZero() {
+			log.Printf("pool: 恢复来源=本地状态（无 Redis 快照）")
 		}
 		return
 	}
 	var snap snapshot
 	if json.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
 		// 快照无 savedAt：无法比较新旧，本地优先。
-		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
+		log.Printf("pool: 恢复来源=本地状态（Redis 快照无 saved_at）")
 		return
 	}
-	if localErr == nil && !localInfo.ModTime().After(snap.SavedAt) {
+	if !localFresh.After(snap.SavedAt) {
 		// 快照不早于本地 → 采用快照。
 		p.mu.Lock()
 		p.applySnapshotLocked(snap)
+		p.markDirtyAllLocked() // 采用的快照写穿到 DB（全量标脏）
 		p.mu.Unlock()
 		p.dirty.Store(true)
 		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
 		return
 	}
-	log.Printf("pool: 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
+	log.Printf("pool: 恢复来源=本地状态（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
 }
 
 // Acquire 为账号占一个在途名额；false 表示该账号已达上限（或不存在）。
@@ -520,13 +670,25 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.randInt64N = fn
 }
 
-// startFlusher 每 flushInterval 检查 dirty 标志，有变更则落盘。
+// startFlusher 每 flushInterval 检查脏状态，有变更则落盘。
+// DB 模式走增量（flushDirtySet），文件模式走全量（saveLocked）。
 func (p *Pool) startFlusher() {
 	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for range t.C {
+			p.mu.RLock()
+			hasPersister := p.persister != nil
+			hasDirty := len(p.dirtySet) > 0
+			p.mu.RUnlock()
+			if hasPersister {
+				if hasDirty {
+					p.flushDirtySet()
+					p.mirrorSnapshotToRedis()
+				}
+				continue
+			}
 			p.mu.Lock()
 			dirty := p.dirty.Swap(false)
 			if dirty {
@@ -540,6 +702,13 @@ func (p *Pool) startFlusher() {
 
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
+	p.mu.RLock()
+	hasPersister := p.persister != nil
+	p.mu.RUnlock()
+	if hasPersister {
+		p.flushDirtySet()
+		return
+	}
 	p.mu.Lock()
 	if p.dirty.Swap(false) {
 		p.saveLocked() // 内部释放 p.mu 后再落盘
@@ -549,30 +718,47 @@ func (p *Pool) Flush() {
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
+// 文件模式不置全量脏标记（历史语义：Add 不触发 state.json 落盘，新账号由
+// SyncToDir/状态变更路径兜底）；DB 模式仍按行 upsert（新账号需要入库，
+// 否则重启后不在池中）。
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.upsertLocked(a)
+	p.markDirtyUpLocked(a.UID)
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
-// 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
+// 剔除结果持久化（文件模式回写 state.json / DB 模式删行），避免已删账号在
+// 下次启动时复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
 		p.upsertLocked(a)
+		p.markDirtyUpLocked(a.UID) // DB 模式：启动全量对齐（新账号入库；已存在行重写无害）
 	}
 	changed := false
 	for uid := range p.byUID {
 		if !seen[uid] {
 			delete(p.byUID, uid)
+			p.markDirtyDeleteLocked(uid)
 			changed = true
 		}
 	}
 	if changed {
-		p.saveLocked() // 内部释放 p.mu 后再落盘
+		p.dirty.Store(true) // 文件模式：有剔除才全量重写（历史语义）
+	}
+	hasPersister := p.persister != nil // 仍持锁时读取（RLock 会死锁）
+	if hasPersister {
+		p.mu.Unlock()
+		// DB 模式：增量写库（含删行），锁外执行（flushDirtySet 自管锁纪律），
+		// 保持"对齐结果立刻持久化"的同步落盘要求。
+		p.flushDirtySet()
+	} else if changed {
+		// 文件模式：保持旧语义——持锁调 saveLocked（内部释放 p.mu 后落盘）。
+		p.saveLocked()
 	} else {
 		p.mu.Unlock()
 	}
@@ -939,6 +1125,20 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	return w
 }
 
+// noteChangeLocked 统一的变更通知（单账号）：文件模式置全量脏标记，
+// DB 模式按 uid 记增量操作。调用方必须已持 p.mu。
+func (p *Pool) noteChangeLocked(uid string) {
+	p.dirty.Store(true)
+	p.markDirtyUpLocked(uid)
+}
+
+// noteChangeAllLocked 统一的变更通知（全部账号）：DB 模式全量标脏。
+// 调用方必须已持 p.mu。
+func (p *Pool) noteChangeAllLocked() {
+	p.dirty.Store(true)
+	p.markDirtyAllLocked()
+}
+
 // SetCredits 更新账号余额（对账快照）：影子扣减随之清零——真实快照
 // 已覆盖一切，影子账使命完成。
 func (p *Pool) SetCredits(uid string, credits int64) {
@@ -947,7 +1147,7 @@ func (p *Pool) SetCredits(uid string, credits int64) {
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
 		e.spent = 0
-		p.dirty.Store(true)
+		p.noteChangeLocked(uid)
 	}
 }
 
@@ -998,7 +1198,7 @@ func (p *Pool) SetCreditDetail(uid string, detail CreditDetail) {
 		e.creditUpdatedAt = time.Now()
 		e.spent = 0 // 对账清零影子账
 		p.updateCreditsLocked(e, detail.Remaining)
-		p.dirty.Store(true)
+		p.noteChangeLocked(uid)
 	}
 }
 
@@ -1024,7 +1224,7 @@ func (p *Pool) CooldownUntil(uid string, kind CoolKind, until time.Time, reason 
 		if kind != CoolRateLimit {
 			p.recordBreakerFailureLocked(e) // 普通冷却入口也是熔断器的失败信号
 		}
-		p.dirty.Store(true)
+		p.noteChangeLocked(uid)
 	}
 }
 
@@ -1059,7 +1259,7 @@ func (p *Pool) CooldownModelUntil(uid, model string, until time.Time, reason str
 				if len(e.modelCooldowns) == 0 {
 					e.modelCooldowns = nil
 				}
-				p.dirty.Store(true)
+				p.noteChangeLocked(uid)
 			}
 		}
 		return
@@ -1071,7 +1271,7 @@ func (p *Pool) CooldownModelUntil(uid, model string, until time.Time, reason str
 		return
 	}
 	e.modelCooldowns[model] = modelCooldown{Until: until, Reason: reason}
-	p.dirty.Store(true)
+	p.noteChangeLocked(uid)
 }
 
 // recordBreakerFailureLocked 累计一次熔断失败；达到阈值则按指数退避熔断。
@@ -1116,7 +1316,7 @@ func (p *Pool) Disable(uid, reason string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.disabled = true
 		e.reason = reason
-		p.dirty.Store(true)
+		p.noteChangeLocked(uid)
 	}
 }
 
@@ -1137,7 +1337,7 @@ func (p *Pool) Enable(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
-	p.dirty.Store(true)
+	p.noteChangeLocked(uid)
 	return true
 }
 
@@ -1155,6 +1355,7 @@ func (p *Pool) Remove(uid string) (removed, busy bool) {
 	}
 	delete(p.byUID, uid)
 	p.dirty.Store(true)
+	p.markDirtyDeleteLocked(uid) // DB 模式：删行
 	return true, false
 }
 
@@ -1182,7 +1383,7 @@ func (p *Pool) ClearCooldown(uid string) bool {
 	if !e.disabled {
 		e.reason = ""
 	}
-	p.dirty.Store(true)
+	p.noteChangeLocked(uid)
 	return true
 }
 
@@ -1217,7 +1418,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		p.updateCreditsLocked(e, remain)
-		p.dirty.Store(true)
+		p.noteChangeLocked(uid)
 	}
 }
 
@@ -1230,7 +1431,7 @@ func (p *Pool) NoteError(uid string) {
 		e.errTotal++
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
-		p.dirty.Store(true)
+		p.noteChangeLocked(uid)
 	}
 }
 
@@ -1247,7 +1448,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
 		e.riskStrikes = 0
-		p.dirty.Store(true)
+		p.noteChangeLocked(uid)
 	}
 }
 
@@ -1266,7 +1467,7 @@ func (p *Pool) NoteRiskStrike(uid string) string {
 	e.riskStrikes++
 	e.errTotal++
 	e.lastErr = time.Now()
-	p.dirty.Store(true)
+	p.noteChangeLocked(uid)
 	if e.riskStrikes >= p.riskDisableThreshold && !e.disabled {
 		e.disabled = true
 		e.reason = fmt.Sprintf("11140 risk flag (连续 %d 次, 连续阈值 %d)", e.riskStrikes, p.riskDisableThreshold)
@@ -1610,7 +1811,7 @@ func (p *Pool) persistSnapshot(sf stateFile) {
 	if p.stateFp != "" {
 		raw, err := json.MarshalIndent(sf, "", "  ")
 		if err != nil {
-			p.notePersistFail(err)
+			p.notePersistFail(err, false)
 			return
 		}
 		if dir := filepath.Dir(p.stateFp); dir != "" {
@@ -1618,11 +1819,11 @@ func (p *Pool) persistSnapshot(sf stateFile) {
 		}
 		tmp := p.stateFp + ".tmp"
 		if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-			p.notePersistFail(err)
+			p.notePersistFail(err, false)
 			return
 		}
 		if err := os.Rename(tmp, p.stateFp); err != nil {
-			p.notePersistFail(err)
+			p.notePersistFail(err, false)
 			return
 		}
 		if p.persistFails > 0 {
@@ -1642,16 +1843,22 @@ func (p *Pool) persistSnapshot(sf stateFile) {
 	}
 }
 
-// notePersistFail 记录一次本地 state.json 落盘失败，并按节流规则决定是否打日志：
-// 首败（状态成功→失败）打完整错误、每 persistLogEvery 次连续失败打一条提醒、
-// 其余连续失败静默（flusher 5s 一把，磁盘持续满时不刷屏）。
-// 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
-// "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
-func (p *Pool) notePersistFail(err error) {
+// notePersistFail 记录一次落盘失败（state.json 或 state.db），并按节流规则
+// 决定是否打日志：首败（状态成功→失败）打完整错误、每 persistLogEvery 次连续
+// 失败打一条提醒、其余连续失败静默（flusher 5s 一把，磁盘持续满时不刷屏）。
+// 恢复成功的日志由 saveLocked/flushDirtySet 在成功路径统一打。与 redisstore
+// 三处异步写的"失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，
+// 故多一层节流（notification）。dbMode 由调用方传入（persistMu 下不便读
+// p.persister——接口字段并发读写会 data race）。
+func (p *Pool) notePersistFail(err error, dbMode bool) {
+	target := "state.json"
+	if dbMode {
+		target = "state.db"
+	}
 	if p.persistFails == 0 {
-		log.Printf("pool: state.json 落盘失败: %v", err)
+		log.Printf("pool: %s 落盘失败: %v", target, err)
 	} else if p.persistFails%persistLogEvery == 0 {
-		log.Printf("pool: state.json 连续落盘失败 %d 次: %v", p.persistFails, err)
+		log.Printf("pool: %s 连续落盘失败 %d 次: %v", target, p.persistFails, err)
 	}
 	p.persistFails++
 }

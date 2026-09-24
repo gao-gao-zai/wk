@@ -4,16 +4,27 @@
 // 都是易失的（job TTL 2h / 日志滚动），用户无法回答"哪些号做完了、哪些
 // 还没做、做任务总共赚了多少分"。
 //
-// 形态：data/growth-ledger.json（state.json 同目录，随卷持久）。
+// 形态（按注入的持久化后端二选一）：
+//
+//   - DB 模式（GrowthLedgerStore 注入）：statestore 的 growth_claims 表，
+//     逐条 INSERT（幂等），启动时全量加载。库空且旧 JSON 文件存在时
+//     一次性导入（旧文件保留，可回滚）。
+//
+//   - 文件模式（仅注入 path）：data/growth-ledger.json（state.json 同目录），
+//     整文件原子重写。DB 不可用时的回退形态，行为与旧版完全一致。
+//
 //   - 记录粒度 = 账号 × 任务码：领取时间、获得积分/能量
+//
 //   - 只记"经本网关自动领奖成功"的条目；上游侧已 claimed 但非本网关领取的
 //     （用户手动/此前完成）在查询端点里实时对账补全（不落盘，标记
 //     source=upstream）
+//
 //   - 查询端点合并池账号给三态视图：完成 / 部分 / 未开始
 package server
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,6 +35,25 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
 )
+
+// GrowthLedgerClaim 增长台账的单条持久化记录（DB 模式用）。
+// 与 statestore.GrowthClaim 字段对应，但为避免 server 包直接依赖
+// statestore 而在包内定义（main 里做适配）。
+type GrowthLedgerClaim struct {
+	UID           string
+	TaskCode      string
+	Nickname      string
+	Credit        int64
+	Energy        int64
+	ClaimedAtUnix int64
+}
+
+// GrowthLedgerStore 增长台账的持久化契约（statestore.Store 满足；
+// 单测注入 fake）。两个方法都只在启动（Load）与领奖（Record）时调用。
+type GrowthLedgerStore interface {
+	RecordGrowthClaim(GrowthLedgerClaim) error
+	LoadGrowthClaims() ([]GrowthLedgerClaim, error)
+}
 
 // ledgerClaim 单条领取记录（账号 × 任务码）。
 type ledgerClaim struct {
@@ -40,17 +70,24 @@ type ledgerAccount struct {
 	Claims   []ledgerClaim `json:"claims"`
 }
 
-// growthLedger 内存态 + 落盘。启动读入；领取时追加并原子写回。
+// growthLedger 内存态 + 落盘（DB 或文件，二选一）。启动读入；领取时追加。
 type growthLedger struct {
 	mu    sync.Mutex
-	path  string
+	path  string                    // 文件模式：JSON 落盘路径；DB 模式：旧 JSON 文件路径（启动导入源）
+	store GrowthLedgerStore         // DB 模式后端；nil = 文件模式
 	byUID map[string]*ledgerAccount // key: uid
-	order []string                  // 首次记录顺序（落盘保留，读回恢复）
+	order []string                  // 首次记录顺序（文件模式落盘保留；DB 模式仅供内存遍历）
 }
 
 // newGrowthLedger path 空 = 纯内存（不落盘，测试用）。
-func newGrowthLedger(path string) *growthLedger {
-	l := &growthLedger{path: path, byUID: map[string]*ledgerAccount{}}
+// store 非 nil = DB 模式：启动从库里加载；库空且 path 指向的旧 JSON 存在
+// 时一次性导入（导入后旧文件原样保留，DB 出问题可回滚到文件模式）。
+func newGrowthLedger(path string, store GrowthLedgerStore) *growthLedger {
+	l := &growthLedger{path: path, store: store, byUID: map[string]*ledgerAccount{}}
+	if store != nil {
+		l.loadFromStore(path)
+		return l
+	}
 	if path == "" {
 		return l
 	}
@@ -58,11 +95,42 @@ func newGrowthLedger(path string) *growthLedger {
 	if err != nil {
 		return l
 	}
+	l.loadJSON(raw)
+	return l
+}
+
+// loadFromStore DB 模式启动加载：库全量灌内存；空库且旧 JSON 文件存在则导入。
+func (l *growthLedger) loadFromStore(legacyPath string) {
+	claims, err := l.store.LoadGrowthClaims()
+	if err != nil {
+		log.Printf("[growth-ledger] 台账库加载失败: %v（空台账口径继续运行）", err)
+		return
+	}
+	for _, c := range claims {
+		if c.UID == "" || c.TaskCode == "" {
+			continue
+		}
+		l.applyClaim(c.UID, c.TaskCode, c.Nickname, c.Credit, c.Energy, unixToRFC3339(c.ClaimedAtUnix))
+	}
+	if len(claims) == 0 && legacyPath != "" {
+		if raw, err := os.ReadFile(legacyPath); err == nil {
+			var before = len(l.byUID)
+			l.loadJSON(raw)
+			if n := len(l.byUID) - before; n > 0 {
+				log.Printf("[growth-ledger] 已从 %s 导入 %d 个账号的台账到数据库（原文件保留）", legacyPath, n)
+				l.replayToStore()
+			}
+		}
+	}
+}
+
+// loadJSON 解析旧 JSON 文件内容灌内存（文件模式启动与 DB 模式导入共用）。
+func (l *growthLedger) loadJSON(raw []byte) {
 	var stored struct {
 		Accounts []*ledgerAccount `json:"accounts"`
 	}
 	if json.Unmarshal(raw, &stored) != nil {
-		return l // 损坏则重新开始记（上游 claimed 仍可对账补全）
+		return // 损坏则重新开始记（上游 claimed 仍可对账补全）
 	}
 	for _, acc := range stored.Accounts {
 		if acc == nil || acc.UID == "" {
@@ -71,7 +139,53 @@ func newGrowthLedger(path string) *growthLedger {
 		l.byUID[acc.UID] = acc
 		l.order = append(l.order, acc.UID)
 	}
-	return l
+}
+
+// replayToStore 把内存台账全部回放写库（仅启动导入旧文件后调用一次）。
+// 写库失败只打日志：导入失败时上游对账仍能补全"完成"事实，仅积分收益
+// 统计缺失，不阻断启动。
+func (l *growthLedger) replayToStore() {
+	for uid, acc := range l.byUID {
+		for _, c := range acc.Claims {
+			at := time.Time{}
+			if t, err := time.Parse(time.RFC3339, c.At); err == nil {
+				at = t
+			}
+			if err := l.store.RecordGrowthClaim(GrowthLedgerClaim{
+				UID: uid, TaskCode: c.TaskCode, Nickname: acc.Nickname,
+				Credit: c.Credit, Energy: c.Energy, ClaimedAtUnix: at.Unix(),
+			}); err != nil {
+				log.Printf("[growth-ledger] 台账导入写库失败 %s/%s: %v", uid, c.TaskCode, err)
+			}
+		}
+	}
+}
+
+// applyClaim 把一条领取记录灌入内存（DB 启动加载用；不走落盘）。
+func (l *growthLedger) applyClaim(uid, taskCode, nickname string, credit, energy int64, at string) {
+	acc := l.byUID[uid]
+	if acc == nil {
+		acc = &ledgerAccount{UID: uid, Nickname: nickname}
+		l.byUID[uid] = acc
+		l.order = append(l.order, uid)
+	}
+	if nickname != "" && acc.Nickname != nickname {
+		acc.Nickname = nickname
+	}
+	for _, c := range acc.Claims {
+		if c.TaskCode == taskCode {
+			return // 幂等：重复条目只保留首条
+		}
+	}
+	acc.Claims = append(acc.Claims, ledgerClaim{TaskCode: taskCode, Credit: credit, Energy: energy, At: at})
+}
+
+// unixToRFC3339 秒级时间戳 → RFC3339 字符串（台账内存表示统一用字符串）。
+func unixToRFC3339(unix int64) string {
+	if unix <= 0 {
+		return ""
+	}
+	return time.Unix(unix, 0).Format(time.RFC3339)
 }
 
 // record 记一条领取（credit/energy 来自 ClaimReward 的返回值；为 0 也记
@@ -84,6 +198,18 @@ func (l *growthLedger) record(uid, nickname, taskCode string, credit, energy int
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	at := time.Now().Format(time.RFC3339)
+	// DB 模式：先写库（幂等冲突时保首条），写库失败只打日志不回滚内存——
+	// 台账写失败不能打断领奖主流程（与 redisstore fire-and-forget 范式
+	// 对齐）；内存有记录，下次重启前查询口径不受影响。
+	if l.store != nil {
+		if err := l.store.RecordGrowthClaim(GrowthLedgerClaim{
+			UID: uid, TaskCode: taskCode, Nickname: nickname,
+			Credit: credit, Energy: energy, ClaimedAtUnix: time.Now().Unix(),
+		}); err != nil {
+			log.Printf("[growth-ledger] 台账写库失败 %s/%s: %v", uid, taskCode, err)
+		}
+	}
 	acc := l.byUID[uid]
 	if acc == nil {
 		acc = &ledgerAccount{UID: uid, Nickname: nickname}
@@ -101,14 +227,16 @@ func (l *growthLedger) record(uid, nickname, taskCode string, credit, energy int
 	}
 	acc.Claims = append(acc.Claims, ledgerClaim{
 		TaskCode: taskCode, Credit: credit, Energy: energy,
-		At: time.Now().Format(time.RFC3339),
+		At: at,
 	})
-	l.flushLocked()
+	if l.store == nil {
+		l.flushLocked() // 文件模式：整文件原子重写
+	}
 }
 
-// flushLocked 原子落盘（调用方需持锁）。
+// flushLocked 原子落盘（文件模式专用；调用方需持锁）。
 func (l *growthLedger) flushLocked() {
-	if l.path == "" {
+	if l.path == "" || l.store != nil {
 		return
 	}
 	accounts := make([]*ledgerAccount, 0, len(l.order))
@@ -298,7 +426,7 @@ func (h *Handler) growthLedgerOverview(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) buildLedgerOverview(accounts []*auth.Auth, tasks [][]upstream.Task) ledgerOverview {
 	l := h.growthLedger
 	if l == nil {
-		l = newGrowthLedger("") // 未初始化（测试/异常路径）：空台账口径
+		l = newGrowthLedger("", nil) // 未初始化（测试/异常路径）：空台账口径
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()

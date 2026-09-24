@@ -92,7 +92,11 @@ type Config struct {
 	// 记录每账号每任务的领取时间与积分/能量收益，重启不丢；查询端点合并
 	// 上游 claimed 对账产出三态视图（完成/部分/未开始）。
 	GrowthLedgerPath string
-	UpdateSchedule   func(checkinHours, keepaliveHours []int)
+	// GrowthLedgerStore 台账 DB 后端（statestore.Store 经适配注入）。
+	// 非 nil 时优先于 GrowthLedgerPath 的文件模式：逐条写库 + 启动全量加载，
+	// GrowthLedgerPath 退化为"旧 JSON 的一次性导入源"。nil = 文件模式。
+	GrowthLedgerStore GrowthLedgerStore
+	UpdateSchedule    func(checkinHours, keepaliveHours []int)
 	// ReconfigureSchedule 完整排程热更新（五类任务时点 + 开关）。控制台保存
 	// schedule 卡片时调用；nil = 走 UpdateSchedule（老部署语义）。
 	ReconfigureSchedule func(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
@@ -261,7 +265,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
-	h.growthLedger = newGrowthLedger(cfg.GrowthLedgerPath)
+	h.growthLedger = newGrowthLedger(cfg.GrowthLedgerPath, cfg.GrowthLedgerStore)
 	// 运行时特性开关/费率从启动配置拷贝一份；WebUI 保存时经 updateFeatures
 	// 同时改这里和 upstream Client（见 saveAdminConfig）。sanitizeHooks 为 nil
 	// 时（单测直接构造 Handler）只更新本地副本。
@@ -4208,7 +4212,7 @@ func (h *Handler) currentCreditPolicy() CreditPolicy {
 //   - ErrNotFound → Cooldown(CoolSoft)：即时账号级软冷却（404）。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrRiskFlag → NoteRiskStrike：11140 风控连续计数，达阈值自动 Disable
-//    （健康号偶发的内容审核触发会被 NoteSuccess 清零，不会连坐）。
+//     （健康号偶发的内容审核触发会被 NoteSuccess 清零，不会连坐）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。

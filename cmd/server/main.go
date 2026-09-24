@@ -28,6 +28,7 @@ import (
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/smslogin"
+	"workbuddy2api/internal/statestore"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -275,8 +276,20 @@ func main() {
 
 	p := pool.New(cfg.StateFile)
 	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
+
+	// statestore：池状态 + 增长台账的数据库后端（PG → SQLite → nil 降级链，
+	// 见 openStateStore）。nil 时 pool/台账走 JSON 文件模式（零回归）。
+	// 注入时机在 Redis 择新之前：DB 先恢复成基础状态，Redis 快照只在
+	// 比 DB 新时才覆盖（见 RestoreFromSnapshot 的择新逻辑），保证
+	// "flush 时 DB 写失败但 Redis 镜像成功"的窗口不丢数据。
+	stateDB := openStateStore(cfg)
+	if stateDB != nil {
+		defer stateDB.Close()
+		p.SetStatePersister(stateDB)
+	}
+
 	p.SetStore(store)
-	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
+	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比 DB/本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
@@ -429,7 +442,9 @@ func main() {
 		// 批跑恢复标记同目录：重启自动续跑剩余账号（见 ResumeGrowthJobsAfterRestart）。
 		GrowthJobMarkPath: filepath.Join(filepath.Dir(cfg.StateFile), "growth-job.json"),
 		// 一次性任务台账同目录：领取记录 + 积分收益持久化（前端三态展示）。
-		GrowthLedgerPath: filepath.Join(filepath.Dir(cfg.StateFile), "growth-ledger.json"),
+		// stateDB 可用时走 DB 模式（此路径退化为旧 JSON 的一次性导入源）。
+		GrowthLedgerPath:  filepath.Join(filepath.Dir(cfg.StateFile), "growth-ledger.json"),
+		GrowthLedgerStore: ledgerStoreAdapterOrNull(stateDB),
 		UpdateSchedule: func(checkinHours, keepaliveHours []int) {
 			// 老签名适配：只改签到/保活时点，其余排程参数不动（完整热改走 Reconfigure）。
 			sch.Reconfigure(checkinHours, nil, nil, keepaliveHours, nil,
@@ -488,7 +503,7 @@ func main() {
 		// 请求体大小上限（字节）：WebUI「请求体大小限制」卡片保存后
 		// 即时生效；默认 8 MiB（config normalize 已保证 1-64）。
 		MaxRequestBodyBytes: cfg.MaxRequestBodyMiB << 20,
-		SoftCooldown: cfg.SoftRateDur,
+		SoftCooldown:        cfg.SoftRateDur,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -637,6 +652,66 @@ func autoEnrollLedgerPath(cfg *Config) string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(sf), "autoenroll-held.json")
+}
+
+// ledgerStoreAdapter 把 statestore 的台账方法适配成 server.GrowthLedgerStore。
+// 与 metricsAdapter 同一模式：main 负责类型翻译，包间不直接依赖。
+type ledgerStoreAdapter struct{ store *statestore.Store }
+
+func (a ledgerStoreAdapter) RecordGrowthClaim(c server.GrowthLedgerClaim) error {
+	return a.store.RecordGrowthClaim(statestore.GrowthClaim{
+		UID: c.UID, TaskCode: c.TaskCode, Nickname: c.Nickname,
+		Credit: c.Credit, Energy: c.Energy, ClaimedAtUnix: c.ClaimedAtUnix,
+	})
+}
+
+func (a ledgerStoreAdapter) LoadGrowthClaims() ([]server.GrowthLedgerClaim, error) {
+	claims, err := a.store.LoadGrowthClaims()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]server.GrowthLedgerClaim, 0, len(claims))
+	for _, c := range claims {
+		out = append(out, server.GrowthLedgerClaim{
+			UID: c.UID, TaskCode: c.TaskCode, Nickname: c.Nickname,
+			Credit: c.Credit, Energy: c.Energy, ClaimedAtUnix: c.ClaimedAtUnix,
+		})
+	}
+	return out, nil
+}
+
+// ledgerStoreAdapterOrNull stateDB 为 nil 时返回 nil（台账走文件模式），
+// 非空时包一层适配器。单独成函数是为了让 server.Config 字段表达式保持简洁。
+func ledgerStoreAdapterOrNull(s *statestore.Store) server.GrowthLedgerStore {
+	if s == nil {
+		return nil
+	}
+	return ledgerStoreAdapter{store: s}
+}
+
+// openStateStore 打开池状态 + 增长台账的持久化后端（降级链：PG → SQLite → nil）。
+//   - 配置了 postgres.dsn：优先 PG（失败不致命，回退 SQLite——与 metricsstore
+//     的降级语义不同，池状态不允许"纯内存"静默丢，必须有本地兜底）；
+//   - 否则 SQLite（state.json 同目录的 state.db）；
+//   - SQLite 也打不开（卷故障/只读）：返回 nil，pool/growthledger 退化为
+//     现有 JSON 文件模式（零回归），启动日志明示。
+func openStateStore(cfg *Config) *statestore.Store {
+	stateDir := groupsStoreDir(cfg)
+	if cfg.Postgres.DSN != "" {
+		s, err := statestore.OpenPostgres(cfg.Postgres.DSN, cfg.Postgres.MaxOpenConns, cfg.Postgres.MaxIdleConns, cfg.PostgresMaxLifetime, cfg.PostgresMaxIdleTime)
+		if err == nil {
+			log.Printf("[statestore] 池状态 + 增长台账存储 = postgres")
+			return s
+		}
+		log.Printf("[statestore] postgres 不可用 (%v)，回退 sqlite", err)
+	}
+	s, err := statestore.OpenSQLite(filepath.Join(stateDir, "state.db"))
+	if err != nil {
+		log.Printf("[statestore] state.db 不可用 (%v)，池状态/台账退化为 JSON 文件模式", err)
+		return nil
+	}
+	log.Printf("[statestore] 池状态 + 增长台账存储 = sqlite (%s)", filepath.Join(stateDir, "state.db"))
+	return s
 }
 
 // smsDebugLogPath SMS 诊断日志路径：与号码账本同目录（data/ 卷，容器重建

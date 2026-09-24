@@ -247,7 +247,9 @@ config.json 基础设施参数（全部可选，不配即用默认值）：
 
 指标和请求日志支持 PostgreSQL。配置 `postgres.dsn` 或设置 `WB2A_POSTGRES_DSN` 后，服务会使用带连接池的 PostgreSQL，并在同一事务中提交统计和请求日志；未配置 DSN 时继续使用本地 SQLite。PostgreSQL 连接失败默认进入内存指标模式，可将 `postgres.fallback_to_sqlite` 设为 `true` 以回退本地 SQLite。连接池可通过 `max_open_conns`、`max_idle_conns`、`conn_max_lifetime` 和 `conn_max_idle_time` 调整。
 
-首次切换到 PostgreSQL 时会自动创建表，已有 `metrics.db` 不会被删除或自动导入；切换前请保留该文件，需要历史数据时再安排离线迁移。
+池状态与增长台账共用同一个 PostgreSQL DSN（`pool_accounts` / `growth_claims` 表）；PG 不可用时自动回退本地 SQLite（`data/state.db`），与指标的降级链相互独立。
+
+首次切换到 PostgreSQL 时会自动创建表，已有 `metrics.db` 不会被删除或自动导入；切换前请保留该文件，需要历史数据时再安排离线迁移。池状态与台账同理：已有 `state.db` 不自动导入 PostgreSQL，需要时把 `data/` 目录下的旧库文件留好再安排迁移。
 
 可运行不调用真实上游、不消耗账号额度的回环压测：
 
@@ -311,9 +313,19 @@ Disabled ←────┘ (session 死亡，永久)
 
 - 配置 `upstash.url/token`（空 = 纯内存模式，一切功能照常，只打一条启动警告）。
 - Redis 仅做异步镜像（粘性会话映射防重启丢失 + 池状态快照恢复备份），**不在请求热路径同步调用**。
-- 池状态快照：每次本地 `state.json` 落盘同步镜像一份到 Redis（带 `saved_at`）；启动时**择新恢复**——Redis 快照比本地新才采用，否则本地优先。
+- 池状态快照：每次落盘同步镜像一份到 Redis（带 `saved_at`）；启动时**择新恢复**——Redis 快照比本地存储（`state.db` 或 `state.json`）新才采用，否则本地优先。
 - `/status` 透出 `redis_mode`（`upstash`/`noop`）与池级 `sticky_sessions`。
-- 账号状态同时包含上游 `capacity_size/remain/used`、`cycle_capacity_size/remain/used` 和 `credit_updated_at`；服务启动、定时签到或调用积分刷新接口时更新，并随 `state.json` 与 Redis 快照持久化。
+- 账号状态同时包含上游 `capacity_size/remain/used`、`cycle_capacity_size/remain/used` 和 `credit_updated_at`；服务启动、定时签到或调用积分刷新接口时更新，并随池状态存储持久化。
+
+### 池状态与增长台账存储
+
+账号池状态与增长任务台账默认持久化在 `state_file` 同目录的 **`state.db`**（SQLite）；配置 PostgreSQL DSN 后（`postgres.dsn`，与请求日志共用）则写入 PostgreSQL。
+
+- **池状态**（`pool_accounts` 表，每账号一行）：credits、容量、冷却/熔断、模型级限流、成功/失败计数等。落盘为**增量**——只写 5 秒周期内变更过的账号行，而非整文件重写（200 账号下每轮只写几行）。
+- **增长台账**（`growth_claims` 表，`(uid, task_code)` 主键）：一次性任务领取记录与积分/能量收益，逐条 INSERT（幂等，重复领取保留首条）。
+- **自动迁移**：首次启动发现旧 `state.json` / `growth-ledger.json` 且库为空时自动导入（启动日志可见 `已从 ... 迁移 N 个账号`）；**旧文件原样保留**，回滚到旧版本时直接可用（可能略旧，冷却态过期自愈）。
+- **降级链**：PG 不可用 → 回退 SQLite；SQLite 打不开（卷故障/只读）→ 退化为旧 JSON 文件模式（零回归），启动日志明示。
+- Redis 择新恢复的比较基准在 DB 模式下换用 DB 的最后写入时间（本地 `state.json` 不再更新，mtime 恒旧）。
 
 ### 请求日志、token 与积分
 
@@ -438,7 +450,7 @@ ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
 - **请求日志**：SQLite 持久化模型、token、积分、TTFB、总耗时和错误码，stdout 保留精简表格
 - **连接池**：`MaxIdleConnsPerHost=20` 减少 TLS 握手
 - **凭证续期**：token 临近过期自动 refresh，失败禁用账号
-- **状态持久化**：`data/state.json` dirty flag + 5s 周期异步落盘，进程退出前强制 flush
+- **状态持久化**：池状态增量写 `data/state.db`（只写变更过的账号行），5s 周期异步落库，进程退出前强制 flush；库不可用时退化为 `state.json` 全量重写（零回归）
 - **防惊群**：100ms 窗口内不重复选中同一账号（高并发时打散热点）
 
 ## 开发
