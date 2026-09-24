@@ -1,5 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+// React 19 兼容补丁（官方）：antd v5 只声明支持 React 16-18；19 移除了
+// 旧版 render/事件模拟路径后，Modal/Drawer 的关闭动画会偶发卡死——遮罩
+// 残留在 ant-fade-leave-active 状态，拦截整页 pointer 事件（表现为
+// 「弹窗/抽屉关不掉」）。此补丁接管 wave/动画事件绑定，必须在任何
+// antd 组件渲染前 import。
+import '@ant-design/v5-patch-for-react-19';
 import {
   Alert, App as AntApp, Button, Card, ConfigProvider, Empty, Form, Input, InputNumber, Layout, Menu, Modal,
   Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography, message,
@@ -164,9 +170,11 @@ function Console() {
       setLocked(false);
     } catch (error) {
       if (error.name === 'AbortError') return;
-      // 401 的错误文案里带 invalid / credential / 密钥 等；宽松匹配避免后端
-      // 文案微调后这里静默失效（锁死在解锁弹窗之外）。
-      if (/invalid|credential|unauthorized|密钥/i.test(error.message)) setLocked(true);
+      // 鉴权失效判定只看 HTTP 状态码：后端的 401 是确定信号，而错误文案
+      // 随端点变化（/status 是 "missing or invalid API key"，/admin/config
+      // 是 "admin credential required"），靠正则匹配文案曾导致会话过期后
+      // 解锁弹窗时隐时现甚至永不出现。
+      if (error.status === 401) setLocked(true);
       return;
     }
     try {
@@ -188,7 +196,14 @@ function Console() {
       }));
     } catch (error) {
       if (error.name === 'AbortError') return;
-      // Dashboard data can still refresh when configuration is unavailable.
+      // 401 单独处理：/status 能过（比如输入了分组密钥）但 /admin/* 拒绝时，
+      // 说明当前凭据进不了管理面——必须重新弹解锁框，而不是静默吞掉
+      // 让用户看着"正常"的仪表盘却处处失败。其他错误（老后端没有该端点
+      // 等）仍静默：仪表盘数据可以照常刷新。
+      if (error.status === 401) {
+        setLocked(true);
+        return;
+      }
     }
   };
 
@@ -503,7 +518,11 @@ function Console() {
       });
       if (!response.ok) {
         const errorBody = await response.json().catch(() => ({}));
-        throw Error(errorBody?.error?.message || errorBody?.error || `请求失败 (${response.status})`);
+        const error = Error(errorBody?.error?.message || errorBody?.error || `请求失败 (${response.status})`);
+        // 会话/密钥失效：Playground 请求 401 时同样要弹解锁框，
+        // 否则用户只看到失败文案，不知道需要重新鉴权。
+        if (response.status === 401) setLocked(true);
+        throw error;
       }
       let finalResponse = null;
       if (!stream) {

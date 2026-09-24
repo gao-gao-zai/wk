@@ -1,7 +1,10 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
-  Alert, AutoComplete, Button, Divider, Drawer, Form, Input, InputNumber, message, Modal, Popconfirm, Select, Space, Tag, Typography,
+  Alert, Button, Divider, Drawer, Form, Input, InputNumber, message, Modal, Popconfirm, Select, Space, Tag, Typography,
 } from 'antd';
+import { SearchOutlined } from '@ant-design/icons';
+
+import ProjectPickerModal from './ProjectPickerModal';
 
 const { Text, Paragraph } = Typography;
 
@@ -35,12 +38,8 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
   const h5 = hz.h5 || {};
   const h5Ready = h5.has === true && h5.expired !== true;
 
-  // —— 项目搜索（H5 type=30 代理） ——
-  const [projectOptions, setProjectOptions] = useState([]);
-  const [searching, setSearching] = useState(false);
-  const [searched, setSearched] = useState(false); // 是否已搜过（空态文案区分）
-  const [searchError, setSearchError] = useState('');
-  const searchTimer = useRef(null);
+  // —— 项目搜索（H5 type=30 代理）——浮窗选择器（ProjectPickerModal）——
+  const [projectPickerOpen, setProjectPickerOpen] = useState(false);
 
   // —— 对接码列表（H5 type=8 代理，按选中的项目 sid 拉取） ——
   // 注意：type=8 只认 16 位 hex 项目标识（type=30 返回的 sid），不认
@@ -99,9 +98,6 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       });
       setDirty(false);
       setSaveError('');
-      setProjectOptions([]);
-      setSearched(false);
-      setSearchError('');
       setHexSidMap({});
       setUidItems(null);
       setUidError('');
@@ -111,30 +107,18 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
     }
   }, [open]);
 
-  const searchProjects = async (keyword) => {
-    const q = (keyword || '').trim();
-    if (!q) return;
-    setSearching(true);
-    setSearchError('');
-    try {
-      const resp = await api(`/admin/account/sms/haozhuma/projects?q=${encodeURIComponent(q)}`);
-      const projects = resp.projects || [];
-      setProjectOptions(projects);
-      // 记录 数字ID → hex sid 映射（对接码列表只认 hex，实测数字 ID
-      // 返回"没有数据"）。
-      setHexSidMap(current => {
-        const next = { ...current };
-        projects.forEach(p => { if (p.project_id) next[p.project_id] = p.sid; });
-        return next;
-      });
-      setSearched(true);
-    } catch (err) {
-      setSearchError(err.message);
-      setProjectOptions([]);
-      setSearched(false);
-    } finally {
-      setSearching(false);
+  // 浮窗选中项目：写表单（数字 ID）、记映射（hex sid）、拉对接码列表。
+  const handlePickProject = (p) => {
+    if (!p || !p.project_id) {
+      message.warning('该项目未能解析出数字 ID，请手动填写');
+      return;
     }
+    form.setFieldValue('sid', p.project_id);
+    setHexSidMap(current => ({ ...current, [p.project_id]: p.sid }));
+    setDirty(true);
+    setUidItems(null);
+    setUidError('');
+    loadUIDsByHex(p.sid);
   };
 
   const handleClose = () => {
@@ -266,45 +250,29 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       >
         <Divider orientation="left" plain style={{ margin: '4px 0 12px' }}>项目与对接码</Divider>
         <Form.Item
-          name="sid"
-          label="项目 ID"
-          extra={h5Ready ? '输入关键词（如"腾讯"）搜索，点选后自动写入项目 ID。' : '取号项目 ID，如 52283（腾讯科技[限对接]）。'}
+          label="项目"
+          extra={h5Ready ? '点「搜索项目」从豪猪项目库选择；选中后自动拉取该项目的对接码列表。' : '取号项目 ID，如 52283（腾讯科技[限对接]）。配置 H5 会话后可搜索选择。'}
           validateTrigger={false}
-          rules={[{
-            validator: (_, v) => (!v || /^\d+$/.test(v.trim()))
-              ? Promise.resolve()
-              : Promise.reject(new Error('项目 ID 是纯数字，如 52283')),
-          }]}
         >
-          {h5Ready ? (
-            <AutoComplete
-              options={projectOptions.map(p => ({
-                value: p.project_id || p.sid,
-                label: (
-                  <div>
-                    <Text strong>{p.project_id ? `【${p.project_id}】` : ''}{(p.name || '').replace(/^【\d+】/, '').replace(/\s*\[[0-9a-f]+\]$/, '')}</Text>
-                    <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>{p.project_id ? '' : '（未能解析项目ID）'}</Text>
-                  </div>
-                ),
-              }))}
-              onSearch={(kw) => {
-                // 300ms 防抖：输入停顿后再搜（每次击键都打上游没必要）。
-                if (searchTimer.current) clearTimeout(searchTimer.current);
-                if (!kw.trim()) { setProjectOptions([]); setSearched(false); return; }
-                searchTimer.current = setTimeout(() => searchProjects(kw), 300);
-              }}
-              notFoundContent={
-                searching ? '搜索中…'
-                  : searchError ? <Text type="danger">{searchError}</Text>
-                    : searched ? '没有匹配的项目，换个关键词（如：腾讯、微信、抖音）'
-                      : '输入关键词搜索，如"腾讯"'
-              }
-              placeholder="输入关键词搜索，如：腾讯"
-              allowClear
-            />
-          ) : (
-            <Input allowClear placeholder="如 52283" />
-          )}
+          <Space.Compact style={{ width: '100%' }}>
+            <Form.Item
+              name="sid"
+              noStyle
+              validateTrigger={false}
+              rules={[{
+                validator: (_, v) => (!v || /^\d+$/.test((v || '').trim()))
+                  ? Promise.resolve()
+                  : Promise.reject(new Error('项目 ID 是纯数字，如 52283')),
+              }]}
+            >
+              <Input allowClear placeholder="如 52283" style={{ width: h5Ready ? 120 : '100%' }} />
+            </Form.Item>
+            {h5Ready && (
+              <Button icon={<SearchOutlined />} onClick={() => setProjectPickerOpen(true)}>
+                搜索项目
+              </Button>
+            )}
+          </Space.Compact>
         </Form.Item>
         <Form.Item
           name="uid"
@@ -401,6 +369,14 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           <InputNumber min={1} max={60} addonAfter="秒" style={{ width: '100%' }} />
         </Form.Item>
       </Form>
+
+      {/* 浮窗式项目选择器：与 Drawer 分层的独立 Modal，选中回填表单。 */}
+      <ProjectPickerModal
+        open={projectPickerOpen}
+        onClose={() => setProjectPickerOpen(false)}
+        api={api}
+        onPick={handlePickProject}
+      />
     </Drawer>
   );
 }
