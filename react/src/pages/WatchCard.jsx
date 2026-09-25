@@ -15,6 +15,35 @@ const { Text } = Typography;
 const WATCH_POLL_MS = 10000;
 
 /**
+ * CommitInputNumber 失焦/回车才提交的数字输入。
+ *
+ * 直接 onChange 即存的写法在输入中途就会触发保存——想输 120 会先存 1
+ * （后端报"间隔需 60-3600"）、再存 12（又报错）。改为：编辑期间只更新
+ * 本地值（也不被 10s 轮询回来的服务器值覆盖），失焦或回车才调
+ * onCommit；validate 不过（含清空）就回退到原值并提示，不打后端。
+ */
+function CommitInputNumber({ value, onCommit, validate, formatMessage, ...rest }) {
+  const [editing, setEditing] = useState(null); // null = 未在编辑（跟随 props 值）
+  const commit = (v) => {
+    setEditing(null);
+    if (validate && !validate(v)) {
+      if (formatMessage) message.warning(formatMessage(v));
+      return; // 放弃本次编辑，自然回退到 props value
+    }
+    if (v !== value) onCommit(v);
+  };
+  return (
+    <InputNumber
+      {...rest}
+      value={editing === null ? value : editing}
+      onChange={v => setEditing(v)}
+      onPressEnter={() => { if (editing !== null) commit(editing); }}
+      onBlur={() => { if (editing !== null) commit(editing); }}
+    />
+  );
+}
+
+/**
  * WatchCard 对接码监控卡片（UID Watcher）。
  *
  * 后台值班员：定期拉对接码市场 → 发现"新码/降价进区间/补货"事件 →
@@ -333,13 +362,15 @@ export default function WatchCard({ api, h5Ready }) {
         <Space wrap size={16}>
           <div>
             <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
-              每次触发加号数（1-10）
+              每次触发加号数（1-10，改完回车/点别处生效）
             </Text>
-            <InputNumber
+            <CommitInputNumber
               min={1}
               max={10}
               value={watch?.want_per_trigger || 1}
-              onChange={v => save({
+              validate={v => v >= 1 && v <= 10}
+              formatMessage={() => '每次触发加号数需在 1-10 之间'}
+              onCommit={v => save({
                 enabled: watch?.enabled || false,
                 interval_seconds: watch?.interval_seconds || 0,
                 want_per_trigger: v,
@@ -354,11 +385,13 @@ export default function WatchCard({ api, h5Ready }) {
             <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
               拉取间隔（秒，60-3600；0=默认 300）
             </Text>
-            <InputNumber
+            <CommitInputNumber
               min={0}
               max={3600}
               value={watch?.interval_seconds || 0}
-              onChange={v => save({
+              validate={v => v === 0 || (v >= 60 && v <= 3600)}
+              formatMessage={() => '拉取间隔需 60-3600 秒（0 = 默认 300）'}
+              onCommit={v => save({
                 enabled: watch?.enabled || false,
                 interval_seconds: v,
                 want_per_trigger: watch?.want_per_trigger || 1,
