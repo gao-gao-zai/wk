@@ -195,7 +195,30 @@ type watcherState struct {
 	PerUID          map[string]*watchUIDState `json:"per_uid"`
 	LastTick        string                  `json:"last_tick"`
 	UpdatedAt       string                  `json:"updated_at"`
+	// Events 触发事件流水（环形，最近 watchEventMax 条）。成果面板的
+	// 数据源——比活动日志强：结构化（项目/码/价格/成功/花费/时长分开
+	// 字段）、持久化（重启不丢）。
+	Events []watchEvent `json:"events,omitempty"`
 }
+
+// watchEvent 一次值班触发的完整生命周期记录（成果面板数据源）。
+type watchEvent struct {
+	Time     string  `json:"time"`              // 触发时刻（2006-01-02 15:04:05）
+	Day      string  `json:"day"`               // 触发日期（2006-01-02，今日汇总用）
+	Sid      string  `json:"sid"`               // 项目 ID
+	UID      string  `json:"uid"`               // 对接码
+	Ev       string  `json:"ev"`                // 事件类型（新码/降价/补货/重新上架）
+	Price    float64 `json:"price"`             // 触发时码价
+	Want     int     `json:"want"`              // 本轮目标数
+	OK       int     `json:"ok"`                // 成功数
+	Cost     float64 `json:"cost"`              // 真实花费（= OK × Price，失败 0）
+	Duration int     `json:"duration"`          // 任务耗时（秒）
+	Note     string  `json:"note,omitempty"`    // 结果备注（熔断原因/冷却标记等）
+}
+
+// watchEventMax 事件流水上限（环形裁剪）。200 条足够看一周的活跃度，
+// 状态文件也不会膨胀。
+const watchEventMax = 200
 
 func (s *watcherState) clone() watcherState {
 	out := watcherState{
@@ -207,6 +230,7 @@ func (s *watcherState) clone() watcherState {
 		PerUID:          make(map[string]*watchUIDState, len(s.PerUID)),
 		LastTick:        s.LastTick,
 		UpdatedAt:       s.UpdatedAt,
+		Events:          append([]watchEvent(nil), s.Events...),
 	}
 	for k, v := range s.PerUID {
 		c := *v
@@ -444,9 +468,37 @@ type WatchStatus struct {
 	LastTick        string  `json:"last_tick"`
 	NextTick        string  `json:"next_tick"`
 	Logs            []string `json:"logs"`
+
+	// Events 触发事件流水（倒序：最新在前），成果面板数据源。
+	Events []WatchEventStatus `json:"events"`
+	// Today 今日汇总（本地时区 0 点起算）。
+	Today WatchDaySummary `json:"today"`
 }
 
-// Status 当前配置 + 状态 + 日志。
+// WatchEventStatus 单条触发事件（GET /watch 回显，成果面板行）。
+type WatchEventStatus struct {
+	Time     string  `json:"time"`
+	Sid      string  `json:"sid"`
+	UID      string  `json:"uid"`
+	Ev       string  `json:"ev"`
+	Price    float64 `json:"price"`
+	Want     int     `json:"want"`
+	OK       int     `json:"ok"`
+	Cost     float64 `json:"cost"`
+	Duration int     `json:"duration"`
+	Note     string  `json:"note,omitempty"`
+}
+
+// WatchDaySummary 单日汇总（今日成果一眼看全）。
+type WatchDaySummary struct {
+	Triggers int     `json:"triggers"`
+	OK       int     `json:"ok"`
+	Spent    float64 `json:"spent"`
+	// SuccessRate 触发轮成功率（0-100）。
+	SuccessRate int `json:"success_rate"`
+}
+
+// Status 当前配置 + 状态 + 日志 + 事件流水 + 今日汇总。
 func (w *UIDWatcher) Status() WatchStatus {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -466,6 +518,33 @@ func (w *UIDWatcher) Status() WatchStatus {
 		Running:         w.running,
 		LastTick:        w.state.LastTick,
 		Logs:            append([]string(nil), w.logs...),
+	}
+	// 事件流水倒序（最新在前，面板第一屏就是最近的成果）。
+	st.Events = make([]WatchEventStatus, 0, len(w.state.Events))
+	for i := len(w.state.Events) - 1; i >= 0; i-- {
+		e := w.state.Events[i]
+		st.Events = append(st.Events, WatchEventStatus{
+			Time: e.Time, Sid: e.Sid, UID: e.UID, Ev: e.Ev,
+			Price: e.Price, Want: e.Want, OK: e.OK, Cost: e.Cost,
+			Duration: e.Duration, Note: e.Note,
+		})
+	}
+	// 今日汇总：Day == 今天（本地时区）。
+	today := time.Now().Format("2006-01-02")
+	var okRounds int
+	for _, e := range w.state.Events {
+		if e.Day != today {
+			continue
+		}
+		st.Today.Triggers++
+		st.Today.OK += e.OK
+		st.Today.Spent = round2(st.Today.Spent + e.Cost)
+		if e.OK > 0 {
+			okRounds++
+		}
+	}
+	if st.Today.Triggers > 0 {
+		st.Today.SuccessRate = okRounds * 100 / st.Today.Triggers
 	}
 	if !w.lastNextTick.IsZero() {
 		st.NextTick = w.lastNextTick.Format("15:04:05")
@@ -725,6 +804,7 @@ func (w *UIDWatcher) syncSnapshot(p WatchProject, items []haozhumah5.UIDItem, sk
 // executeTrigger 派活：加入账户 → 临时切换取号参数 → 跑一轮 → 记账 → 恢复。
 func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p WatchProject, uid string, price float64, ev string) {
 	want := cfg.want()
+	start := time.Now()
 	w.log("触发：%s %s（项目 %s）——加 %d 个号，预算 ¥%.2f", uid, ev, p.Sid, want, round2(price*float64(want)))
 
 	// 1) 确保码已加入账户（官方 API 只认已加入的；幂等）。
@@ -788,6 +868,7 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 			if st.Running {
 				// 还在跑：用当前成功数记账（保守），标记状态。
 				w.charge(uid, price, st.OK, st.StopReason)
+				w.recordEvent(p, uid, ev, price, want, start, st.OK, st.StopReason)
 				return
 			}
 			break
@@ -796,6 +877,7 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	}
 	st := w.en.Status()
 	w.charge(uid, price, st.OK, st.StopReason)
+	w.recordEvent(p, uid, ev, price, want, start, st.OK, st.StopReason)
 
 	// 差码处理：一轮下来 0 成功（典型 = 给出号收不到码）→ 冷却 +
 	// 从豪猪账户移除。冷却不是拉黑（24h 后自动恢复，真补了好库存仍能
@@ -803,6 +885,32 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	if st.OK == 0 {
 		w.markBadUID(ctx, uid, st.StopReason)
 	}
+}
+
+// recordEvent 事件流水入账（成果面板数据源）。cost 从当前预算口径
+// 推导（OK×Price），note 带任务结束原因。
+func (w *UIDWatcher) recordEvent(p WatchProject, uid, ev string, price float64, want int, start time.Time, ok int, stopReason string) {
+	now := time.Now()
+	e := watchEvent{
+		Time:     now.Format("2006-01-02 15:04:05"),
+		Day:      now.Format("2006-01-02"),
+		Sid:      p.Sid,
+		UID:      uid,
+		Ev:       ev,
+		Price:    price,
+		Want:     want,
+		OK:       ok,
+		Cost:     round2(price * float64(ok)),
+		Duration: int(now.Sub(start).Round(time.Second).Seconds()),
+		Note:     stopReason,
+	}
+	w.mu.Lock()
+	w.state.Events = append(w.state.Events, e)
+	if len(w.state.Events) > watchEventMax {
+		w.state.Events = w.state.Events[len(w.state.Events)-watchEventMax:]
+	}
+	w.mu.Unlock()
+	w.persist()
 }
 
 // markBadUID 差码善后：冷却 24h + 从账户移除（幂等，失败不阻塞）。

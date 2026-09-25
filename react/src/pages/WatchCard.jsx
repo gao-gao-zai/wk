@@ -6,6 +6,7 @@ import {
 import { EyeOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 
 import ProjectPickerModal from './ProjectPickerModal';
+import WatchHistoryPanel from './WatchHistoryPanel';
 
 const { Text } = Typography;
 
@@ -253,6 +254,7 @@ export default function WatchCard({ api, h5Ready }) {
   const enrolled = watch?.enrolled_total ?? 0;
 
   return (
+    <>
     <Card
       title="监控加号（对接码市场值班员）"
       size="small"
@@ -423,5 +425,9 @@ export default function WatchCard({ api, h5Ready }) {
         onPick={pickProject}
       />
     </Card>
+
+    {/* 成果面板：同一份数据源（10s 轮询），独立卡片更聚焦"看结果" */}
+    <WatchHistoryPanel watch={watch} />
+    </>
   );
 }

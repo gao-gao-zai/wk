@@ -637,6 +637,48 @@ func TestWatcherCooldownExpires(t *testing.T) {
 	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "冷却到期 + 补货应再次触发")
 }
 
+// TestWatcherEventsRecorded 成果面板数据源：触发事件结构化入账（时间/
+// 项目/码/事件/价格/成功/花费/时长），持久化且今日汇总正确。
+func TestWatcherEventsRecorded(t *testing.T) {
+	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 15*time.Second, func() bool { return len(e.w.Status().Events) >= 1 }, "事件应已入账（含记账）")
+
+	st := e.w.Status()
+	if len(st.Events) == 0 {
+		t.Fatal("事件流水应有 1 条")
+	}
+	ev := st.Events[0] // 倒序：最新在前
+	if ev.UID != "52283-CHEAP" || ev.Sid != "52283" || ev.Price != 0.88 {
+		t.Fatalf("事件字段不对：%+v", ev)
+	}
+	if ev.OK != 1 || ev.Cost != 0.88 {
+		t.Fatalf("成功/花费不对：%+v", ev)
+	}
+	if ev.Time == "" || ev.Duration < 0 || ev.Want != 1 {
+		t.Fatalf("时间/时长/目标不对：%+v", ev)
+	}
+	if !strings.Contains(ev.Ev, "新码") {
+		t.Fatalf("事件类型应为新码：%s", ev.Ev)
+	}
+	// 今日汇总。
+	if st.Today.Triggers != 1 || st.Today.OK != 1 || st.Today.Spent != 0.88 {
+		t.Fatalf("今日汇总不对：%+v", st.Today)
+	}
+	if st.Today.SuccessRate != 100 {
+		t.Fatalf("今日成功率 = %d，want 100", st.Today.SuccessRate)
+	}
+	// 持久化：状态文件里有 events 数组。
+	waitFor(t, 5*time.Second, func() bool {
+		raw, err := readFileStr(filepath.Join(e.tmp, "watcher-state.json"))
+		return err == nil && strings.Contains(raw, `"events"`) && strings.Contains(raw, "52283-CHEAP")
+	}, "事件应持久化到状态文件")
+}
+
 // TestWatcherStateFileShape 状态文件结构（字段名/类型约定：前端与排查依赖）。
 func TestWatcherStateFileShape(t *testing.T) {
 	e := newWatchEnv(t, map[string]string{})
