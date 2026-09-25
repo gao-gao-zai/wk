@@ -19,8 +19,8 @@ import (
 )
 
 // fakeWatchH5 可编程的 fake H5：type=8 返回 uidTable 里的当前值，
-// type=4 记录加码，/time.php 恒通。consume() 模拟真实市场——号码被取走
-// 后可取库存下降（真实 H5 的 zxky 就是这么动的）。
+// type=4 记录加码，type=41 记录移码，/time.php 恒通。consume() 模拟
+// 真实市场——号码被取走后可取库存下降（真实 H5 的 zxky 就是这么动的）。
 type fakeWatchH5 struct {
 	t        *testing.T
 	srv      *httptest.Server
@@ -28,6 +28,7 @@ type fakeWatchH5 struct {
 	mu       chanMut
 	uidTable map[string]string // uid -> "price|stock"
 	added    atomic.Int32
+	removed  atomic.Int32
 }
 
 // chanMut 用 mutex 字段（embedded 值类型，不拷贝使用）。
@@ -80,6 +81,9 @@ func newFakeWatchH5(t *testing.T, hexSID string, table map[string]string) *fakeW
 			case "4":
 				f.added.Add(1)
 				w.Write([]byte(`{"code":1,"data":null,"msg":"添加成功"}`))
+			case "41":
+				f.removed.Add(int32(len(strings.Split(r.URL.Query().Get("uid"), ","))))
+				w.Write([]byte(`{"code":200,"data":null,"msg":"对接码状态:已删除"}`))
 			default:
 				w.Write([]byte(`{"code":-1,"data":null,"msg":"unknown type"}`))
 			}
@@ -499,6 +503,138 @@ func TestWatcherDeadUIDRevives(t *testing.T) {
 	if st := e.w.Status(); st.TriggerTotal != 2 {
 		t.Fatalf("基线重建后不应再触发，实际 %d 次", st.TriggerTotal)
 	}
+}
+
+// TestWatcherMultipleCandidatesQueued 同一轮多个候选（新码 3 个）：
+// 按价格升序逐个派活，都在本轮消化（≤ 单轮上限）；不吞事件——上限
+// 之外的候选留到下轮，基线不同步。
+func TestWatcherMultipleCandidatesQueued(t *testing.T) {
+	e := newWatchEnv(t, map[string]string{
+		"52283-A": "0.50|10",
+		"52283-B": "0.30|10",
+		"52283-C": "0.40|10",
+	})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.w.tick(context.Background(), e.w.cfg)
+	// 单轮上限 3：三个候选全部按价派活（0.30 → 0.40 → 0.50）。
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 3 }, "三个候选都应加号成功")
+	st := e.w.Status()
+	if st.TriggerTotal != 3 {
+		t.Fatalf("应触发 3 次，实际 %d", st.TriggerTotal)
+	}
+	if st.BudgetRemaining != round2(10-0.3-0.4-0.5) {
+		t.Fatalf("额度 = %.2f，want 8.80", st.BudgetRemaining)
+	}
+	// 每次成功都扣市场库存（fake 侧如实模拟）——这里补扣 3 个。
+	e.fh.consume("52283-A", 1)
+	e.fh.consume("52283-B", 1)
+	e.fh.consume("52283-C", 1)
+	// 下轮：观察 = 基线，不再触发。
+	e.w.tick(context.Background(), e.w.cfg)
+	if st := e.w.Status(); st.TriggerTotal != 3 {
+		t.Fatalf("全部消化后不应再触发，实际 %d", st.TriggerTotal)
+	}
+}
+
+// TestWatcherCandidateOverflowKeepsEvent 候选超过单轮上限：本轮只消化
+// 3 个（最便宜的），其余**不吞**——下轮继续触发。
+func TestWatcherCandidateOverflowKeepsEvent(t *testing.T) {
+	e := newWatchEnv(t, map[string]string{
+		"52283-A": "0.10|10",
+		"52283-B": "0.20|10",
+		"52283-C": "0.30|10",
+		"52283-D": "0.40|10",
+		"52283-E": "0.50|10",
+	})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 3 }, "单轮上限 3 个应先消化")
+	// 市场扣库存（前 3 个：A B C）。
+	e.fh.consume("52283-A", 1)
+	e.fh.consume("52283-B", 1)
+	e.fh.consume("52283-C", 1)
+	// 第 4 轮：D、E 的事件还在（基线没同步），继续按价派活。
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 5 }, "剩余候选下轮应继续消化")
+	st := e.w.Status()
+	if st.TriggerTotal != 5 {
+		t.Fatalf("两轮应共触发 5 次，实际 %d", st.TriggerTotal)
+	}
+}
+
+// TestWatcherBadUIDCooldownDiffuse 给出号收不到码（sms 永远空）→
+// 本轮 0 成功 → 不扣额度 + 差码冷却（下轮同码不再触发）+ 从账户移除。
+func TestWatcherBadUIDCooldownDiffuse(t *testing.T) {
+	e := newWatchEnv(t, map[string]string{"52283-BAD": "0.88|23"})
+	// 短信永远收不到（豪猪 getMessage 一直无码）——"给得出号接不到码"。
+	e.fz.msgResp.Store(`{"code":"0","msg":"ok","sms":""}`)
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.w.tick(context.Background(), e.w.cfg)
+	// 触发一次，任务以 0 成功结束（尝试上限收紧为 want×3=4 次下限）。
+	waitFor(t, 30*time.Second, func() bool { return e.w.Status().TriggerTotal >= 1 }, "应触发")
+	waitFor(t, 30*time.Second, func() bool {
+		st := e.w.Status()
+		return !st.Running && st.TriggerTotal >= 1
+	}, "差码任务应已结束（0 成功）")
+	st := e.w.Status()
+	if st.EnrolledTotal != 0 {
+		t.Fatalf("收不到码不应有成功，实际 %d", st.EnrolledTotal)
+	}
+	if st.BudgetRemaining != 10 {
+		t.Fatalf("失败不扣额度，实际 %.2f", st.BudgetRemaining)
+	}
+	// 差码被移出账户。
+	if n := e.fh.removed.Load(); n < 1 {
+		t.Fatalf("差码应从账户移除，实际移除 %d 次", n)
+	}
+	// 下轮：同一差码在冷却中，即使价格/库存仍达标也不再触发。
+	e.w.tick(context.Background(), e.w.cfg)
+	if st := e.w.Status(); st.TriggerTotal != 1 {
+		t.Fatalf("冷却中的差码不应再触发，实际 %d 次", st.TriggerTotal)
+	}
+	// 换个好码出现 → 正常触发（冷却只针对差码，不影响别的）。
+	e.fh.mu.lock()
+	e.fh.uidTable["52283-GOOD"] = "0.50|10"
+	e.fh.mu.unlock()
+	e.fz.msgResp.Store(`{"code":"0","msg":"ok","sms":"【腾讯科技】您的验证码是 123456，5 分钟内有效"}`)
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "好码应正常触发加号")
+}
+
+// TestWatcherCooldownExpires 差码冷却到期自动恢复资格（不是拉黑）。
+func TestWatcherCooldownExpires(t *testing.T) {
+	e := newWatchEnv(t, map[string]string{"52283-BAD": "0.88|23"})
+	e.fz.msgResp.Store(`{"code":"0","msg":"ok","sms":""}`)
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 30*time.Second, func() bool {
+		st := e.w.Status()
+		return !st.Running && st.TriggerTotal >= 1
+	}, "差码第一轮应结束（0 成功）")
+	// 手动把冷却拨回过去（等 24h 不现实）。
+	e.w.mu.Lock()
+	e.w.state.PerUID["52283-BAD"].CooldownUntil = time.Now().Add(-time.Minute).Format(time.RFC3339)
+	e.w.mu.Unlock()
+	// 差码"补货"（上游真增量）→ 冷却已过 → 允许再试（真实语义：可能
+	// 上游换了号源，值得再给一次机会）。
+	e.fh.mu.lock()
+	e.fh.uidTable["52283-BAD"] = "0.88|30"
+	e.fh.mu.unlock()
+	e.fz.msgResp.Store(`{"code":"0","msg":"ok","sms":"【腾讯科技】您的验证码是 123456，5 分钟内有效"}`)
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "冷却到期 + 补货应再次触发")
 }
 
 // TestWatcherStateFileShape 状态文件结构（字段名/类型约定：前端与排查依赖）。

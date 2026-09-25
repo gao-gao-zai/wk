@@ -62,6 +62,25 @@ type WatchConfig struct {
 const (
 	watchIntervalMin = 60
 	watchIntervalMax = 3600
+
+	// watchMaxPerRound 单轮最多派活的候选数。市场一次性摆出 20 个新码
+	// 时按价格排队、每轮消化 N 个——值班捡漏的节奏，也留时间观察前几
+	// 个的真实收码质量。
+	watchMaxPerRound = 3
+
+	// watchAttemptCapFactor / watchAttemptCapFloor 值班轮的尝试上限 =
+	// want × factor（下限 floor）。手动跑加号默认 want*12（下限 20）
+	// 是"用户盯着、目标就是这些号"的场景；值班场景不同：差码不值得
+	// 烧满 15 次尝试、占用豪猪并发 40 分钟——钱虽然不扣，但时间是真实
+	// 成本，账户并发额度（500）也一直被占。收紧到 want×3（下限 4）：
+	// 收不到码就尽快结束本轮、给码记差评。
+	watchAttemptCapFactor = 3
+	watchAttemptCapFloor  = 4
+
+	// watchCooldown 差码冷却时长。"给出号收不到码"的码冷却 24h 不再
+	// 派活——不是拉黑（到期自动恢复；若上游真补了好库存仍能触发
+	// 补货事件再次被用），但同一差码不会每轮浪费一遍额度。
+	watchCooldown = 24 * time.Hour
 )
 
 func (c *WatchConfig) interval() time.Duration {
@@ -158,6 +177,12 @@ type watchUIDState struct {
 	LastPrice  float64 `json:"last_price"`
 	Consumed   int     `json:"consumed"` // 我们经它成功加掉的号数（累计）
 	Joined     bool    `json:"joined"`   // 是否已加入过豪猪账户
+	// CooldownUntil 差码冷却截止（RFC3339）。给出号却收不到码（连续
+	// watchFailStreakThreshold 次尝试全失败）→ 冷却 watchCooldown：
+	// 期间该码不再触发（市场拉表照常、基线照常同步，只是不派活）。
+	// 冷却是"临时差评"不是"永久拉黑"：到期自动恢复资格，若它真补了
+	// 优质库存（触发"补货"事件）能再次被用。
+	CooldownUntil string `json:"cooldown_until,omitempty"`
 }
 
 // watcherState 持久化的运行时状态。
@@ -533,6 +558,7 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 		}
 		fetched = append(fetched, fetchedTable{p, items})
 		snap := w.stateSnapshot()
+		now := time.Now()
 		for _, it := range items {
 			// 价格/库存门槛：超出区间的码不触发。
 			if it.Price > p.MaxPrice || it.Stock < p.MinStock {
@@ -541,6 +567,10 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 			st := snap.PerUID[it.UID]
 			if st == nil {
 				candidates = append(candidates, candidate{p, it.UID, it.Price, fmt.Sprintf("新码 ¥%.2f", it.Price), it.Stock})
+				continue
+			}
+			// 差码冷却中：跳过派活（基线照常同步，观察不中断）。
+			if cd := st.cooldownLeft(now); cd > 0 {
 				continue
 			}
 			if st.KnownStock < 0 {
@@ -566,54 +596,102 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 			// 由 syncSnapshot 更新基线。
 		}
 	}
-	syncAll := func() {
+	// 基线同步：skip 集合里的码**跳过**（保留旧基线，事件不吞）——
+	// 多候选择优派活时，没派到的候选下轮还要重新判定。
+	syncAll := func(skip map[string]bool) {
 		for _, f := range fetched {
-			w.syncSnapshot(f.proj, f.items)
+			w.syncSnapshot(f.proj, f.items, skip)
 		}
 	}
 	if len(candidates) == 0 {
-		syncAll() // 无事件：观测值正常入账
+		syncAll(nil) // 无事件：观测值正常入账
 		w.clearTransientPause()
 		return
 	}
 
-	// 多候选取价格最低的一个（跨项目比价）。
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].price < candidates[j].price })
-	c := candidates[0]
-
-	// 额度判定。不足时：暂停派活，基线不同步（充值后事件仍成立）。
-	snap := w.stateSnapshot()
-	cost := round2(c.price * float64(cfg.want()))
-	if snap.BudgetRemaining < cost {
-		w.setPaused(fmt.Sprintf("额度耗尽（剩 ¥%.2f，本次需 ¥%.2f：最低可用码 %s ¥%.2f）——充值后自动恢复",
-			snap.BudgetRemaining, cost, c.uid, c.price))
-		return
+	// 多候选：按价格升序逐个处理（跨项目比价）。同一轮最多派
+	// watchMaxPerRound 个活（防"一次性 20 个新码"把额度瞬间烧穿——
+	// 用户语义是"值班捡漏"，不是"扫货"）。基线同步按"已派活"的码为准：
+	// 还在排队的候选**不同步**（事件不吞，下轮还在），下轮继续按价排队。
+	queued := make(map[string]bool, len(candidates)) // 待派活候选：基线先不同步
+	for _, c := range candidates {
+		queued[c.uid] = true
 	}
-	w.clearTransientPause()
-
-	// 派活前看互斥：手动任务在跑就跳过（不排队——用户正在主动加号，
-	// 值班员插队会打架）。基线同样保留（下轮再判）。
-	if w.en.Status().Running {
-		w.log("有手动加号任务在跑，跳过本轮触发（%s ¥%.2f，下轮再看）", c.uid, c.price)
-		return
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].price != candidates[j].price {
+			return candidates[i].price < candidates[j].price
+		}
+		return candidates[i].uid < candidates[j].uid // 稳定排序：同价按 uid
+	})
+	if len(candidates) > watchMaxPerRound {
+		w.log("本轮候选 %d 个，单轮上限 %d：按价格排队，其余（最贵 %s ¥%.2f）留到下轮",
+			len(candidates), watchMaxPerRound,
+			candidates[watchMaxPerRound].uid, candidates[watchMaxPerRound].price)
 	}
+	dispatched := 0
+	for _, c := range candidates[:min(len(candidates), watchMaxPerRound)] {
+		// 额度判定。不足时：暂停派活，剩余候选基线全部保留（充值后
+		// 事件仍成立）。
+		snap := w.stateSnapshot()
+		cost := round2(c.price * float64(cfg.want()))
+		if snap.BudgetRemaining < cost {
+			w.setPaused(fmt.Sprintf("额度耗尽（剩 ¥%.2f，本次需 ¥%.2f：最低可用码 %s ¥%.2f）——充值后自动恢复",
+				snap.BudgetRemaining, cost, c.uid, c.price))
+			return
+		}
 
-	// 派活：基线同步（OwnPending 归零）→ 执行。
-	syncAll()
-	w.executeTrigger(ctx, cfg, c.proj, c.uid, c.price, c.ev)
+		// 派活前看互斥：手动任务在跑就跳过（不排队——用户正在主动
+		// 加号，值班员插队会打架）。剩余候选基线同样保留。
+		if w.en.Status().Running {
+			w.log("有手动加号任务在跑，跳过本轮触发（%s ¥%.2f，下轮再看）", c.uid, c.price)
+			return
+		}
+
+		// 派活这一个：先把本候选从 skip 集合去掉再同步——它的观察值现在
+		// 正常入账（事件正在被消化，下一轮以本次观察为基线），其余排队
+		// 候选仍然跳过（事件不吞）。顺序很重要：先 delete 后 sync，
+		// 反过来会留下 nil 基线 → 下轮误判"新码"重复触发。
+		delete(queued, c.uid)
+		syncAll(queued)
+		w.executeTrigger(ctx, cfg, c.proj, c.uid, c.price, c.ev)
+		dispatched++
+	}
+	if dispatched > 0 {
+		w.clearTransientPause()
+	}
+}
+
+// cooldownLeft 冷却剩余时长（0 = 不在冷却）。
+func (s *watchUIDState) cooldownLeft(now time.Time) time.Duration {
+	if s == nil || s.CooldownUntil == "" {
+		return 0
+	}
+	t, err := time.Parse(time.RFC3339, s.CooldownUntil)
+	if err != nil {
+		return 0
+	}
+	if d := t.Sub(now); d > 0 {
+		return d
+	}
+	return 0
 }
 
 // syncSnapshot 把一轮拉到的码表同步进 per_uid 基线。
 // 基线 = 本次观察值。上游真回升时观察值上升（下轮触发补货）；自身
 // 消耗让观察值下降或不变（天然不误报）。
-func (w *UIDWatcher) syncSnapshot(p WatchProject, items []haozhumah5.UIDItem) {
+// skip：本轮还在排队的候选（事件未消化），保留旧基线不吞事件。
+func (w *UIDWatcher) syncSnapshot(p WatchProject, items []haozhumah5.UIDItem, skip map[string]bool) {
 	seen := map[string]bool{}
 	w.mu.Lock()
 	if w.state.PerUID == nil {
 		w.state.PerUID = map[string]*watchUIDState{}
 	}
 	for _, it := range items {
-		seen[it.UID] = true
+		seen[it.UID] = true // skip 的码也标记"还在列表"（不标记会被
+		// 误判成消失 → dead → 下轮"重新上架"重复触发）
+		if skip != nil && skip[it.UID] {
+			continue // 排队中的候选：保留旧基线（事件未消化）
+		}
 		st := w.state.PerUID[it.UID]
 		if st == nil {
 			w.state.PerUID[it.UID] = &watchUIDState{KnownStock: it.Stock, LastPrice: it.Price}
@@ -677,10 +755,19 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	}()
 
 	// 3) 跑任务。AutoRunWith 报"已在进行中"（竞态：手动任务刚启动）时放弃本轮。
+	// 尝试上限收紧为 want×watchAttemptCapFactor（下限 floor）：值班场景
+	// 不值得为一个码烧满默认的 15-20 次尝试（真实踩过：¥0.18 差码
+	// 连烧 15 个号、占用豪猪并发 ~40 分钟，虽然失败不扣钱，但时间和
+	// 并发额度是真实成本）。
+	maxAttempts := want * watchAttemptCapFactor
+	if maxAttempts < watchAttemptCapFloor {
+		maxAttempts = watchAttemptCapFloor
+	}
 	err := w.en.AutoRunWith(AutoRunOptions{
-		Want:    want,
-		Workers: cfg.workers(),
-		Groups:  cfg.Groups,
+		Want:        want,
+		Workers:     cfg.workers(),
+		Groups:      cfg.Groups,
+		MaxAttempts: maxAttempts,
 	})
 	if err != nil {
 		w.log("启动加号失败：%v（本轮放弃）", err)
@@ -709,6 +796,33 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	}
 	st := w.en.Status()
 	w.charge(uid, price, st.OK, st.StopReason)
+
+	// 差码处理：一轮下来 0 成功（典型 = 给出号收不到码）→ 冷却 +
+	// 从豪猪账户移除。冷却不是拉黑（24h 后自动恢复，真补了好库存仍能
+	// 触发补货事件再次被用），但不会每轮在同一个差码上浪费额度和时间。
+	if st.OK == 0 {
+		w.markBadUID(ctx, uid, st.StopReason)
+	}
+}
+
+// markBadUID 差码善后：冷却 24h + 从账户移除（幂等，失败不阻塞）。
+func (w *UIDWatcher) markBadUID(ctx context.Context, uid, stopReason string) {
+	until := time.Now().Add(watchCooldown).Format(time.RFC3339)
+	w.mu.Lock()
+	if st := w.state.PerUID[uid]; st != nil {
+		st.CooldownUntil = until
+	}
+	w.mu.Unlock()
+	w.persist()
+	w.log("差码冷却：%s 24 小时内不再派活（%s）", uid, stopReason)
+	// 从账户移除：差码留在账户里只会污染号池（对接码列表/轮换池会
+	// 把它当可用码）。type=41 幂等，失败也不阻塞（下轮触发路径里
+	// AddUID 会重新加回来，冷却标记仍在）。
+	if err := w.h5.RemoveUIDs(ctx, []string{uid}); err != nil {
+		w.log("从账户移除 %s 失败（不影响冷却）：%v", uid, err)
+	} else {
+		w.log("已从账户移除差码 %s", uid)
+	}
 }
 
 // charge 记账：成功数 × 触发时快照价，从额度扣；更新 per_uid 消耗。
