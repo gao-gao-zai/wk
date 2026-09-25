@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Alert, Button, Card, Empty, InputNumber, Popconfirm, Space, Switch,
-  Table, Tag, Typography, message,
+  Alert, Button, Card, Empty, InputNumber, Popconfirm, Select, Space, Switch,
+  Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import { EyeOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 
@@ -63,6 +63,9 @@ export default function WatchCard({ api, h5Ready }) {
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   // 草稿项目列表（编辑中；保存时整体 PUT）。
   const [draftProjects, setDraftProjects] = useState(null);
+  // 分组选项（与手动加号卡片同一接口；加载失败保持禁用+占位）。
+  const [groupOptions, setGroupOptions] = useState(null);
+  const [groupsFailed, setGroupsFailed] = useState(false);
   const timerRef = useRef(null);
 
   const load = async () => {
@@ -79,6 +82,18 @@ export default function WatchCard({ api, h5Ready }) {
     load();
     timerRef.current = setInterval(load, WATCH_POLL_MS);
     return () => clearInterval(timerRef.current);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 分组选项：进入时拉一次（值班加的号登记进哪个分组）。
+  useEffect(() => {
+    let alive = true;
+    api('/admin/groups')
+      .then(body => {
+        if (!alive) return;
+        setGroupOptions((body.groups || []).map(g => g.name));
+      })
+      .catch(() => alive && setGroupsFailed(true));
+    return () => { alive = false; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 草稿与服务器同步：打开编辑时（watch 变化且草稿未动）刷新。
@@ -146,15 +161,19 @@ export default function WatchCard({ api, h5Ready }) {
       message.warning('先添加至少一个监控项目再开启');
       return;
     }
-    await save({
-      enabled: on,
-      interval_seconds: watch?.interval_seconds || 0,
-      want_per_trigger: watch?.want_per_trigger || 1,
-      workers: watch?.workers || 1,
-      groups: watch?.groups || [],
-      projects,
-    });
+    await saveParam({ enabled: on });
   };
+
+  // saveParam 用当前配置 + 覆盖项整体保存（参数区控件共用）。
+  const saveParam = (patch) => save({
+    enabled: watch?.enabled || false,
+    interval_seconds: watch?.interval_seconds || 0,
+    want_per_trigger: watch?.want_per_trigger || 1,
+    workers: watch?.workers || 1,
+    groups: watch?.groups || [],
+    projects,
+    ...patch,
+  });
 
   const saveProjects = async () => {
     // 客户端先校验一遍（后端还会再验）：给用户即时反馈。
@@ -359,7 +378,7 @@ export default function WatchCard({ api, h5Ready }) {
         </div>
 
         {/* 触发参数 */}
-        <Space wrap size={16}>
+        <Space wrap size={16} align="end">
           <div>
             <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
               每次触发加号数（1-10，改完回车/点别处生效）
@@ -370,14 +389,7 @@ export default function WatchCard({ api, h5Ready }) {
               value={watch?.want_per_trigger || 1}
               validate={v => v >= 1 && v <= 10}
               formatMessage={() => '每次触发加号数需在 1-10 之间'}
-              onCommit={v => save({
-                enabled: watch?.enabled || false,
-                interval_seconds: watch?.interval_seconds || 0,
-                want_per_trigger: v,
-                workers: watch?.workers || 1,
-                groups: watch?.groups || [],
-                projects,
-              })}
+              onCommit={v => saveParam({ want_per_trigger: v })}
               style={{ width: 120 }}
             />
           </div>
@@ -391,15 +403,26 @@ export default function WatchCard({ api, h5Ready }) {
               value={watch?.interval_seconds || 0}
               validate={v => v === 0 || (v >= 60 && v <= 3600)}
               formatMessage={() => '拉取间隔需 60-3600 秒（0 = 默认 300）'}
-              onCommit={v => save({
-                enabled: watch?.enabled || false,
-                interval_seconds: v,
-                want_per_trigger: watch?.want_per_trigger || 1,
-                workers: watch?.workers || 1,
-                groups: watch?.groups || [],
-                projects,
-              })}
+              onCommit={v => saveParam({ interval_seconds: v })}
               style={{ width: 120 }}
+            />
+          </div>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
+              <Tooltip title="值班加的号登记进这些分组（可多选）。分组密钥只能用对应分组里的账号；空 = default。">
+                <span style={{ borderBottom: '1px dashed #bfbfbf' }}>加号进分组</span>
+              </Tooltip>
+            </Text>
+            <Select
+              mode="multiple"
+              value={watch?.groups?.length ? watch.groups : ['default']}
+              onChange={v => saveParam({ groups: v.length ? v : ['default'] })}
+              style={{ minWidth: 200 }}
+              placeholder="default"
+              loading={!groupOptions && !groupsFailed}
+              status={groupsFailed ? 'warning' : undefined}
+              options={(groupOptions || []).map(g => ({ value: g, label: g }))}
+              notFoundContent={groupsFailed ? '分组服务不可用，将保存 default' : '暂无分组'}
             />
           </div>
         </Space>
