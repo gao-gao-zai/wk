@@ -84,6 +84,7 @@ export default function WatchCard({ api, h5Ready }) {
   const paused = !!watch?.paused_reason;
   const running = !!watch?.running;
   const enabled = !!watch?.enabled;
+  const hasProjects = (watch?.projects || []).length > 0;
 
   const statusTag = !enabled
     ? <Tag>未启用</Tag>
@@ -277,6 +278,20 @@ export default function WatchCard({ api, h5Ready }) {
           showIcon
           message={watch.paused_reason}
           style={{ marginBottom: 12 }}
+        />
+      )}
+      {!enabled && hasProjects && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="项目已配好但总开关未开"
+          description={(
+            <span>
+              打开右上角「开」才会开始定期拉取对接码市场并自动加号。项目行里的小开关只控制
+              单个项目，不会启动值班。
+            </span>
+          )}
         />
       )}
       {watchError && (

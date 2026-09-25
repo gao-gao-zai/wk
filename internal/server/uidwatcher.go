@@ -365,9 +365,17 @@ func (w *UIDWatcher) Run(ctx context.Context) {
 		// 启动立刻跑第一轮（用户开了开关想立刻看到状态，不想等 5 分钟）。
 		w.tick(ctx, cfg)
 	}
+	// wasActive 上一配置态是否在值班。只在**状态翻转**时记日志：
+	// 关着的时候每次保存项目设置（改价/库存/加项目）都会触发 reload，
+	// 逐条记"监控已停止"是纯噪音。
+	wasActive := cfg.Enabled && len(cfg.Projects) > 0
 	for {
 		w.mu.Lock()
-		w.lastNextTick = time.Now().Add(interval)
+		if wasActive {
+			w.lastNextTick = time.Now().Add(interval)
+		} else {
+			w.lastNextTick = time.Time{} // 未在值班：不显示"下次拉取"（误导）
+		}
 		w.mu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -378,11 +386,21 @@ func (w *UIDWatcher) Run(ctx context.Context) {
 			interval = cfg.interval()
 			w.mu.Unlock()
 			ticker.Reset(interval)
-			if !cfg.Enabled || len(cfg.Projects) == 0 {
-				w.log("监控已停止（配置禁用）")
-				continue // 循环常驻：等下次热开启，不退出
+			active := cfg.Enabled && len(cfg.Projects) > 0
+			if !active {
+				if wasActive {
+					w.log("监控已停止（配置禁用）——循环待命，开启总开关即恢复")
+					wasActive = false
+				}
+				continue
 			}
-			w.log("配置已更新：间隔 %s，%d 个项目", interval, len(cfg.Projects))
+			if !wasActive {
+				w.log("监控启动：%d 个项目，间隔 %s，额度余 ¥%.2f",
+					len(cfg.Projects), interval, w.stateSnapshot().BudgetRemaining)
+				wasActive = true
+			} else {
+				w.log("配置已更新：间隔 %s，%d 个项目", interval, len(cfg.Projects))
+			}
 			w.tick(ctx, cfg)
 		case <-ticker.C:
 			if cfg.Enabled && len(cfg.Projects) > 0 {
