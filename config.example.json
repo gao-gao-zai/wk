@@ -96,10 +96,14 @@
       "sticky_minutes": 30
     },
     "haozhuma": {
+      "provider": "ecode",
+      "ecode_base": "https://api.eomsg.com/zc/data.php",
+      "ecode_card_type": "全部",
+      "ecode_province": "",
       "user": "",
       "pass": "",
-      "token": "",
-      "sid": ""
+      "token": "09c86fcf35c54c899487e3d98291f85c",
+      "sid": "腾讯科技"
     }
   },
   "reqproxy": {
