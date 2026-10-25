@@ -144,7 +144,35 @@ type Config struct {
 		// Haozhuma 豪猪接码平台（haozhuma.com），用于自动加号：取号 →
 		// 走本服务的短信直登链 → 收码 → 落盘账号。
 		Haozhuma struct {
+			// Provider 接码平台："haozhuma"（默认/空）= 豪猪 JSON API；
+			// "ecode" = E码云系纯文本 API（eomsg.com / uomsg.com 同模板）。
+			// 豪猪挂了/维护时切到 ecode 即可，sid 字段语义变为短信关键词
+			// （keyWord，如"腾讯科技"），uid/author/isp 忽略。
+			Provider string `json:"provider"`
+			// EcodeBase E码云系 API 基址。空 = https://api.eomsg.com/zc/data.php；
+			// D1 用 https://api.uomsg.com/zc/data.php。仅 provider=ecode。
+			EcodeBase string `json:"ecode_base"`
+			// EcodeCardType 取号卡类型：实卡/虚卡/全部（空=全部）。仅 ecode。
+			EcodeCardType string `json:"ecode_card_type"`
+			// EcodeProvince 取号归属地省份（空=不限）。仅 ecode。
+			EcodeProvince string `json:"ecode_province"`
+			// Fallback 双平台共存兜底（2026-10）：豪猪取号失败时自动切
+			// E码云再试一次。填 E码云 API Token 即启用；空 = 关闭。
+			// 豪猪恢复后无需改配置——正常时豪猪优先，兜底只在失败触发。
+			Fallback string `json:"fallback"`
+			// FallbackBase 兜底平台基址。空 = E码云；
+			// D1 用 https://api.uomsg.com/zc/data.php。
+			FallbackBase string `json:"fallback_base"`
+			// FallbackCardType 兜底取号卡类型（实卡/虚卡/全部，空=全部）。
+			FallbackCardType string `json:"fallback_card_type"`
+			// FallbackProvince 兜底取号归属地（空=不限）。
+			FallbackProvince string `json:"fallback_province"`
+			// Mode 双平台取号模式（前端热切换，运行时也热改）：空/auto =
+			// 豪猪优先失败切兜底；haozhuma = 仅豪猪；ecode = 仅兜底平台；
+			// both = 双平台交替并行。启动时读入，之后 WebUI 改。
+			Mode string `json:"mode"`
 			// User / Pass 豪猪 API 账号密码（login 换 token 用）。
+			// ecode 模式无 API 登录，token 网页版创建，这里可留空。
 			User string `json:"user"`
 			Pass string `json:"pass"`
 			// Token 已有 token 时直接用，跳过 login。

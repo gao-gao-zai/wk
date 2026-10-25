@@ -19,11 +19,54 @@ import (
 //
 // 接口全部是 GET + query。code 字段："0"/"200" 成功；"-1" 且 msg 含
 // "等待" 表示短信还没到（轮询用）；其它为失败。
+//
+// Provider "ecode"（2026-10 新增）：E码云/D1系（eomsg.com / uomsg.com，
+// 同一模板）。API 形态完全不同——纯文本响应、keyWord 取号、无 token
+// 换取接口（token 在网页版个人中心手动创建）。差异要点：
+//   - 基址 https://api.eomsg.com/zc/data.php，参数 code=<动作>&token=...
+//   - getPhone: keyWord（对应豪猪 sid 的语义位置）+ 可选 phone/province/cardType
+//   - getMsg:   phone + keyWord；"尚未收到" 表示等待（对应豪猪 code=-1 等待）
+//   - 失败统一 "ERROR:xxx" 纯文本前缀
+//   - release/block 平台已自动化（指定号除外），调用视为 no-op
+//   - token 由网页版创建后长期有效，Relogin 无操作（保留账密仅为兼容）
 type Client struct {
 	Base    string
 	Token   string
 	Timeout time.Duration
 	HTTP    *http.Client
+
+	// Provider 接码平台选择。空 / "haozhuma" = 豪猪 JSON API；
+	// "ecode" = E码云/D1 系纯文本 API（Base 应指向各自 data.php）。
+	Provider string
+
+	// CardType E码云取号卡类型：实卡/虚卡/全部（空 = 全部）。仅 ecode。
+	CardType string
+
+	// Province E码云取号归属地（空 = 不限）。仅 ecode。
+	Province string
+
+	// Fallback 兜底接码客户端（2026-10 双平台共存）：主客户端（豪猪）
+	// GetPhone 失败时自动切到这里（E码云）；GetMessage 按号码来源路由。
+	// 取号成功后号码记入 phoneSource；收码时先查来源，路由到对应平台。
+	// Release/Blacklist：豪猪侧照常，ecode 侧 no-op（平台自动）。
+	// 配置：sms.haozhuma.fallback_*（见 config.go）。
+	Fallback *Client
+
+	// Mode 平台选择模式（前端「自动加号」页热切换/任务级覆盖）：
+	//   ""/"auto"      = 豪猪优先，失败自动切 Fallback（默认，兼容旧行为）
+	//   "haozhuma"     = 仅豪猪（摘掉 Fallback）
+	//   "ecode"        = 仅 Fallback 平台
+	//   "both"         = 双平台并行：交替首选，失败换边再试（两池同耗）
+	// 仅当 Fallback != nil 时非 auto 模式才有意义；Fallback 为 nil 时
+	// 一切行为退回主客户端单平台。
+	Mode string
+
+	// altPrefersBoth both 模式轮替游标：true = 本次先试 Fallback 侧。
+	altPreferAlt bool
+
+	// phoneSource 号码来源记账（fallback 路由用）：
+	// phone -> "ecode"（取号走的是兜底平台）。
+	phoneSource map[string]string
 
 	// user/pass 留着，token 失效时 Relogin 用。
 	mu   sync.Mutex
@@ -190,6 +233,80 @@ func NewWithCredentials(token, user, password string) *Client {
 	return c
 }
 
+// NewEcode 建 E码云系客户端（eomsg.com / uomsg.com 同模板）。
+// token 在网页版 个人中心 → API对接中心 创建；E码云没有 API 登录接口，
+// user/pass 仅为将来兼容保留（Relogin 直接成功——token 本就长期有效）。
+func NewEcode(base, token string) *Client {
+	if base == "" {
+		base = "https://api.eomsg.com/zc/data.php"
+	}
+	return &Client{
+		Base:     base,
+		Provider: "ecode",
+		Token:    token,
+		Timeout:  15 * time.Second,
+		HTTP:     newHTTPClient(),
+	}
+}
+
+// ecodeGet 发一次 E码云请求（纯文本响应）。
+// 返回 body 原文；HTTP 非 200 或 "ERROR:" 前缀时包成 APIError。
+func (c *Client) ecodeGet(ctx context.Context, params url.Values) (string, error) {
+	u, err := url.Parse(c.Base)
+	if err != nil {
+		return "", err
+	}
+	q := u.Query()
+	for k, vs := range params {
+		for _, v := range vs {
+			if strings.TrimSpace(v) == "" {
+				continue
+			}
+			q.Add(k, v)
+		}
+	}
+	u.RawQuery = q.Encode()
+
+	ctx2, cancel := context.WithTimeout(ctx, c.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx2, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "text/plain, */*")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		// 同豪猪 call：不能让 *url.Error 把含 token 的完整 URL 带进日志。
+		return "", fmt.Errorf("网络错误: api=%s: %w", params.Get("code"), redactNetErr(err))
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	text := strings.TrimSpace(string(body))
+	// E码云 token 失效实测同样回 HTTP 403/401（无 JSON）。
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return "", &APIError{API: params.Get("code"), Code: "403",
+			Msg: fmt.Sprintf("HTTP %d（token 失效或账号被拒）", resp.StatusCode)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", &APIError{API: params.Get("code"), Code: fmt.Sprintf("%d", resp.StatusCode),
+			Msg: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(text, 120))}
+	}
+	if strings.HasPrefix(text, "ERROR:") {
+		msg := strings.TrimSpace(strings.TrimPrefix(text, "ERROR:"))
+		return text, &APIError{API: params.Get("code"), Code: "-1", Msg: msg}
+	}
+	return text, nil
+}
+
+// ecodeWaiting E码云的"短信未到"判定：响应含 "[尚未收到]"。
+// 对应豪猪 code=-1 msg=等待短信 的轮询正常态。
+func ecodeWaiting(text string) bool {
+	return strings.Contains(text, "尚未收到")
+}
+
 // Login 用账号密码换取 token。
 func Login(user, password string) (*Client, error) {
 	c := &Client{
@@ -216,7 +333,12 @@ func Login(user, password string) (*Client, error) {
 
 // Relogin 用保存的账号密码重换 token（token 失效时调用）。
 // 没存过凭据（token 直建模式）时返回错误。
+// E码云没有 API 登录接口（token 网页版手动创建、长期有效），直接
+// 视为成功——真正失效时 Summary 会报 403，由用户去网页版重建。
 func (c *Client) Relogin() error {
+	if c.Provider == "ecode" {
+		return nil
+	}
 	c.mu.Lock()
 	user, pass := c.user, c.pass
 	c.mu.Unlock()
@@ -441,6 +563,51 @@ func (c *Client) Balance(ctx context.Context) (float64, error) {
 }
 
 func (c *Client) Summary(ctx context.Context) (Summary, error) {
+	// E码云：leftAmount 纯文本返回余额数字；占用数平台不提供（自动释放，
+	// 无并发额度概念），保持 -1 = 未知。
+	if c.Provider == "ecode" {
+		text, err := c.ecodeGet(ctx, url.Values{
+			"code": {"leftAmount"}, "token": {c.Token},
+		})
+		if err != nil {
+			return Summary{Occupied: -1}, err
+		}
+		f, perr := strconv.ParseFloat(strings.TrimSpace(text), 64)
+		if perr != nil {
+			return Summary{Occupied: -1}, fmt.Errorf("余额字段无法解析: %v", truncate(text, 60))
+		}
+		return Summary{Balance: f, Occupied: -1}, nil
+	}
+	// 双平台共存：豪猪挂了（维护/网络）但兜底可用时，返回兜底平台余额，
+	// 错误信息附带说明——WebUI 概览不至于全红，取号链路也由兜底撑着。
+	fb := c.fallbackClient()
+	if fb != nil && c.mode() == "ecode" {
+		// 仅 E码云模式：只查兜底侧，不碰豪猪（摘掉的意图要尊重）。
+		return fb.Summary(ctx)
+	}
+	s, hzErr := c.summaryHaozhuma(ctx)
+	if hzErr != nil {
+		if fb != nil && c.mode() != "haozhuma" {
+			if fbS, fbErr := fb.Summary(ctx); fbErr == nil {
+				return Summary{
+					Balance:  fbS.Balance,
+					Occupied: -1,
+				}, fmt.Errorf("豪猪不可用（%v），当前由 E码云兜底", hzErr)
+			}
+		}
+		return s, hzErr
+	}
+	// 两边都活着且非"仅豪猪"模式：余额合并展示（豪猪 + E码云），占用取豪猪侧。
+	if fb != nil && c.mode() != "haozhuma" {
+		if fbS, fbErr := fb.Summary(ctx); fbErr == nil {
+			s.Balance += fbS.Balance
+		}
+	}
+	return s, nil
+}
+
+// summaryHaozhuma 豪猪侧原版 getSummary（Summary 的主路径）。
+func (c *Client) summaryHaozhuma(ctx context.Context) (Summary, error) {
 	raw, err := c.call(ctx, "getSummary", url.Values{"token": {c.Token}})
 	if err != nil {
 		return Summary{}, err
@@ -497,9 +664,102 @@ func truncate(s string, n int) string {
 // 取一个码用；某码报「专属码不存在」自动出池（记入 drained，上层负责
 // 从豪猪账户移除），换下一个码继续；池耗尽后退回平台自动分配。
 func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
+	// E码云直连客户端：sid 语义位放 keyWord（短信关键词，如"腾讯科技"）；
+	// 无对接码/author/isp 概念，uid 池与 ISP 参数全部忽略。无号时 ERROR:xxx。
+	if c.Provider == "ecode" {
+		keyWord := strings.TrimSpace(sid)
+		params := url.Values{
+			"code": {"getPhone"}, "token": {c.Token},
+			"keyWord": {keyWord},
+			"cardType": {c.cardTypeOr()},
+			"province": {strings.TrimSpace(c.Province)},
+		}
+		phone, err := c.ecodeGet(ctx, params)
+		if err != nil {
+			return "", err
+		}
+		phone = strings.TrimSpace(phone)
+		if phone == "" {
+			return "", errors.New("取号成功但未返回手机号")
+		}
+		return phone, nil
+	}
+	// —— 双平台模式分发（主客户端 = 豪猪，Fallback = E码云系）——
+	if fb := c.fallbackClient(); fb != nil {
+		switch c.mode() {
+		case "haozhuma":
+			// 仅豪猪：走主链（下方原逻辑），失败不上兜底。
+		case "ecode":
+			// 仅 E码云：直接走兜底客户端，不碰豪猪。
+			phone, err := fb.GetPhone(ctx, sid)
+			if err != nil {
+				return "", err
+			}
+			c.rememberSource(phone, "ecode")
+			return phone, nil
+		case "both":
+			// 双平台并行：交替首选，首选失败换边再试一次。
+			// 两池同耗，取号吞吐翻倍；失败面（一边挂了）自动单边续跑。
+			if c.takePreferAlt() {
+				if phone, err := fb.GetPhone(ctx, sid); err == nil {
+					c.rememberSource(phone, "ecode")
+					return phone, nil
+				}
+				if phone, err := c.getPhoneHaozhuma(ctx, sid); err == nil {
+					return phone, nil
+				} else {
+					return "", fmt.Errorf("双平台取号均失败（E码云先试）: %w", err)
+				}
+			}
+			if phone, err := c.getPhoneHaozhuma(ctx, sid); err == nil {
+				return phone, nil
+			}
+			if phone, err := fb.GetPhone(ctx, sid); err == nil {
+				c.rememberSource(phone, "ecode")
+				return phone, nil
+			} else {
+				return "", fmt.Errorf("双平台取号均失败（豪猪先试）: %w", err)
+			}
+		default:
+			// auto（默认）：豪猪优先，失败切 E码云——原兜底语义。
+			if phone, err := c.getPhoneHaozhuma(ctx, sid); err == nil {
+				return phone, nil
+			} else if fbPhone, fbErr := fb.GetPhone(ctx, sid); fbErr == nil {
+				c.rememberSource(fbPhone, "ecode")
+				return fbPhone, nil
+			} else {
+				return "", fmt.Errorf("豪猪取号失败: %v；兜底(E码云)取号也失败: %v", err, fbErr)
+			}
+		}
+	}
+	return c.getPhoneHaozhuma(ctx, sid)
+}
+
+// mode 当前平台选择模式（并发安全快照）。
+func (c *Client) mode() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if m := strings.TrimSpace(c.Mode); m != "" {
+		return m
+	}
+	return "auto"
+}
+
+// takePreferAlt both 轮替：读并翻转"下次先试哪边"游标。
+func (c *Client) takePreferAlt() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v := c.altPreferAlt
+	c.altPreferAlt = !v
+	return v
+}
+
+// getPhoneHaozhuma 豪猪原版取号（uid 池/ISP 降级/钉死码回退全逻辑）。
+func (c *Client) getPhoneHaozhuma(ctx context.Context, sid string) (string, error) {
 	// 轮换池模式：逐码尝试（每码内部仍按 ISP 降级）。
 	if len(c.uidsSnapshot()) > 0 {
 		var lastErr error
+		var poolErr error // 池模式最终失败（触发兜底判定）
 		for range c.uidsSnapshot() { // 最多试池大小的次数
 			uid := c.nextPoolUID()
 			if uid == "" {
@@ -517,17 +777,21 @@ func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
 			}
 			// 其它错误（没号/网络）不逐码轮——池里的码共享项目侧库存，
 			// 单码没号不代表其它码没号，但为了不放大请求量，先直接返回。
-			return "", err
+			poolErr = err
+			break
 		}
-		// 池试空了或全部专属码失效：退回平台自动分配。
-		phone, err := c.getPhoneRound(ctx, sid, "")
-		if err == nil {
-			return phone, nil
-		}
-		if lastErr != nil {
+		if poolErr == nil && lastErr != nil {
+			// 池试空（全部专属码失效）：退回平台自动分配。
+			phone, err := c.getPhoneRound(ctx, sid, "")
+			if err == nil {
+				return phone, nil
+			}
 			return "", fmt.Errorf("%w（轮换池 %d 个码已试完，已退回平台自动分配）", err, len(c.uidsSnapshot()))
 		}
-		return "", err
+		if poolErr != nil {
+			return "", poolErr
+		}
+		// 池试空且无错误（nextPoolUID 空）：退回平台自动分配，走下方单码模式。
 	}
 
 	// 单码/自动分配模式。
@@ -550,6 +814,42 @@ func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
 	return phone, err
 }
 
+// fallbackClient 返回兜底客户端（无配置返回 nil）。并发安全。
+func (c *Client) fallbackClient() *Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Fallback
+}
+
+// rememberSource 记下号码来源平台（fallback 收码路由用）。
+// 记账上限：超过 256 条（长跑任务累积）直接清空——在途号码必然
+// 是最近取的，老的早已收尾，清掉不影响路由。
+func (c *Client) rememberSource(phone, provider string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phoneSource == nil {
+		c.phoneSource = map[string]string{}
+	}
+	if len(c.phoneSource) >= 256 {
+		c.phoneSource = map[string]string{}
+	}
+	c.phoneSource[phone] = provider
+}
+
+// sourceOf 查号码来源；未记账返回空串（= 主平台语义）。
+func (c *Client) sourceOf(phone string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.phoneSource[phone]
+}
+
+// forgetSource 号码收尾后清掉记账。
+func (c *Client) forgetSource(phone string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.phoneSource, phone)
+}
+
 // uidsSnapshot 池快照（只读）。
 func (c *Client) uidsSnapshot() []string {
 	c.mu.Lock()
@@ -557,6 +857,14 @@ func (c *Client) uidsSnapshot() []string {
 	out := make([]string, len(c.uidPool))
 	copy(out, c.uidPool)
 	return out
+}
+
+// cardTypeOr 返回 E码云 cardType 参数；未配置时给"全部"。
+func (c *Client) cardTypeOr() string {
+	if t := strings.TrimSpace(c.CardType); t != "" {
+		return t
+	}
+	return "全部"
 }
 
 // getPhoneRound 跑一轮取号（按 ISP 优先级逐档降级）。uid 为本次用的
@@ -658,6 +966,33 @@ func redactNetErr(err error) error {
 // GetMessage 查一次短信。返回 sms 原文与 code 状态。
 // 官方 SDK 还会看 yzm 字段（有的项目把码单独放那里），这里两个都取。
 func (c *Client) GetMessage(ctx context.Context, sid, phone string) (string, error) {
+	// 双平台共存：号码来自兜底平台时，收码路由到兜底客户端（keyWord
+	// 语义），不查豪猪。sid 直接透传——兜底端把它当 keyWord 用。
+	if c.sourceOf(phone) == "ecode" {
+		if fb := c.fallbackClient(); fb != nil {
+			return fb.GetMessage(ctx, sid, phone)
+		}
+	}
+	// E码云：phone + keyWord 查短信；"[尚未收到]" 是正常等待态（上层
+	// pollCode 靠 APIError.Waiting() 识别，这里返回原文、空 sms 表示等待）。
+	if c.Provider == "ecode" {
+		text, err := c.ecodeGet(ctx, url.Values{
+			"code": {"getMsg"}, "token": {c.Token},
+			"phone": {phone}, "keyWord": {strings.TrimSpace(sid)},
+		})
+		if err != nil {
+			// 等待态在 ecodeGet 里表现为含 [尚未收到] 的非 ERROR 文本；
+			// 为与豪猪语义对齐，等待时返回空 sms（不报错）。
+			if ecodeWaiting(text) {
+				return "", nil
+			}
+			return "", err
+		}
+		if ecodeWaiting(text) {
+			return "", nil
+		}
+		return text, nil
+	}
 	raw, err := c.call(ctx, "getMessage", url.Values{
 		"token": {c.Token}, "sid": {sid}, "phone": {phone},
 	})
@@ -674,8 +1009,17 @@ func (c *Client) GetMessage(ctx context.Context, sid, phone string) (string, err
 	return sms, nil
 }
 
-// Release 释放号码（cancelRecv）。
+// Release 释放号码（cancelRecv）。E码云为自动释放，no-op。
+// 双平台共存：兜底来源的号码（E码云侧自动归还）不碰豪猪。记账保留
+// （拉黑收尾时才清）——tryOne 的 finish 是 Blacklist→Release 顺序，
+// Release 先来时若无记账，后续 Blacklist 就路由错了。
 func (c *Client) Release(ctx context.Context, sid, phone string) error {
+	if c.Provider == "ecode" {
+		return nil
+	}
+	if c.sourceOf(phone) == "ecode" {
+		return nil
+	}
 	_, err := c.call(ctx, "cancelRecv", url.Values{
 		"token": {c.Token}, "sid": {sid}, "phone": {phone},
 	})
@@ -683,19 +1027,32 @@ func (c *Client) Release(ctx context.Context, sid, phone string) error {
 }
 
 // ReleaseAll 一键释放账户名下所有占用中的号码（cancelAllRecv）。
+// E码云为自动释放，no-op。
 // 只需 token，不需要 sid/phone——用于"额度被旧号占满"时批量归还，
 // 或界面上手动兜底（豪猪后台也有同款按钮）。注意它会释放**所有**
 // 占用号，不区分是谁取的；任务运行中调用会把在途号码一起放掉，
 // 调用方需自行保证没有并发取号。
 func (c *Client) ReleaseAll(ctx context.Context) error {
+	if c.Provider == "ecode" {
+		return nil
+	}
 	_, err := c.call(ctx, "cancelAllRecv", url.Values{
 		"token": {c.Token},
 	})
 	return err
 }
 
-// Blacklist 拉黑号码（收不到码的号）。
+// Blacklist 拉黑号码（收不到码的号）。E码云自动拉黑随机号（指定号不拉），
+// no-op——上层 tryOne 的拉黑+释放收尾在 ecode 下天然幂等。
+// 双平台共存：兜底来源的号码 E码云侧超时自动拉黑，这里只清记账。
 func (c *Client) Blacklist(ctx context.Context, sid, phone string) error {
+	if c.Provider == "ecode" {
+		return nil
+	}
+	if c.sourceOf(phone) == "ecode" {
+		c.forgetSource(phone)
+		return nil
+	}
 	_, err := c.call(ctx, "addBlacklist", url.Values{
 		"token": {c.Token}, "sid": {sid}, "phone": {phone},
 	})

@@ -474,8 +474,12 @@ func main() {
 		Traffic:  trafficTracker,
 		// 豪猪自动加号（可选）：取号→直登→落盘全自动。与手动发码共用代理池；
 		// AutoEnroll 在 NewHandler 内部组装（persist 回调指向 handler）。
-		HaozhumaClient: newHaozhumaClient(cfg),
+		HaozhumaClient: newSMSCodeClient(cfg),
 		HaozhumaSid:    strings.TrimSpace(cfg.SMS.Haozhuma.Sid),
+		HaozhumaEcode:  strings.TrimSpace(cfg.SMS.Haozhuma.Provider),
+		EcodeBase:      strings.TrimSpace(cfg.SMS.Haozhuma.EcodeBase),
+		EcodeCardType:  strings.TrimSpace(cfg.SMS.Haozhuma.EcodeCardType),
+		EcodeProvince:  strings.TrimSpace(cfg.SMS.Haozhuma.EcodeProvince),
 		// 号码账本放在 state.json 同目录（部署时该目录已挂载为卷）。
 		AutoEnrollLedger: autoEnrollLedgerPath(cfg),
 		// SMS 诊断日志同目录（data/ 卷内）：完整手机号+短信原文，本机排障用。
@@ -912,6 +916,21 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 		if len(hz.UIDs) > 0 {
 			c.SetUIDs(hz.UIDs)
 		}
+		// 双平台共存：配置了 fallback token 时挂 E码云兜底客户端。
+		// 豪猪取号失败（维护/没号/网络）自动切兜底，收码按号码来源路由。
+		if fbToken := strings.TrimSpace(hz.Fallback); fbToken != "" {
+			fbBase := strings.TrimSpace(hz.FallbackBase)
+			if fbBase == "" {
+				fbBase = "https://api.eomsg.com/zc/data.php"
+			}
+			fb := haozhuma.NewEcode(fbBase, fbToken)
+			fb.CardType = strings.TrimSpace(hz.FallbackCardType)
+			fb.Province = strings.TrimSpace(hz.FallbackProvince)
+			c.Fallback = fb
+			// 落盘模式（auto/haozhuma/ecode/both）带上；运行时由 WebUI 热改。
+			c.Mode = strings.TrimSpace(hz.Mode)
+			log.Printf("auto-enroll: 兜底接码已挂载（%s，mode=%q，cardType=%q province=%q）——豪猪失败时自动切 E码云", fbBase, c.Mode, fb.CardType, fb.Province)
+		}
 		return c
 	}
 
@@ -934,4 +953,34 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 		return setup(haozhuma.New(token))
 	}
 	return nil
+}
+
+// newSMSCodeClient 按 sms.haozhuma.provider 分发接码客户端：
+// "ecode" → E码云系；空/"haozhuma" → 豪猪。均未配置凭据时返回 nil。
+func newSMSCodeClient(cfg *Config) *haozhuma.Client {
+	if strings.TrimSpace(cfg.SMS.Haozhuma.Provider) == "ecode" {
+		return newEcodeClient(cfg)
+	}
+	return newHaozhumaClient(cfg)
+}
+
+// newEcodeClient 建 E码云系客户端（provider=ecode）。无 token 或未配置
+// keyWord（sid 位）时返回 nil（端点关闭，与 newHaozhumaClient 同语义）。
+func newEcodeClient(cfg *Config) *haozhuma.Client {
+	hz := cfg.SMS.Haozhuma
+	sid := strings.TrimSpace(hz.Sid)
+	token := strings.TrimSpace(hz.Token)
+	if token == "" || sid == "" {
+		return nil
+	}
+	base := strings.TrimSpace(hz.EcodeBase)
+	if base == "" {
+		base = "https://api.eomsg.com/zc/data.php"
+	}
+	c := haozhuma.NewEcode(base, token)
+	c.CardType = strings.TrimSpace(hz.EcodeCardType)
+	c.Province = strings.TrimSpace(hz.EcodeProvince)
+	log.Printf("auto-enroll: ecode provider configured (base=%s keyWord=%q cardType=%q province=%q)",
+		base, sid, c.CardType, c.Province)
+	return c
 }

@@ -492,6 +492,54 @@ func (a *AutoEnroller) UpdateFetchOptions(author, uid string, uids []string, isp
 	hzm.ISP = strings.TrimSpace(isp)
 }
 
+// UpdateProviderMode 热切换双平台取号模式（auto/haozhuma/ecode/both）。
+// 任务运行中允许：mode 只影响下一次 GetPhone 的路由，在途号码按
+// phoneSource 记账正常收码/收尾，不受切换影响。
+func (a *AutoEnroller) UpdateProviderMode(mode string) {
+	a.mu.Lock()
+	hzm := a.hzm
+	a.mu.Unlock()
+	if hzm == nil {
+		return
+	}
+	hzm.Mode = strings.TrimSpace(mode)
+}
+
+// UpdateFallbackClient 热更换兜底（E码云）客户端。运行中拒绝：在途
+// E码云号码的收码要打到同一 token 上（与 ReplaceClient 同语义）。
+func (a *AutoEnroller) UpdateFallbackClient(fb *haozhuma.Client) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	hzm := a.hzm
+	if hzm == nil {
+		return errors.New("主接码客户端未初始化")
+	}
+	if a.running && hzm.Fallback != nil {
+		return ErrBusyAuth
+	}
+	hzm.Fallback = fb
+	return nil
+}
+
+// ProviderMode 当前双平台模式（客户端实时值；无客户端返回 ""）。
+func (a *AutoEnroller) ProviderMode() string {
+	a.mu.Lock()
+	hzm := a.hzm
+	a.mu.Unlock()
+	if hzm == nil {
+		return ""
+	}
+	return hzm.Mode
+}
+
+// FallbackMounted 兜底客户端是否挂载中。
+func (a *AutoEnroller) FallbackMounted() bool {
+	a.mu.Lock()
+	hzm := a.hzm
+	a.mu.Unlock()
+	return hzm != nil && hzm.Fallback != nil
+}
+
 // FetchSnapshot 当前取号参数快照（sid/author/单码/轮换池/isp）。
 // UIDWatcher 派活前快照、收工后恢复用——参数是"用户配置的资产"，
 // 值班轮临时覆盖必须原样还回来。
@@ -522,6 +570,9 @@ type AutoRunOptions struct {
 	MaxAttempts int
 	// Groups 加号成功后新账号登记进这些分组（多归属）。空 = default。
 	Groups []string
+	// ProviderMode 本任务取号平台（临时覆盖，任务结束不回写全局）：
+	// auto/haozhuma/ecode/both。空 = 用客户端当前 Mode。
+	ProviderMode string
 }
 
 // AutoRun 对外入口（保持旧签名）。已在跑时返回错误。
@@ -564,6 +615,13 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	if a.running {
 		a.mu.Unlock()
 		return errors.New("自动加号已在进行中")
+	}
+	// 任务级平台覆盖：显式给出时改客户端 Mode（与全局热切换同槽位——
+	// 单任务部署里两者语义一致；任务结束保留，用户在 UI 上看到的即所得）。
+	if pm := strings.TrimSpace(opts.ProviderMode); pm != "" {
+		if a.hzm != nil {
+			a.hzm.Mode = pm
+		}
 	}
 	// 快照本次启动检查用的阈值（SetLimits 运行中热改只影响后续轮次）。
 	minBalance := a.minBalance

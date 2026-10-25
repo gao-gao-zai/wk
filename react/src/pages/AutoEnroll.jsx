@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Alert, Button, Card, Checkbox, Collapse, Divider, Empty, Input, InputNumber,
-  Popconfirm, Progress, Select, Space, Statistic, Tag, Tooltip, Typography, message,
+  Popconfirm, Progress, Segmented, Select, Space, Statistic, Tag, Tooltip, Typography, message,
 } from 'antd';
 import {
   ApiOutlined, CheckCircleOutlined, LinkOutlined, PauseCircleOutlined,
@@ -76,6 +76,12 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
   // groups 任务新账号登记的分组（多选，默认 default）。
   const [selectedGroups, setSelectedGroups] = useState(['default']);
   const [groupOptions, setGroupOptions] = useState(null);
+  // 任务级取号平台（POST auto-enroll 的 provider 字段）：空 = 跟全局 mode。
+  const [runProvider, setRunProvider] = useState('');
+  // 全局平台模式（POST /admin/config sms.haozhuma.mode 热切换）。
+  const [mode, setMode] = useState('');
+  const [modeSaving, setModeSaving] = useState(false);
+  const fallbackMounted = hz.fallback_mounted ?? false;
 
   // —— 任务状态 ——
   const [status, setStatus] = useState(null);
@@ -193,6 +199,36 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 全局平台模式：config 回显 → state（运行中后端热切换，本地跟随）。
+  useEffect(() => {
+    if (hz.mode !== undefined) setMode(hz.mode || 'auto');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hz.mode]);
+
+  // 切换全局平台模式（热切换，落盘 + 运行时立即生效）。
+  const switchMode = async (next) => {
+    if (!next || next === mode) return;
+    setModeSaving(true);
+    try {
+      await api('/admin/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sms: { haozhuma: { mode: next } } }),
+      });
+      setMode(next);
+      message.success(
+        next === 'auto' ? '已切换：豪猪优先，失败自动切 E码云'
+          : next === 'haozhuma' ? '已切换：仅豪猪'
+          : next === 'ecode' ? '已切换：仅 E码云'
+          : '已切换：双平台并行（豪猪+E码云交替）',
+      );
+    } catch (err) {
+      message.error(err.message);
+    } finally {
+      setModeSaving(false);
+    }
+  };
+
   const start = async () => {
     setStarting(true);
     setError('');
@@ -206,6 +242,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
           poll_count: Number(pollCount) || 0,
           max_attempts: Number(maxAttempts) || 0,
           groups: selectedGroups.length ? selectedGroups : ['default'],
+          provider: runProvider || mode || 'auto',
         }),
       });
       // 提示用后端回的**生效值**：填了超范围的值时，这里显示的就是真实生效的那个。
@@ -377,6 +414,8 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
                 onSaveHaozhuma={onSaveHaozhuma}
                 onSaved={() => { loadSummary(); }}
                 onH5Saved={() => { refreshConfig?.(); }}
+                fallbackMounted={fallbackMounted}
+                onFallbackChanged={() => { refreshConfig?.(); loadSummary(); }}
               />
             ),
           }]}
@@ -388,10 +427,55 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
         title="启动任务"
         extra={<Tag color={running ? 'processing' : 'default'}>{running ? '运行中' : '空闲'}</Tag>}
       >
+        {/* 双平台取号模式：热切换（下一次取号立即按新模式路由）。 */}
+        <div style={{ marginBottom: 16 }}>
+          <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
+            <Tooltip title="豪猪与 E码云双平台共存。自动=豪猪优先、失败秒切 E码云；仅豪猪/仅E码云=锁定单平台；并行=两平台交替取号，失败自动换边。切换立即生效（运行中任务的下一次取号也按新值）。">
+              <span style={{ borderBottom: '1px dashed #bfbfbf' }}>取号平台</span>
+            </Tooltip>
+            {fallbackMounted ? <Tag color="green" style={{ marginLeft: 8 }}>双平台已挂载</Tag> : <Tag style={{ marginLeft: 8 }}>单平台</Tag>}
+          </Text>
+          <Segmented
+            value={mode || 'auto'}
+            onChange={v => switchMode(v)}
+            loading={modeSaving}
+            options={[
+              { label: '自动（豪猪优先）', value: 'auto' },
+              { label: '仅豪猪', value: 'haozhuma' },
+              { label: '仅E码云', value: 'ecode' },
+              { label: '双平台并行', value: 'both' },
+            ]}
+          />
+          <Text type="secondary" style={{ display: 'block', marginTop: 4, fontSize: 12 }}>
+            {mode === 'both' && '并行模式：豪猪/E码云交替取号，吞吐翻倍；单边挂掉自动全走另一边。'}
+            {mode === 'ecode' && '仅 E码云：不碰豪猪（余额为 E码云余额）。'}
+            {mode === 'haozhuma' && '仅豪猪：失败不上 E码云兜底。'}
+            {(!mode || mode === 'auto') && '豪猪优先；失败（维护/没号/网络）自动切 E码云。'}
+          </Text>
+        </div>
         <Space wrap size={16} align="end">
           <div>
             <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>目标账号数</Text>
             <InputNumber min={1} max={50} value={count} onChange={setCount} disabled={running} style={{ width: 130 }} />
+          </div>
+          <div>
+            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
+              <Tooltip title="本次任务用哪个平台取号（只影响这一批，不改上面的全局模式）。">
+                <span style={{ borderBottom: '1px dashed #bfbfbf' }}>本次任务平台</span>
+              </Tooltip>
+            </Text>
+            <Select
+              value={runProvider}
+              onChange={setRunProvider}
+              disabled={running}
+              style={{ width: 150 }}
+              options={[
+                { value: '', label: '跟随全局模式' },
+                { value: 'haozhuma', label: '仅豪猪' },
+                { value: 'ecode', label: '仅E码云' },
+                { value: 'both', label: '双平台并行' },
+              ]}
+            />
           </div>
           <div>
             <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>并发数</Text>
@@ -602,7 +686,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
  *   - H5 会话（P1 增强）：粘贴 PHPSESSID 解锁项目搜索/对接码选择。
  *     后端验证通过才落盘；失效（410）提示重贴。
  */
-function AuthPanel({ api, auth, h5, running, onSaveHaozhuma, onSaved, onH5Saved }) {
+function AuthPanel({ api, auth, h5, running, onSaveHaozhuma, onSaved, onH5Saved, fallbackMounted, onFallbackChanged }) {
   const [mode, setMode] = useState(auth.mode === 'token' ? 'token' : 'userpass');
   const [userDraft, setUserDraft] = useState('');
   const [passDraft, setPassDraft] = useState('');
@@ -615,6 +699,29 @@ function AuthPanel({ api, auth, h5, running, onSaveHaozhuma, onSaved, onH5Saved 
 
   const [h5Draft, setH5Draft] = useState('');
   const [h5Saving, setH5Saving] = useState(false);
+
+  // E码云兜底 token（fallback）：非空→验证挂载；空提交→摘掉。
+  const [fbDraft, setFbDraft] = useState('');
+  const [fbSaving, setFbSaving] = useState(false);
+
+  const saveFallback = async () => {
+    const token = fbDraft.trim();
+    setFbSaving(true);
+    try {
+      await api('/admin/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sms: { haozhuma: { fallback: token } } }),
+      });
+      message.success(token ? 'E码云兜底已验证并挂载（豪猪失败自动切）' : 'E码云兜底已摘除');
+      setFbDraft('');
+      onFallbackChanged?.();
+    } catch (err) {
+      message.error(err.message);
+    } finally {
+      setFbSaving(false);
+    }
+  };
 
   const h5Has = h5?.has === true;
   const h5Expired = h5?.expired === true;
@@ -823,6 +930,29 @@ function AuthPanel({ api, auth, h5, running, onSaveHaozhuma, onSaved, onH5Saved 
       <Text type="secondary" style={{ fontSize: 12 }}>
         一次性操作：豪猪网页版登录后按 F12 → 应用/存储 → Cookie → 复制 PHPSESSID 的值粘到这里。
         后端每 7 天自动保活（官方有效期 10 天滑动）。该会话只用于选择器数据源，与接码任务链路无关。
+      </Text>
+
+      <Divider style={{ margin: '4px 0' }} plain />
+      <Space wrap size={12} align="center">
+        <Text type="secondary">E码云兜底（双平台）</Text>
+        {fallbackMounted
+          ? <Tag color="green">已挂载</Tag>
+          : <Tag>未配置</Tag>}
+        <Input.Password
+          value={fbDraft}
+          onChange={e => setFbDraft(e.target.value)}
+          placeholder={fallbackMounted ? '粘贴新 token 覆盖；清空输入保存 = 摘除兜底' : 'E码云 API Token（eomsg.com 后台「API对接中心」创建）'}
+          style={{ width: 340 }}
+          disabled={fbSaving}
+          visibilityToggle={false}
+        />
+        <Button loading={fbSaving} onClick={saveFallback}>
+          {fallbackMounted && !fbDraft.trim() ? '摘除兜底' : '验证并挂载'}
+        </Button>
+      </Space>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        填入 E码云 token 后豪猪取号失败（维护/没号）自动切 E码云，收码按号码来源自动路由，切换按钮在「启动任务」卡片顶部。
+        D1（uomsg.com）同样支持：在高级设置里把 fallback_base 改成 https://api.uomsg.com/zc/data.php。
       </Text>
     </Space>
   );
