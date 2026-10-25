@@ -30,6 +30,8 @@ const DEFAULT_POLL_COUNT = 18;
 const pollSeconds = n => Math.round((Number(n) || 0) * 5);
 // 豪猪项目单价（估）：余额换算"约可成功 N 个"用。52283 腾讯项目 2.2 元/次。
 const PRICE_PER_SUCCESS = 2.2;
+// E码云单价：0.45 元/条（估）。
+const ECODE_PRICE_PER_SUCCESS = 0.45;
 
 // logTone 给日志行着色：扫一眼就能看出这轮顺不顺。
 function logTone(text) {
@@ -339,8 +341,10 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
   const occupied = summary?.occupied ?? -1; // -1 = 平台未返回
   const heldLocal = summary?.held_local ?? holding;
   const connected = !!summary && auth.mode !== 'none';
+  // provider 感知文案：E码云主用时账户/计费提示说 E码云的话。
+  const isEcode = hz.provider === 'ecode';
   const approxCount = balance != null && balance > 0
-    ? Math.floor(balance / (Number(autoenrollCfg.min_balance) > 0 ? Number(autoenrollCfg.min_balance) : PRICE_PER_SUCCESS))
+    ? Math.floor(balance / (hz.provider === 'ecode' ? ECODE_PRICE_PER_SUCCESS : PRICE_PER_SUCCESS))
     : null;
 
   // 账户 Tag：连接状态一眼可读。未配置/未拉到概览时灰色，凭据在但查询
@@ -357,20 +361,24 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
         type="info"
         showIcon
         message="按成功计费，失败不扣费"
-        description="豪猪只在收到短信验证码时扣费；取号后收不到码不扣费。每个取到的号（成功或失败）都会加入黑名单，不会被重复取到。"
+        description={isEcode
+          ? "E码云只在收到短信验证码时扣费（0.45 元/条）；取号后收不到码不扣费，号自动释放并拉黑，不会被重复取到。"
+          : "豪猪只在收到短信验证码时扣费；取号后收不到码不扣费。每个取到的号（成功或失败）都会加入黑名单，不会被重复取到。"}
       />
 
       {error && <Alert type="error" showIcon message="操作失败" description={error} />}
 
-      {/* —— 卡片① 豪猪账户 —— */}
+      {/* —— 卡片① 接码平台账户 —— */}
       <Card
-        title="豪猪账户"
+        title={isEcode ? 'E码云账户' : '豪猪账户'}
         extra={<Space>{accountTag}<Button size="small" icon={<ReloadOutlined />} loading={summaryLoading} onClick={loadSummary} /></Space>}
       >
         {auth.mode === 'none' && !connected ? (
           <Paragraph type="secondary" style={{ marginBottom: 8 }}>
-            自动加号需要豪猪接码平台账户。展开下方「鉴权与增强设置」填入 API 账号密码即可开始使用。
-            还没有账户？<a href="https://www.haozhuma.com" target="_blank" rel="noreferrer">去豪猪注册 <LinkOutlined /></a>
+            {isEcode
+              ? <>自动加号使用 E码云接码（eomsg.com）。展开下方「鉴权与增强设置」，E码云兜底一栏粘贴 API token（后台「API对接中心」创建，需先充值）即可开始。</>
+              : <>自动加号需要豪猪接码平台账户。展开下方「鉴权与增强设置」填入 API 账号密码即可开始使用。
+              还没有账户？<a href="https://www.haozhuma.com" target="_blank" rel="noreferrer">去豪猪注册 <LinkOutlined /></a></>}
           </Paragraph>
         ) : (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: 16 }}>
@@ -391,7 +399,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
               </Text>
             </div>
             <div>
-              <Statistic title="项目" value={hz.sid || '未配置'} valueStyle={{ fontSize: 22 }} />
+              <Statistic title={isEcode ? '短信关键词' : '项目'} value={hz.sid || '未配置'} valueStyle={{ fontSize: 22 }} />
               <Text type="secondary" style={{ fontSize: 12 }}>
                 {approxCount != null ? `约可成功 ${approxCount} 个` : ''}
               </Text>
@@ -411,6 +419,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
                 auth={auth}
                 h5={hz.h5}
                 running={running}
+                isEcode={isEcode}
                 onSaveHaozhuma={onSaveHaozhuma}
                 onSaved={() => { loadSummary(); }}
                 onH5Saved={() => { refreshConfig?.(); }}
@@ -686,8 +695,9 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
  *   - H5 会话（P1 增强）：粘贴 PHPSESSID 解锁项目搜索/对接码选择。
  *     后端验证通过才落盘；失效（410）提示重贴。
  */
-function AuthPanel({ api, auth, h5, running, onSaveHaozhuma, onSaved, onH5Saved, fallbackMounted, onFallbackChanged }) {
-  const [mode, setMode] = useState(auth.mode === 'token' ? 'token' : 'userpass');
+function AuthPanel({ api, auth, h5, running, isEcode, onSaveHaozhuma, onSaved, onH5Saved, fallbackMounted, onFallbackChanged }) {
+  // ecode 主用（无账密登录概念）强制 token 形态。
+  const [mode, setMode] = useState(isEcode || auth.mode === 'token' ? 'token' : 'userpass');
   const [userDraft, setUserDraft] = useState('');
   const [passDraft, setPassDraft] = useState('');
   const [tokenDraft, setTokenDraft] = useState('');
@@ -822,20 +832,22 @@ function AuthPanel({ api, auth, h5, running, onSaveHaozhuma, onSaved, onH5Saved,
     <Space direction="vertical" size={8} style={{ width: '100%' }}>
       {saveError && <Alert type="error" showIcon closable message="保存失败" description={saveError} onClose={() => setSaveError('')} />}
       <Space wrap size={16} align="end">
-        <div>
-          <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>鉴权方式</Text>
-          <Select
-            value={mode}
-            onChange={v => { setMode(v); setVerifyResult(null); setConfirming(false); }}
-            disabled={running}
-            style={{ width: 180 }}
-            options={[
-              { value: 'userpass', label: '账号密码（可自动重登）' },
-              { value: 'token', label: '直接填 Token' },
-            ]}
-          />
-        </div>
-        {mode === 'userpass' ? (
+        {!isEcode && (
+          <div>
+            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>鉴权方式</Text>
+            <Select
+              value={mode}
+              onChange={v => { setMode(v); setVerifyResult(null); setConfirming(false); }}
+              disabled={running}
+              style={{ width: 180 }}
+              options={[
+                { value: 'userpass', label: '账号密码（可自动重登）' },
+                { value: 'token', label: '直接填 Token' },
+              ]}
+            />
+          </div>
+        )}
+        {mode === 'userpass' && !isEcode ? (
           <>
             <div>
               <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>账号</Text>
@@ -859,19 +871,19 @@ function AuthPanel({ api, auth, h5, running, onSaveHaozhuma, onSaved, onH5Saved,
               />
             </div>
           </>
-        ) : (
+        ) : mode === 'token' || isEcode ? (
           <div>
             <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>Token</Text>
             <Input.Password
               value={tokenDraft}
               onChange={e => setTokenDraft(e.target.value)}
-              placeholder={auth.has_token ? '已保存，留空则不修改；填写则覆盖' : '豪猪后台提取的 API token'}
+              placeholder={auth.has_token ? '已保存，留空则不修改；填写则覆盖' : (isEcode ? '接码平台 API token' : '豪猪后台提取的 API token')}
               disabled={running}
               style={{ width: 280 }}
             />
           </div>
-        )}
-        <Tooltip title="用当前填写的草稿真调一次豪猪接口，不保存。建议先验证再保存，避免把坏凭据写进配置。">
+        ) : null}
+        <Tooltip title="用当前填写的草稿真调一次接码平台接口，不保存。建议先验证再保存，避免把坏凭据写进配置。">
           <Button icon={<ApiOutlined />} loading={verifying} onClick={verify}>验证连接</Button>
         </Tooltip>
         {confirming ? (
