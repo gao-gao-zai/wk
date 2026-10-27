@@ -217,6 +217,7 @@ function Console() {
         ...(currentConfig.schedule || {}),
         region: currentConfig.region || current.region || 'cn',
         features: currentConfig.features || current.features,
+		legacy_prompt_compat_migrated: currentConfig.legacy_prompt_compat_migrated === true,
         billing: currentConfig.billing || current.billing,
         upstream: currentConfig.upstream || current.upstream,
         sms: currentConfig.sms || current.sms,
@@ -835,13 +836,14 @@ function Console() {
                 <Paragraph type="secondary" style={{ margin: 0 }}>
                   保存后即时生效（同时写回 config.json，重启不丢）。只影响出站请求改写，不改变路由与账号选择。
                 </Paragraph>
+                {config.legacy_prompt_compat_migrated && <Alert type="info" showIcon message="Codex / DSH 兼容设置已迁移到可编辑的系统提示词规则" action={<Button onClick={() => setActiveSection('prompt-guard')}>管理提示词规则</Button>} />}
                 {[
                   ['codex_compat', 'Codex 兼容', '改写 Codex CLI 系统提示词身份句（open source → open-source），绕开上游逐字指纹拦截；句子不存在时原样透传。'],
                   ['dsh_compat', 'DSH 兼容', '同义改写 DSH 系统提示词中的固定身份句、Web GUI 说明和路径引用说明；只改写 system/developer 文本，默认关闭。'],
                   ['sanitize_blacklist_fingerprints', '指纹脱敏', '剥离/改写出站请求中的 Claude Code 指纹模板句；关闭后完全原样发送（调试用）。'],
                   ['passthrough', '原始流透传', '流式响应原样转发上游 SSE 字节，保留扩展字段；单请求可用 X-WorkBuddy-Passthrough: false 临时关闭。'],
                   ['responses_api', 'Responses API', '开放 /v1/responses 端点（OpenAI Responses 协议，Codex CLI 等客户端使用）；关闭后返回 404，只用 Chat Completions 的部署建议关掉。'],
-                ].map(([key, label, desc]) => (
+                ].filter(([key]) => !config.legacy_prompt_compat_migrated || !['codex_compat', 'dsh_compat'].includes(key)).map(([key, label, desc]) => (
                   <div key={key} style={{ display: 'flex', justifyContent: 'space-between', gap: 24, alignItems: 'flex-start' }}>
                     <div>
                       <Text strong>{label}</Text>

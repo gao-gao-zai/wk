@@ -217,6 +217,8 @@ type Client struct {
 	// RewriteSystem is installed before serving requests. Its implementation
 	// takes concurrent rule snapshots and only edits system/developer text.
 	RewriteSystem func(map[string]any) error
+	// Immutable after startup. Migrated rules exclusively control Codex/DSH.
+	LegacyPromptRulesManaged bool
 
 	// Stream 是流式 chat 请求的时长策略。零值 = 只受调用方 ctx 约束（即不限总时长、
 	// 不检查空闲），对长回答最友好；main 会按配置注入非零值。
@@ -292,7 +294,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // 返回错误表示请求体无法解码——此时必须拒绝请求而不是原样转发，
 // 否则内容脱敏会被一个畸形 body 绕过（见 ErrUnprocessableBody）。
 func (c *Client) prepareBody(body []byte) ([]byte, error) {
-	if c.RewriteSystem == nil || len(body) == 0 {
+	if c.RewriteSystem == nil && !c.LegacyPromptRulesManaged || len(body) == 0 {
 		return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), c.effortsSnapshot())
 	}
 	var obj map[string]any
@@ -311,7 +313,7 @@ func (c *Client) prepareBodyFromObj(obj map[string]any) ([]byte, error) {
 			return nil, fmt.Errorf("%w: %v", ErrUnprocessableBody, err)
 		}
 	}
-	return PrepareBodyFromMap(obj, c.sanitizeEnabled(), c.effortsSnapshot())
+	return prepareBodyFromMap(obj, c.sanitizeEnabled(), c.effortsSnapshot(), c.LegacyPromptRulesManaged)
 }
 
 // PrepareChatBody normalizes the document once, before cache routing, and

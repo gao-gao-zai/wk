@@ -20,11 +20,13 @@ import (
 )
 
 type Rule struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Match       string `json:"match"`
-	Replacement string `json:"replacement"`
-	Enabled     bool   `json:"enabled"`
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	Match              string `json:"match"`
+	Replacement        string `json:"replacement"`
+	Enabled            bool   `json:"enabled"`
+	RequireEndBoundary bool   `json:"require_end_boundary,omitempty"`
+	Source             string `json:"source,omitempty"`
 }
 type Settings struct {
 	AutoLocate    bool `json:"auto_locate"`
@@ -33,9 +35,10 @@ type Settings struct {
 	MaxCases      int  `json:"max_cases"`
 }
 type Config struct {
-	Revision uint64   `json:"revision"`
-	Settings Settings `json:"settings"`
-	Rules    []Rule   `json:"rules"`
+	Revision               uint64   `json:"revision"`
+	Settings               Settings `json:"settings"`
+	Rules                  []Rule   `json:"rules"`
+	LegacyMigrationVersion int      `json:"legacy_migration_version,omitempty"`
 }
 type ProbeResult struct {
 	Outcome string `json:"outcome"` // pass, blocked, inconclusive
@@ -211,13 +214,13 @@ func (m *Manager) Update(c Config) error {
 	if c.Settings.ProbeBudget < 4 || c.Settings.ProbeBudget > 256 || c.Settings.RetentionDays < 1 || c.Settings.RetentionDays > 365 || c.Settings.MaxCases < 1 || c.Settings.MaxCases > 1000 {
 		return errors.New("请求预算须为 4–256、保留天数 1–365、记录上限 1–1000")
 	}
-	if len(c.Rules) > 200 {
-		return errors.New("最多 200 条替换规则")
+	if len(c.Rules) > 256 {
+		return errors.New("最多 256 条替换规则")
 	}
 	ids := map[string]bool{}
 	for i := range c.Rules {
 		r := &c.Rules[i]
-		if r.Match == "" || len(r.Match) > 1<<20 || len(r.Replacement) > 1<<20 || len(r.Name) > 200 {
+		if r.Match == "" || len(r.Match) > 1<<20 || len(r.Replacement) > 1<<20 || len(r.Name) > 200 || len(r.Source) > 100 {
 			return errors.New("匹配内容不可为空；单条匹配/替换最多 1 MiB")
 		}
 		if r.ID == "" {
@@ -238,6 +241,8 @@ func (m *Manager) Update(c Config) error {
 		return errors.New("配置已被更新，请刷新后重试")
 	}
 	old := copyJSON(m.state)
+	// This is a durable migration marker, not an administrator-editable setting.
+	c.LegacyMigrationVersion = m.state.Config.LegacyMigrationVersion
 	rulesChanged := !slices.Equal(c.Rules, m.state.Config.Rules)
 	c.Revision++
 	m.state.Config = copyJSON(c)

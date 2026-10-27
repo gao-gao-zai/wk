@@ -68,6 +68,7 @@ func (h *Handler) registerPromptGuard() {
 	if m := h.cfg.PromptGuard; m != nil {
 		if h.cfg.Upstream != nil {
 			h.cfg.Upstream.RewriteSystem = m.Apply
+			h.cfg.Upstream.LegacyPromptRulesManaged = m.LegacyMigrated()
 		}
 		m.SetProbeFactory(h.promptProbe)
 		m.SetPreparer(func(item promptguard.Case) ([]promptguard.Message, error) {
@@ -82,6 +83,10 @@ func (h *Handler) registerPromptGuard() {
 		})
 	}
 	h.mux.HandleFunc("/admin/prompt-guard/", h.withFrontend(h.promptGuardAPI))
+}
+
+func (h *Handler) legacyPromptMigrated() bool {
+	return h.cfg.PromptGuard != nil && h.cfg.PromptGuard.LegacyMigrated()
 }
 
 func (h *Handler) promptGuardAPI(w http.ResponseWriter, r *http.Request) {

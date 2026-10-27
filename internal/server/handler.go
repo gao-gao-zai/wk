@@ -1103,7 +1103,7 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
 	if h.cfg.ConfigPath == "" {
-		writeJSON(w, 200, map[string]any{})
+		writeJSON(w, 200, map[string]any{"legacy_prompt_compat_migrated": h.legacyPromptMigrated()})
 		return
 	}
 	raw, err := os.ReadFile(h.cfg.ConfigPath)
@@ -1224,25 +1224,31 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	// 回显运行时的实际限制，包含环境变量和旧配置键的兼容结果。
 	c.MaxRequestBodyMB = h.currentMaxRequestBody() / 1_000_000
+	if h.legacyPromptMigrated() {
+		c.Features.CodexCompat = false
+		c.Features.DSHCompat = false
+	}
 	resp := struct {
-		Schedule               any    `json:"schedule"`
-		Region                 any    `json:"region"`
-		Features               any    `json:"features"`
-		Billing                any    `json:"billing"`
-		Upstream               any    `json:"upstream"`
-		SMS                    any    `json:"sms"`
-		AutoEnroll             any    `json:"autoenroll"`
-		Retention              any    `json:"request_log_retention"`
-		ResponseHistory        any    `json:"response_history"`
-		ResponseHistoryStorage string `json:"response_history_storage"`
+		LegacyPromptCompatMigrated bool   `json:"legacy_prompt_compat_migrated"`
+		Schedule                   any    `json:"schedule"`
+		Region                     any    `json:"region"`
+		Features                   any    `json:"features"`
+		Billing                    any    `json:"billing"`
+		Upstream                   any    `json:"upstream"`
+		SMS                        any    `json:"sms"`
+		AutoEnroll                 any    `json:"autoenroll"`
+		Retention                  any    `json:"request_log_retention"`
+		ResponseHistory            any    `json:"response_history"`
+		ResponseHistoryStorage     string `json:"response_history_storage"`
 		// MaxRequestBodyMB 对前端组装成嵌套对象（与 POST 补丁形状一致）。
 		MaxRequestBody any `json:"max_request_body"`
 	}{
-		Schedule: c.Schedule,
-		Region:   c.Region,
-		Features: c.Features,
-		Billing:  c.Billing,
-		Upstream: c.Upstream,
+		LegacyPromptCompatMigrated: h.legacyPromptMigrated(),
+		Schedule:                   c.Schedule,
+		Region:                     c.Region,
+		Features:                   c.Features,
+		Billing:                    c.Billing,
+		Upstream:                   c.Upstream,
 		SMS: map[string]any{
 			"haozhuma": map[string]any{
 				"sid":    c.SMS.Haozhuma.Sid,
@@ -1532,6 +1538,10 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if h.legacyPromptMigrated() && req.Features != nil && (req.Features.CodexCompat != nil || req.Features.DSHCompat != nil) {
+		writeJSON(w, 400, map[string]string{"error": "Codex/DSH 兼容配置已迁移，请在系统提示词规则中修改", "code": "prompt_compat_migrated"})
 		return
 	}
 	var historyPolicy responsehistory.Policy

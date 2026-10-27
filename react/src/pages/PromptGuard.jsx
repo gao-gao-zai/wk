@@ -65,7 +65,7 @@ export default function PromptGuardPage({ api }) {
     catch (e) { setError(e.message); message.error(e.message); return null; }
     finally { setBusy(false); }
   };
-  const edit = rule => { setEditor(rule || {}); ruleForm.setFieldsValue({ name: '', match: '', replacement: '', enabled: true, ...rule }); };
+  const edit = rule => { setEditor(rule || {}); ruleForm.setFieldsValue({ name: '', match: '', replacement: '', enabled: true, require_end_boundary: false, ...rule }); };
   const saveRule = async () => {
     const values = await ruleForm.validateFields().catch(() => null); if (!values) return;
     const rules = [...(config.rules || [])];
@@ -88,7 +88,7 @@ export default function PromptGuardPage({ api }) {
   const remove = row => modal.confirm({ title: '删除这条拦截记录？', content: '将删除保存的完整系统提示词和诊断结果；后续新的 11128 仍会记录。', okText: '删除', okButtonProps: { danger: true }, cancelText: '取消', onOk: async () => { await api(`${root}cases/${row.id}`, { method: 'DELETE' }); if (row.id === detailId) setDetailId(null); await load(); changed(); } });
   const rulesColumns = [
     { title: '顺序', width: 100, render: (_, r, i) => <Space><Text>{i + 1}</Text><Button aria-label="上移规则" size="small" disabled={busy || i === 0} icon={<ArrowUpOutlined />} onClick={() => move(i, -1)} /><Button aria-label="下移规则" size="small" disabled={busy || i === config.rules.length - 1} icon={<ArrowDownOutlined />} onClick={() => move(i, 1)} /></Space> },
-    { title: '规则', dataIndex: 'name', render: (v, r) => <div><Text strong>{v || '未命名规则'}</Text><div className="pg-snippet">{r.match}</div></div> },
+    { title: '规则', dataIndex: 'name', render: (v, r) => <div><Text strong>{v || '未命名规则'}</Text>{['legacy_codex', 'legacy_dsh'].includes(r.source) && <Tag color="blue" style={{ marginLeft: 6 }}>{r.source === 'legacy_codex' ? 'Codex 迁移' : 'DSH 迁移'}</Tag>}{r.require_end_boundary && <Tag>末尾边界</Tag>}<div className="pg-snippet">{r.match}</div></div> },
     { title: '替换为', dataIndex: 'replacement', render: v => <div className="pg-snippet">{v || <Text type="secondary">删除匹配内容</Text>}</div> },
     { title: '启用', dataIndex: 'enabled', width: 80, render: (v, r) => <Switch aria-label={`启用 ${r.name || '规则'}`} checked={v} disabled={busy} onChange={enabled => saveConfig({ rules: config.rules.map(rule => rule.id === r.id ? { ...rule, enabled } : rule) })} /> },
     { title: '操作', width: 140, render: (_, r) => <Space><Button size="small" icon={<EditOutlined />} disabled={busy} onClick={() => edit(r)}>编辑</Button><Button size="small" danger disabled={busy} onClick={() => modal.confirm({ title: '删除替换规则？', okText: '删除', cancelText: '取消', onOk: () => saveConfig({ rules: config.rules.filter(rule => rule.id !== r.id) }) })}>删除</Button></Space> },
@@ -111,7 +111,8 @@ export default function PromptGuardPage({ api }) {
           ]} />
         </> },
         { key: 'rules', label: '替换规则', children: <>
-          <Alert type="info" showIcon message="按顺序对每个 system / developer 文本块执行精确、区分大小写的全量替换；后面的规则可以匹配前面的替换结果。" description="支持任意多行内容与空替换，不支持正则。用户消息、工具内容和图片保持原样。通用规则先于已有 DSH / Codex 兼容处理运行。" />
+          {!!config?.legacy_migration_version && <Alert type="success" showIcon message="旧 Codex / DSH 配置已自动迁移" description="规则保留了旧开关的启停状态，可在此修改、关闭或删除。重启不会重新导入，也不会再执行旧兼容替换。" style={{ marginBottom: 12 }} />}
+          <Alert type="info" showIcon message="按顺序对每个 system / developer 文本块执行精确、区分大小写的全量替换；后面的规则可以匹配前面的替换结果。" description="支持任意多行内容与空替换，可设置匹配末尾边界，不支持正则。用户消息、工具内容和图片保持原样。" />
           <div className="pg-toolbar"><Text type="secondary">保存后立即生效。修改规则后，旧验证结果需要重新验证。</Text><Button type="primary" icon={<PlusOutlined />} disabled={!config} onClick={() => edit()}>新增规则</Button></div>
           <Table rowKey="id" columns={rulesColumns} dataSource={config?.rules || []} pagination={false} scroll={{ x: 850 }} locale={{ emptyText: '添加任意需要替换的系统提示词内容' }} />
         </> },
@@ -140,7 +141,7 @@ export default function PromptGuardPage({ api }) {
       </Space>}
     </Drawer>
     <Modal title={editor?.id ? '编辑替换规则' : '新增替换规则'} open={editor !== null} onCancel={() => setEditor(null)} onOk={saveRule} confirmLoading={busy} width={760} okText="保存规则" cancelText="取消" destroyOnHidden>
-      <Form form={ruleForm} layout="vertical"><Form.Item name="name" label="规则名称"><Input maxLength={200} placeholder="例如：路径说明同义改写" /></Form.Item><Form.Item name="match" label="匹配原文（精确匹配）" rules={[{ required: true, message: '请输入要替换的原文' }]}><Input.TextArea rows={6} spellCheck={false} /></Form.Item><Form.Item name="replacement" label="替换内容" extra="留空会删除匹配内容。请自行确认改写前后的语义。"><Input.TextArea rows={6} spellCheck={false} /></Form.Item><Form.Item name="enabled" label="启用规则" valuePropName="checked"><Switch /></Form.Item><Alert type="info" showIcon message="保存规则不会自动验证。保存后可在拦截详情点击“验证当前替换”，确认后发送请求。" /></Form>
+      <Form form={ruleForm} layout="vertical"><Form.Item name="name" label="规则名称"><Input maxLength={200} placeholder="例如：路径说明同义改写" /></Form.Item><Form.Item name="match" label="匹配原文（精确匹配）" rules={[{ required: true, message: '请输入要替换的原文' }]}><Input.TextArea rows={6} spellCheck={false} /></Form.Item><Form.Item name="replacement" label="替换内容" extra="留空会删除匹配内容。请自行确认改写前后的语义。"><Input.TextArea rows={6} spellCheck={false} /></Form.Item><Form.Item name="require_end_boundary" label="检查匹配末尾边界" valuePropName="checked" extra="匹配内容之后须为英文句点、空格、制表符、换行或文本结尾；迁移的 DSH 身份规则默认开启，避免误改更长的名称。"><Switch /></Form.Item><Form.Item name="enabled" label="启用规则" valuePropName="checked"><Switch /></Form.Item><Alert type="info" showIcon message="保存规则不会自动验证。保存后可在拦截详情点击“验证当前替换”，确认后发送请求。" /></Form>
     </Modal>
   </div>;
 }

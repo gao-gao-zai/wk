@@ -100,9 +100,9 @@ type Config struct {
 		Passthrough bool `json:"passthrough"`
 		// CodexCompat 改写 Codex CLI 系统提示词中的身份句（"open source"
 		// → "open-source"），绕开上游内容审核的逐字指纹匹配。句子不存在
-		// 时原样透传。默认 false。
+		// 时原样透传。默认 false。首次启动时自动迁移为提示词规则，之后忽略此旧字段。
 		CodexCompat bool `json:"codex_compat"`
-		// DSHCompat rewrites the fixed DSH system-prompt identity. Default false.
+		// DSHCompat seeds migrated DSH prompt rules once. Default false.
 		DSHCompat bool `json:"dsh_compat"`
 		// ResponsesAPI 是否暴露 Responses 端点（/v1/responses、/responses）。
 		// 关闭时返回 404（表现为端点不存在）。默认 true。

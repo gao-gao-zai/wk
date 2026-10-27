@@ -58,6 +58,10 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 // obj 为 nil（字面量 null 解码成功的结果）会得到与解码失败一致的
 // fail-closed 错误，语义与 PrepareBodyOptWithEffirts 对齐。
 func PrepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]string) ([]byte, error) {
+	return prepareBodyFromMap(obj, sanitize, efforts, false)
+}
+
+func prepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]string, legacyManaged bool) ([]byte, error) {
 	// json.Unmarshal 对字面量 null 会**成功**并把 obj 留成 nil map，
 	// 随后 obj["stream"] = true 会直接 panic（assignment to entry in nil map）。
 	// 一个 `null` 请求体就足以打挂一个请求，所以必须显式挡掉。
@@ -88,12 +92,12 @@ func PrepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]
 	// Codex 兼容改写放在角色映射之后：developer→system 已完成，system
 	// 消息（含由 developer 映射来的）都会被检查；放在脱敏之前，两层
 	// 改写互不干扰（脱敏管 Claude 指纹，这里管 Codex 身份句）。
-	if codexCompatEnabled {
+	if !legacyManaged && codexCompatEnabled {
 		if msgs, ok := obj["messages"].([]any); ok {
 			rewriteCodexPromptMessages(msgs)
 		}
 	}
-	if dshCompatEnabled.Load() {
+	if !legacyManaged && dshCompatEnabled.Load() {
 		if msgs, ok := obj["messages"].([]any); ok {
 			rewriteDSHPromptMessages(msgs)
 		}

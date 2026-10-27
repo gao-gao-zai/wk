@@ -101,13 +101,13 @@ func ApplyToDocument(doc map[string]any, rules []Rule) error {
 			}
 			for _, r := range rules {
 				if r.Enabled && r.Match != "" {
-					count := strings.Count(s, r.Match)
+					count := literalMatchCount(s, r.Match, r.RequireEndBoundary)
 					delta := len(r.Replacement) - len(r.Match)
 					if len(s) > limit-total || delta > 0 && count > (limit-total-len(s))/delta {
 						rewriteErr = errors.New("system prompt replacement exceeds 128 MiB limit")
 						return s
 					}
-					s = strings.ReplaceAll(s, r.Match, r.Replacement)
+					s = replaceLiteral(s, r)
 				}
 			}
 			if len(s) > limit-total {
@@ -120,6 +120,57 @@ func ApplyToDocument(doc map[string]any, rules []Rule) error {
 		msg["content"] = m[0].Content
 	}
 	return rewriteErr
+}
+
+func endBoundary(text string, end int) bool {
+	return end == len(text) || strings.ContainsRune(". \t\r\n", rune(text[end]))
+}
+
+func literalMatchCount(text, match string, boundary bool) int {
+	if !boundary {
+		return strings.Count(text, match)
+	}
+	count, pos := 0, 0
+	for pos < len(text) {
+		i := strings.Index(text[pos:], match)
+		if i < 0 {
+			break
+		}
+		end := pos + i + len(match)
+		if endBoundary(text, end) {
+			count++
+		}
+		pos = end
+	}
+	return count
+}
+
+func replaceLiteral(text string, r Rule) string {
+	if !r.RequireEndBoundary {
+		return strings.ReplaceAll(text, r.Match, r.Replacement)
+	}
+	var out strings.Builder
+	pos, written := 0, 0
+	for pos < len(text) {
+		i := strings.Index(text[pos:], r.Match)
+		if i < 0 {
+			break
+		}
+		i += pos
+		end := i + len(r.Match)
+		pos = end
+		if !endBoundary(text, end) {
+			continue
+		}
+		out.WriteString(text[written:i])
+		out.WriteString(r.Replacement)
+		written = end
+	}
+	if written == 0 {
+		return text
+	}
+	out.WriteString(text[written:])
+	return out.String()
 }
 
 // IsBlocked requires a structured upstream code, never a substring in a prompt

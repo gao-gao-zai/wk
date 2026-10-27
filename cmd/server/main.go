@@ -469,6 +469,13 @@ func main() {
 			log.Fatalf("prompt guard: %v", err)
 		}
 		defer promptManager.Close()
+		migrated, err := promptManager.MigrateLegacy(promptguard.LegacyConfig{Codex: cfg.Features.CodexCompat, DSH: cfg.Features.DSHCompat})
+		if err != nil {
+			log.Fatalf("prompt guard migration: %v", err)
+		}
+		if migrated {
+			log.Printf("prompt guard: Codex/DSH settings migrated to editable rules")
+		}
 	}
 	h := server.NewHandler(server.Config{
 		PromptGuard:      promptManager,
