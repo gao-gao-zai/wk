@@ -19,7 +19,7 @@ const DEFAULTS = { min_balance: 2.2, consecutive_fails: 15, retry_delay_seconds:
  * 所有修改以底部「保存高级设置」为唯一提交点，有脏改动关抽屉先确认。
  *
  * 三组参数：
- *   - 项目与对接码（P1 增强）：项目搜索选择（H5 会话可用时）/ 对接码
+ *   - 项目与对接码（P1 增强）：项目搜索选择（Web 登录令牌可用时）/ 对接码
  *     列表选择（带价格/库存/运营商标签）；H5 未配置或失效时自动退化
  *     为手填输入框，功能不缺失只是少辅助。
  *   - 取号策略：运营商优先级 isp / 对接方标识 author
@@ -237,11 +237,11 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           type="info"
           showIcon
           style={{ marginBottom: 12 }}
-          message={h5.expired ? 'H5 会话已失效，选择器退化为手填' : '未配置 H5 会话，项目/对接码为手填模式'}
+          message={h5.expired ? 'Web 登录令牌已失效，选择器退化为手填' : '未配置 Web 登录令牌，项目/对接码为手填模式'}
           description={
             h5.expired
-              ? '到主页面「豪猪 · 配置 → 豪猪增强功能」重新粘贴 PHPSESSID 后，这里会升级为搜索选择。'
-              : '在主页面「豪猪 · 配置 → 豪猪增强功能」粘贴 PHPSESSID 后，这里会升级为带价格/库存的项目搜索与对接码选择。'
+              ? '到主页面「豪猪 · 配置 → 豪猪增强功能」重新粘贴 qs_web_token 后，这里会升级为搜索选择。'
+              : '在主页面「豪猪 · 配置 → 豪猪增强功能」粘贴 qs_web_token 后，这里会升级为带价格/库存的项目搜索与对接码选择。'
           }
         />
       )}
@@ -268,7 +268,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
         <Divider orientation="left" plain style={{ margin: '4px 0 12px' }}>项目与对接码</Divider>
         <Form.Item
           label="项目"
-          extra={h5Ready ? '点「搜索项目」从豪猪项目库选择；选中后自动拉取该项目的对接码列表。' : '取号项目 ID，如 52283（腾讯科技[限对接]）。配置 H5 会话后可搜索选择。'}
+          extra={h5Ready ? '点「搜索项目」从豪猪项目库选择；选中后自动拉取该项目的对接码列表。' : '取号项目 ID，如 52283（腾讯科技[限对接]）。配置 Web 登录令牌后可搜索选择。'}
           validateTrigger={false}
         >
           <Space.Compact style={{ width: '100%' }}>

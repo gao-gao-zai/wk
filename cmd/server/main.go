@@ -593,15 +593,8 @@ func main() {
 		SoftCooldown:        cfg.SoftRateDur,
 	})
 
-	// 豪猪 H5 增强（P1，可选）：sms.haozhuma.h5_session 非空时启动只读
-	// 客户端（项目搜索/对接码选择的数据源）+ 7 天保活。未配置 = 端点
-	// 503，前端退化为手填——与接码 API 完全独立，随便关停。
-	if s := strings.TrimSpace(cfg.SMS.Haozhuma.H5Session); s != "" {
-		h5 := haozhumah5.New(s)
-		h5.StartKeepalive()
-		h.SetHaozhumaH5(h5)
-		log.Printf("haozhuma H5 增强已启用（PHPSESSID 已配置，7 天自动保活）")
-	}
+	// Web token is independent of the SMS API token and stays in memory.
+	h.SetHaozhumaH5(haozhumah5.New(strings.TrimSpace(os.Getenv("HAOZHUMA_WEB_TOKEN"))))
 
 	// 对接码监控（UID Watcher，可选）：autoenroll.watch 配置 + 豪猪 H5 +
 	// AutoEnroll 三者齐备才组装。状态文件在 state.json 同目录（卷内，

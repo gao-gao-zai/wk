@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	h5 "workbuddy2api/internal/haozhumah5"
 )
@@ -20,29 +19,19 @@ import (
 func newFakeH5Server(t *testing.T, validSession string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, err := r.Cookie("PHPSESSID")
-		if err != nil || got.Value == "" || (validSession != "" && got.Value != validSession) {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"code":-1,"data":null,"msg":"请选择正确的API"}`))
+
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token == "" || (validSession != "" && token != validSession) {
+			w.WriteHeader(401)
 			return
 		}
-		switch r.URL.Path {
-		case "/api.php":
-			switch r.URL.Query().Get("type") {
-			case "30":
-				w.Write([]byte(`{"code":1,"data":[
-  {"name":"【52283】腾讯科技[限对接] [70da814e38b466b6]","sid":"70da814e38b466b6"},
-  {"name":"【61904】腾讯科技3次[限对接] [1972972d69bd0453]","sid":"1972972d69bd0453"}
-],"msg":"Success"}`))
-			case "8":
-				w.Write([]byte(`{"code":1,"data":[
-  {"sid":"52283","mc":"[52283]腾讯科技[限对接]","uid":"52283-WW9L2J4WOL","yhj":"16.500","zxky":"可用数量:23","yyy":"移动|电信|联通|","sheng":"","haoduan":"未知号段","hd":"198|193|","time":"2026-09-22 23:24:18","zd":"1"}
-],"msg":"Success"}`))
-			default:
-				w.Write([]byte(`{"code":-1,"data":null,"msg":"unknown type"}`))
-			}
-		case "/time.php":
-			w.Write([]byte(time.Now().Format(time.RFC3339)))
+		switch {
+		case r.URL.Path == "/projects/search":
+			w.Write([]byte(`{"code":0,"data":{"list":[{"id":52283,"name":"腾讯科技[限对接]","sid":"70da814e38b466b6"},{"id":61904,"name":"腾讯科技3次[限对接]","sid":"1972972d69bd0453"}]}}`))
+		case strings.HasSuffix(r.URL.Path, "/public-codes"):
+			w.Write([]byte(`{"code":0,"data":[{"code":"52283-WW9L2J4WOL","projectName":"腾讯科技","price":"16.500","available":23,"operators":["移动","电信","联通"],"provinces":[],"prefixes":["198","193"],"segmentType":"未知号段"}]}`))
+		case r.URL.Path == "/bindings":
+			w.Write([]byte(`{"code":0,"data":{"list":[],"total":0}}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -100,8 +89,8 @@ func TestHaozhumaH5SessionPaste(t *testing.T) {
 		t.Fatalf("good session paste: %d: %s", rec.Code, rec.Body.String())
 	}
 	raw, _ = os.ReadFile(cfgPath)
-	if !strings.Contains(string(raw), `"h5_session": "good-session"`) {
-		t.Fatalf("h5_session not persisted: %s", raw)
+	if strings.Contains(string(raw), "good-session") {
+		t.Fatalf("token must not persist: %s", raw)
 	}
 	if ah.Handler.cfg.HaozhumaH5 == nil {
 		t.Fatal("runtime H5 client should be created after paste")
@@ -238,7 +227,7 @@ func TestHaozhumaUIDsEndpoint(t *testing.T) {
 		t.Fatalf("uids = %d, want 1", len(resp.UIDs))
 	}
 	u0 := resp.UIDs[0]
-	if u0.UID != "52283-WW9L2J4WOL" || u0.Price != 16.5 || u0.Stock != 23 || !u0.Pinned {
+	if u0.UID != "52283-WW9L2J4WOL" || u0.Price != 16.5 || u0.Stock != 23 || u0.Pinned {
 		t.Fatalf("uid item = %+v", u0)
 	}
 	if len(u0.ISPs) != 3 {

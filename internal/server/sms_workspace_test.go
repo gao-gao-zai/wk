@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -81,20 +82,28 @@ func TestSMSWorkspaceUIDSyncPreservesUnmanagedAndOldOnPartialFailure(t *testing.
 	for _, failSecond := range []bool{false, true} {
 		t.Run(fmt.Sprint(failSecond), func(t *testing.T) {
 			removed := make(chan string, 2)
+
+			deleted := false
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Query().Get("type") {
-				case "3":
-					fmt.Fprint(w, `{"code":200,"data":[{"uid":"52283-OLD"},{"uid":"52283-UNMANAGED"}],"msg":"ok"}`)
-				case "4":
-					if failSecond && r.URL.Query().Get("djm") == "52283-NEWB" {
-						fmt.Fprint(w, `{"code":-1,"msg":"fixture add rejected"}`)
-					} else {
-						fmt.Fprint(w, `{"code":1,"msg":"ok"}`)
+				if r.Method == "GET" {
+					list := []map[string]any{{"code": "52283-UNMANAGED", "price": "1", "available": 1}}
+					if !deleted {
+						list = append(list, map[string]any{"code": "52283-OLD", "price": "1", "available": 1})
 					}
-				case "41":
-					removed <- r.URL.Query().Get("uid")
-					fmt.Fprint(w, `{"code":200,"msg":"ok"}`)
+					json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"list": list, "total": len(list)}})
+					return
 				}
+				var body struct {
+					Codes []string `json:"codes"`
+				}
+				json.NewDecoder(r.Body).Decode(&body)
+				if r.URL.Path == "/bindings/batch" {
+					deleted = true
+					removed <- strings.Join(body.Codes, ",")
+					fmt.Fprint(w, `{"code":0,"data":{"affected":1}}`)
+					return
+				}
+				json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"results": []map[string]any{{"code": body.Codes[0], "ok": !(failSecond && body.Codes[0] == "52283-NEWB")}}}})
 			}))
 			defer srv.Close()
 			old := h5.BaseURL

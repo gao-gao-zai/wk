@@ -212,6 +212,11 @@ func (h *Handler) syncUIDSelection(ctx context.Context, before, after []string) 
 	for _, u := range after {
 		want[u] = true
 	}
+	for _, u := range mine {
+		if want[u.UID] && u.State == "已暂停" {
+			return []string{"对接码 " + u.UID + " 已暂停，请先在豪猪网站确认是否恢复"}
+		}
+	}
 	var failures []string
 	for _, u := range after {
 		if !have[u] {

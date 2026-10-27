@@ -1340,17 +1340,12 @@ func maskCredential(s string) string {
 // h5SessionEcho H5 会话回显（脱敏）：只报 has/expired/last_seen/last_error，
 // PHPSESSID 值本体绝不出接口（泄露 = 豪猪账号完全被盗，见设计文档 §6.2）。
 // configuredSession 来自配置文件（未启动 client 时只知道配没配）。
-func (h *Handler) h5SessionEcho(configuredSession string) map[string]any {
-	echo := map[string]any{"has": false}
-	if configuredSession != "" {
-		echo["has"] = true
-		echo["configured"] = true
-	}
+func (h *Handler) h5SessionEcho(_ string) map[string]any {
+	echo := map[string]any{"has": false, "configured": false, "storage": "memory", "auth_mode": "web_token"}
 	if h.cfg.HaozhumaH5 != nil {
 		info := h.cfg.HaozhumaH5.Info()
-		if info.Has {
-			echo["has"] = true
-		}
+		echo["has"] = info.Has
+		echo["configured"] = info.Has
 		echo["expired"] = info.Expired
 		if !info.LastSeen.IsZero() {
 			echo["last_seen"] = info.LastSeen.Format(time.RFC3339)
@@ -2363,58 +2358,47 @@ func (h *Handler) haozhumaSummary(w http.ResponseWriter, r *http.Request) {
 // 运行中的任务不受任何影响：H5 只服务选择器，与接码 API 完全独立。
 func (h *Handler) haozhumaH5Session(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Session string `json:"session"`
+		Session string  `json:"session"`
+		Token   *string `json:"token"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req) != nil {
+		writeJSON(w, 400, map[string]string{"error": "请求格式不正确"})
 		return
 	}
-	session := strings.TrimSpace(req.Session)
-	if session == "" {
-		// 显式清空。
-		if h.cfg.SetHaozhumaH5Session != nil {
-			h.cfg.SetHaozhumaH5Session("")
-		}
-		if err := h.persistHaozhumaH5Session(""); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败：" + err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": true})
+	token := strings.TrimSpace(req.Session)
+	if req.Token != nil {
+		token = strings.TrimSpace(*req.Token)
+	}
+	if len(token) > 4096 || strings.ContainsAny(token, "\r\n") {
+		writeJSON(w, 400, map[string]string{"error": "令牌格式不正确"})
 		return
 	}
-	// 验证：临时客户端真调一次 type=30。
-	probe := haozhumah5.New(session)
-	defer probe.Close()
+	if token == "" {
+		if h.cfg.HaozhumaH5 != nil {
+			h.cfg.HaozhumaH5.Session("")
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "cleared": true})
+		return
+	}
+	probe := haozhumah5.New(token)
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	if _, err := probe.Projects(ctx, "腾讯"); err != nil {
-		// 会话无效/网络故障都拒绝保存（与鉴权 patch 同语义：坏值不落盘）。
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "会话验证失败：" + err.Error()})
-		return
-	}
-	// 验证通过：先落盘，再热更运行态（客户端不存在时按需创建——
-	// h5_session 是纯 WebUI 增强，允许在未配置接码 API 的部署上单独启用）。
-	if err := h.persistHaozhumaH5Session(session); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败：" + err.Error()})
+	if err := probe.Ping(ctx); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "Web 登录令牌验证失败：" + err.Error()})
 		return
 	}
 	if h.cfg.HaozhumaH5 == nil {
-		h.cfg.HaozhumaH5 = probe
-		probe = nil // 已转正，别被 defer Close
-		h.cfg.HaozhumaH5.StartKeepalive()
+		h.SetHaozhumaH5(probe)
 	} else {
-		h.cfg.HaozhumaH5.Session(session)
+		h.cfg.HaozhumaH5.Session(token)
 	}
-	if h.cfg.SetHaozhumaH5Session != nil {
-		h.cfg.SetHaozhumaH5Session(session)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, 200, map[string]any{"ok": true, "storage": "memory"})
 }
 
 // haozhumaProjects 项目搜索（代理 H5 type=30）。q 为搜索关键词。
 func (h *Handler) haozhumaProjects(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.HaozhumaH5 == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "项目搜索未启用（需在增强设置里粘贴 PHPSESSID）"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "项目搜索未启用（需在增强设置里粘贴 Web 登录令牌）"})
 		return
 	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -2436,7 +2420,7 @@ func (h *Handler) haozhumaProjects(w http.ResponseWriter, r *http.Request) {
 // 标识与数字项目 ID 两种（上游两者都收）。
 func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.HaozhumaH5 == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码列表未启用（需在增强设置里粘贴 PHPSESSID）"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码列表未启用（需在增强设置里粘贴 Web 登录令牌）"})
 		return
 	}
 	sid := strings.TrimSpace(r.URL.Query().Get("sid"))
@@ -2647,45 +2631,6 @@ func (h *Handler) persistWatchConfig(cfg WatchConfig) error {
 	}
 	ae["watch"] = watchDoc
 	doc["autoenroll"] = ae
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600)
-}
-
-// persistHaozhumaH5Session 把 h5_session 写进 config.json（复用 admin 配置
-// 的原子写链 + configMu 互斥）。与鉴权 patch 分开：h5_session 允许在
-// AutoEnroll 未启用的部署上单独配置（纯 WebUI 增强）。
-func (h *Handler) persistHaozhumaH5Session(session string) error {
-	h.configMu.Lock()
-	defer h.configMu.Unlock()
-	if h.cfg.ConfigPath == "" {
-		return errors.New("config 路径未配置（内存模式不支持持久化）")
-	}
-	raw, err := os.ReadFile(h.cfg.ConfigPath)
-	if err != nil {
-		return err
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return fmt.Errorf("invalid config: %w", err)
-	}
-	sms, _ := doc["sms"].(map[string]any)
-	if sms == nil {
-		sms = map[string]any{}
-	}
-	hz, _ := sms["haozhuma"].(map[string]any)
-	if hz == nil {
-		hz = map[string]any{}
-	}
-	if session == "" {
-		delete(hz, "h5_session")
-	} else {
-		hz["h5_session"] = session
-	}
-	sms["haozhuma"] = hz
-	doc["sms"] = sms
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err

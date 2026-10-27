@@ -674,6 +674,7 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 		if !p.Enabled {
 			continue
 		}
+		w.h5.RememberProject(p.HexSID, p.Sid)
 		items, err := w.h5.UIDs(ctx, p.HexSID)
 		if err != nil {
 			// 拉表失败（非会话失效）：退避不派活，下一轮再看。

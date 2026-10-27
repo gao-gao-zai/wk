@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -61,34 +60,34 @@ func (f *fakeWatchH5) consume(uid string, n int) {
 func newFakeWatchH5(t *testing.T, hexSID string, table map[string]string) *fakeWatchH5 {
 	f := &fakeWatchH5{t: t, hexSID: hexSID, uidTable: table}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api.php":
-			switch r.URL.Query().Get("type") {
-			case "8":
-				if r.URL.Query().Get("sid") != f.hexSID {
-					w.Write([]byte(`{"code":-1,"data":null,"msg":"sid 不匹配"}`))
-					return
-				}
-				f.mu.lock()
-				rows := make([]string, 0, len(f.uidTable))
-				for uid, meta := range f.uidTable {
-					rows = append(rows, fmt.Sprintf(
-						`{"sid":"52283","mc":"腾讯科技","uid":%q,"yhj":%q,"zxky":"可用数量:%s","yyy":"移动|","sheng":"","haoduan":"未知号段","hd":"198|","time":"2026-09-24 00:00:00","zd":"0"}`,
-						uid, price(meta), stockOf(meta)))
-				}
-				f.mu.unlock()
-				w.Write([]byte(`{"code":1,"data":[` + strings.Join(rows, ",") + `],"msg":"Success"}`))
-			case "4":
-				f.added.Add(1)
-				w.Write([]byte(`{"code":1,"data":null,"msg":"添加成功"}`))
-			case "41":
-				f.removed.Add(int32(len(strings.Split(r.URL.Query().Get("uid"), ","))))
-				w.Write([]byte(`{"code":200,"data":null,"msg":"对接码状态:已删除"}`))
-			default:
-				w.Write([]byte(`{"code":-1,"data":null,"msg":"unknown type"}`))
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/public-codes"):
+			f.mu.lock()
+			rows := make([]map[string]any, 0, len(f.uidTable))
+			for uid, meta := range f.uidTable {
+				rows = append(rows, map[string]any{"code": uid, "projectName": "腾讯科技", "price": price(meta), "available": stockOf(meta), "operators": []string{"移动"}})
 			}
-		case "/time.php":
-			w.Write([]byte(time.Now().Format(time.RFC3339)))
+			f.mu.unlock()
+			json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": rows})
+		case r.Method == "GET" && r.URL.Path == "/bindings":
+			w.Write([]byte(`{"code":0,"data":{"list":[],"total":0}}`))
+		case r.Method == "POST":
+			var body struct {
+				Codes []string `json:"codes"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			if r.URL.Path == "/bindings/batch" {
+				f.removed.Add(int32(len(body.Codes)))
+				w.Write([]byte(`{"code":0,"data":{"affected":1}}`))
+			} else {
+				f.added.Add(1)
+				results := []map[string]any{}
+				for _, u := range body.Codes {
+					results = append(results, map[string]any{"code": u, "ok": true})
+				}
+				json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"results": results}})
+			}
 		default:
 			http.NotFound(w, r)
 		}

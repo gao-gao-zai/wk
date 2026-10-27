@@ -106,7 +106,7 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
   }, [watch, projectsDirty]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!h5Ready) {
-    return <Card title="配置豪猪监控"><Alert showIcon type="info" message="需要豪猪接码配置和 H5 会话" description="在接码平台卡片的豪猪增强功能中保存 H5 会话。" /><Space style={{ marginTop: 16 }}><Button onClick={onConfigure}>去工作台配置豪猪</Button><Button disabled={!watch?.enabled || saving} onClick={async()=>{setSaving(true);try{const r=await api('/admin/account/sms/haozhuma/watch',{method:'PATCH',body:JSON.stringify({enabled:false})});setWatch(r.watch);}catch(e){message.error(e.message);}finally{setSaving(false);}}}>暂停已保存的监控</Button></Space></Card>;
+    return <Card title="配置豪猪监控"><Alert showIcon type="info" message="需要豪猪接码配置和 Web 登录令牌" description="在接码平台卡片的豪猪增强功能中保存 Web 登录令牌。" /><Space style={{ marginTop: 16 }}><Button onClick={onConfigure}>去工作台配置豪猪</Button><Button disabled={!watch?.enabled || saving} onClick={async()=>{setSaving(true);try{const r=await api('/admin/account/sms/haozhuma/watch',{method:'PATCH',body:JSON.stringify({enabled:false})});setWatch(r.watch);}catch(e){message.error(e.message);}finally{setSaving(false);}}}>暂停已保存的监控</Button></Space></Card>;
   }
 
   const available = watch?.available !== false;
@@ -117,7 +117,7 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
           type="warning"
           showIcon
           message="监控不可用"
-          description="需配置豪猪接码账号并粘贴 H5 会话（PHPSESSID）后才能监控对接码市场。"
+          description="需配置豪猪接码账号并粘贴 Web 登录令牌（qs_web_token）后才能监控对接码市场。"
         />
       </Card>
     );
