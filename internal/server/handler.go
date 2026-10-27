@@ -32,6 +32,7 @@ import (
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/haozhumah5"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/promptguard"
 	"workbuddy2api/internal/reqproxy"
 	"workbuddy2api/internal/responsehistory"
 	"workbuddy2api/internal/scheduler"
@@ -43,6 +44,7 @@ import (
 
 // Config handler 依赖。
 type Config struct {
+	PromptGuard      *promptguard.Manager
 	Traffic          *traffic.Tracker
 	Pool             *pool.Pool
 	Upstream         *upstream.Client
@@ -388,6 +390,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/unlock", h.unlock)
 	h.mux.HandleFunc("GET /admin/config", h.withFrontend(h.adminConfig))
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
+	h.registerPromptGuard()
 	// 分组 + 密钥管理（多密钥体系）。分组存储未启用时端点回 503。
 	h.mux.HandleFunc("GET /admin/groups", h.withFrontend(h.adminGroups))
 	h.mux.HandleFunc("POST /admin/groups", h.withFrontend(h.adminGroups))
@@ -2745,6 +2748,9 @@ func (h *Handler) applyRuntimeFeatures(features *featuresPatch, billing *billing
 				h.sanitizeHooks.setDSH(*features.DSHCompat)
 			}
 			updated["dsh_compat"] = *features.DSHCompat
+		}
+		if h.cfg.PromptGuard != nil && (features.DSHCompat != nil || features.CodexCompat != nil || features.SanitizeBlacklistFingerprints != nil) {
+			h.cfg.PromptGuard.Invalidate()
 		}
 	}
 	if billing != nil {
@@ -5252,6 +5258,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
+			if h.cfg.PromptGuard != nil && promptguard.IsBlocked(status, respBody) {
+				h.capturePrompt(routeModel, acct.UID, body, bodyDoc)
+			}
 			st.status = status
 			bodyText := string(respBody)
 			kind := upstream.Classify(status, bodyText)
@@ -5282,6 +5291,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			fail(acct.UID)
 			continue
+		}
+		if h.cfg.PromptGuard != nil && rc != nil {
+			rc = &promptErrorReader{ReadCloser: rc, blocked: func() { h.capturePrompt(routeModel, acct.UID, body, bodyDoc) }}
 		}
 		if stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。

@@ -24,6 +24,7 @@ import (
 	"workbuddy2api/internal/haozhumah5"
 	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/promptguard"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/reqproxy"
 	"workbuddy2api/internal/responsehistory"
@@ -456,7 +457,21 @@ func main() {
 		log.Printf("groups: %d 个存量账号已归入 default 分组", n)
 	}
 
+	var promptManager *promptguard.Manager
+	promptSecret := cfg.APIKey
+	if promptSecret == "" {
+		promptSecret = cfg.FrontendPassword
+	}
+	if promptSecret != "" {
+		var err error
+		promptManager, err = promptguard.Open(filepath.Join(filepath.Dir(cfg.StateFile), "prompt-guard.enc"), promptSecret)
+		if err != nil {
+			log.Fatalf("prompt guard: %v", err)
+		}
+		defer promptManager.Close()
+	}
 	h := server.NewHandler(server.Config{
+		PromptGuard:      promptManager,
 		Pool:             p,
 		Upstream:         up,
 		APIKey:           cfg.APIKey,
@@ -660,6 +675,9 @@ func main() {
 		<-ctx.Done()
 		defer close(shutdownDone)
 		p.Flush() // 信号触发：先落盘再做优雅停机
+		if promptManager != nil {
+			promptManager.Close()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)

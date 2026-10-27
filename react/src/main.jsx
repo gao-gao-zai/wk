@@ -11,7 +11,7 @@ import {
   Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import {
-  ApiOutlined, ApartmentOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, GiftOutlined,
+  ApiOutlined, ApartmentOutlined, CheckCircleOutlined, DashboardOutlined, EditOutlined, FileSearchOutlined, GiftOutlined,
   GlobalOutlined, KeyOutlined, ReloadOutlined, SendOutlined, SettingOutlined, TeamOutlined,
   ThunderboltOutlined, CloudServerOutlined, UserAddOutlined,
 } from '@ant-design/icons';
@@ -27,6 +27,7 @@ import TrafficStatistics from './pages/TrafficStatistics';
 import AccountSettingsPage from './pages/AccountSettings';
 import AccountListPage from './pages/AccountList';
 import GrowthTasksPage from './pages/GrowthTasks';
+import PromptGuardPage, { PromptGuardNotice } from './pages/PromptGuard';
 import RequestSummaryNotice from './components/RequestSummaryNotice';
 import { buildRequestQuery, hasRequestSummary, statisticsFromSummary } from './lib/requestStatistics';
 
@@ -55,7 +56,7 @@ const parseHours = value => String(value || '').split(',').map(item => item.trim
 
 // 页面标识。用 hash 路由（#/auto-enroll）而不是给每页单独打包：
 // 刷新能停在原页、地址可收藏转发，且不引入 react-router 依赖。
-const SECTIONS = ['dashboard', 'traffic', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'reqproxy', 'groups', 'growth', 'settings'];
+const SECTIONS = ['dashboard', 'traffic', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'reqproxy', 'groups', 'growth', 'prompt-guard', 'settings'];
 
 // sectionFromHash 读取地址栏里的页面标识；非法/缺失时回落到仪表盘。
 function sectionFromHash() {
@@ -703,6 +704,7 @@ function Console() {
   ];
   const activeTab = activeSection === 'settings' ? 'admin' : activeSection;
   const pageCopy = {
+    'prompt-guard': ['系统提示词', '配置通用内容替换，记录 11128 拦截，定位触发片段并验证替换结果。'],
 	traffic: ['流量统计', '按全站、账号、API key、账号分组、代理分组和单代理查看 RPM、并发与请求用量。'],
     dashboard: ['运营概览', '账号池、请求量和 token 用量实时汇总，数据每 30 秒自动更新。'],
     pool: ['账号列表', '账号池全量明细：状态、冷却/熔断、积分与凭证有效期，支持搜索和多维筛选。'],
@@ -725,6 +727,7 @@ function Console() {
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
     { key: 'playground', icon: <SendOutlined />, label: '请求测试' },
     { key: 'requests', icon: <FileSearchOutlined />, label: '请求日志' },
+    { key: 'prompt-guard', icon: <EditOutlined />, label: '系统提示词' },
     {
       key: 'accounts-group', icon: <UserAddOutlined />, label: '账号运营',
       type: 'group',
@@ -1081,6 +1084,7 @@ function Console() {
             </Space>
           </Header>
           <Content style={{ padding: 26 }}>
+            {!locked && <PromptGuardNotice api={api} onOpen={() => setActiveSection('prompt-guard')} />}
             <Title level={2} style={{ marginTop: 0 }}>{pageTitle}</Title>
             <Paragraph type="secondary">{pageDescription}</Paragraph>
             {activeSection === 'dashboard' && (
@@ -1149,6 +1153,7 @@ function Console() {
               </>
             )}
             {activeSection === 'requests' && <RequestLogsPage api={api} models={models} accounts={data.accounts || []} />}
+            {activeSection === 'prompt-guard' && !locked && <PromptGuardPage api={api} />}
             {activeSection === 'traffic' && <TrafficStatistics api={api} enabled={!locked} />}
             {activeSection === 'pool' && <AccountListPage api={api} data={data} refresh={refresh} refreshCredits={refreshCredits} creditRefreshing={creditRefreshing} />}
             {activeSection === 'accounts' && <AccountSettingsPage api={api} refresh={refresh} region={config.region} />}

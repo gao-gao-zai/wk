@@ -214,6 +214,9 @@ type apiEnvelope struct {
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
 	HTTP *http.Client
+	// RewriteSystem is installed before serving requests. Its implementation
+	// takes concurrent rule snapshots and only edits system/developer text.
+	RewriteSystem func(map[string]any) error
 
 	// Stream 是流式 chat 请求的时长策略。零值 = 只受调用方 ctx 约束（即不限总时长、
 	// 不检查空闲），对长回答最友好；main 会按配置注入非零值。
@@ -244,6 +247,13 @@ type Client struct {
 	// DialProxy reqproxy 接入钩子（账号级统一路由，见 reqproxy_hook.go）。
 	// nil = 模块关闭，全部直连，行为与旧版逐字节一致。
 	DialProxy DialProxyFunc
+}
+
+type diagnosticContextKey struct{}
+
+// DiagnosticContext keeps error bodies that may echo prompts out of logs.
+func DiagnosticContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, diagnosticContextKey{}, true)
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -282,13 +292,25 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // 返回错误表示请求体无法解码——此时必须拒绝请求而不是原样转发，
 // 否则内容脱敏会被一个畸形 body 绕过（见 ErrUnprocessableBody）。
 func (c *Client) prepareBody(body []byte) ([]byte, error) {
-	return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), c.effortsSnapshot())
+	if c.RewriteSystem == nil || len(body) == 0 {
+		return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), c.effortsSnapshot())
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, ErrUnprocessableBody
+	}
+	return c.prepareBodyFromObj(obj)
 }
 
 // prepareBodyFromObj 是 prepareBody 的免解码入口：server 层在请求入口已经
 // 做过一次全量 map 解码（校验/统计/路由共用），传进来可省掉对大请求体的
 // 第二次 map[string]any 解码。fail-closed 语义与 prepareBody 完全一致。
 func (c *Client) prepareBodyFromObj(obj map[string]any) ([]byte, error) {
+	if obj != nil && c.RewriteSystem != nil {
+		if err := c.RewriteSystem(obj); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrUnprocessableBody, err)
+		}
+	}
 	return PrepareBodyFromMap(obj, c.sanitizeEnabled(), c.effortsSnapshot())
 }
 
@@ -618,8 +640,11 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 		resp.Body.Close()
 		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
-		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
-			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		if diagnostic, _ := ctx.Value(diagnosticContextKey{}).(bool); diagnostic {
+			log.Printf("chat_stream uid=%s: upstream %d %s (prompt diagnostic)", a.UID, resp.StatusCode, kind)
+		} else {
+			log.Printf("chat_stream uid=%s: upstream %d %s body=%s", a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		}
 		return nil, resp.StatusCode, raw, headers, nil
 	}
 	// 交还 body 时把 cancel 挂上：调用方 Close 即释放 ctx（含 Total 定时器）。
