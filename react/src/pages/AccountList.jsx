@@ -108,6 +108,11 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
   const [accountRegionFilter, setAccountRegionFilter] = useState('all');
   // 分组筛选（'all' = 不过滤）。
   const [accountGroupFilter, setAccountGroupFilter] = useState('all');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+  useEffect(() => {
+    setPage(1);
+  }, [accountSearch, accountStatusFilter, accountRegionFilter, accountGroupFilter]);
   // 分组功能：groups 列表来自 /admin/groups；每账号归属来自 /status 的
   // account_groups 快照（一次拉齐，不逐账号 GET）。老后端两个字段都缺时
   // groupList 为 null，分组列与按钮整体隐藏。保留 region 供入组校验展示。
@@ -554,7 +559,19 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
           rowKey="uid"
           columns={columns}
           dataSource={filteredAccounts}
-          pagination={false}
+          // Each row mounts several interactive controls. Keep the DOM bounded
+          // while filtering and sorting still operate on the full account pool.
+          pagination={{
+            current: page,
+            pageSize,
+            showSizeChanger: true,
+            pageSizeOptions: [25, 50, 100],
+            showTotal: total => `共 ${total} 个账号`,
+            onChange: (current, size) => {
+              setPage(size === pageSize ? current : 1);
+              setPageSize(size);
+            },
+          }}
           scroll={{ x: 1560 }}
           locale={{ emptyText: (data.total ? '暂无匹配的账号' : '账号池为空') }}
         />
