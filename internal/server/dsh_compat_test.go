@@ -33,8 +33,8 @@ func TestAdminDSHCompatTogglePersistenceAndOutbound(t *testing.T) {
 	h.cfg.Upstream = up
 	h.cfg.Pool = testPoolWith(&auth.Auth{UID: "u1", AccessToken: "fake", ExpiresAt: 9999999999})
 	h.sanitizeHooks.setDSH = upstream.SetDSHCompat
-	const original = "You are an AI agent powered by DeepSeek Harness.\nYou are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI."
-	const rewritten = "You are an AI agent running on DeepSeek Harness.\nYou are communicating with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI."
+	const original = "You are an AI agent powered by DeepSeek Harness.\nYou are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI.\nTokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host."
+	const rewritten = "You are an AI agent running on DeepSeek Harness.\nYou are communicating with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI.\nPaths explicitly referenced by the user are prefixed with @. Resolve relative paths from the workspace root; absolute paths refer to files or directories on the host."
 	for _, enabled := range []bool{true, false} {
 		out := doAdminConfig(t, h, http.MethodPost, map[string]any{"checkin_hours": []int{9}, "keepalive_hours": []int{22}, "features": map[string]any{"dsh_compat": enabled}})
 		if out["updated"].(map[string]any)["dsh_compat"] != enabled {

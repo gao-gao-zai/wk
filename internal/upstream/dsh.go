@@ -5,13 +5,15 @@ import (
 	"sync/atomic"
 )
 
-// DSH's fixed identity and Web GUI instructions can trigger channel verification.
+// DSH's fixed identity, Web GUI, and path instructions can trigger channel verification.
 // Rewrite these exact system-prompt templates while retaining their meaning.
 const (
 	dshIdentityOriginal  = "You are an AI agent powered by DeepSeek Harness"
 	dshIdentityRewritten = "You are an AI agent running on DeepSeek Harness"
 	dshGUIOriginal       = "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI."
 	dshGUIRewritten      = "You are communicating with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI."
+	dshPathsOriginal     = "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host."
+	dshPathsRewritten    = "Paths explicitly referenced by the user are prefixed with @. Resolve relative paths from the workspace root; absolute paths refer to files or directories on the host."
 )
 
 var dshCompatEnabled atomic.Bool
@@ -21,6 +23,7 @@ func SetDSHCompat(enabled bool) { dshCompatEnabled.Store(enabled) }
 
 func rewriteDSHPromptText(text string) string {
 	text = strings.ReplaceAll(text, dshGUIOriginal, dshGUIRewritten)
+	text = strings.ReplaceAll(text, dshPathsOriginal, dshPathsRewritten)
 	var out strings.Builder
 	pos, written := 0, 0
 	for pos < len(text) {
