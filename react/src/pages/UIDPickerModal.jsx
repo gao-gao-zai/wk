@@ -14,7 +14,7 @@ const { Text } = Typography;
  * （市场挂牌 ≠ 拥有）。已加入的行标绿；未加入的勾选后在外层保存时同步加入。
  * 取消勾选并保存 → 上层 diff 后自动从账户移出（type=41）。
  */
-export default function UIDPickerModal({ open, onClose, uidItems, loading, selectedUids, onConfirm, api }) {
+export default function UIDPickerModal({ open, onClose, uidItems, loading, selectedUids, onConfirm, api, error = '' }) {
   const [keyword, setKeyword] = useState('');
   const [sorter, setSorter] = useState('default');
   const [mySet, setMySet] = useState(null); // Set<string> 已加入账户的码；null=未加载
@@ -166,11 +166,11 @@ export default function UIDPickerModal({ open, onClose, uidItems, loading, selec
       width={1000}
       styles={{ body: { paddingTop: 12 } }}
       footer={
-        <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Text type="secondary" style={{ fontSize: 12 }}>
+        <div style={{ display: 'flex', gap: 12, justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap' }}>
+          <Text type="secondary" style={{ fontSize: 12, flex: '1 1 320px' }}>
             勾选多个组成轮换池：取号逐个轮着用，失效自动移出。官方 API 只认<b>已加入</b>账户的码（绿色）——这里只更新草稿；点击外层「保存高级设置」才会同步到账户。
           </Text>
-          <Space>
+          <Space style={{ marginLeft: 'auto' }}>
             <Button onClick={onClose}>取消</Button>
             <Button type="primary" loading={adding} disabled={!dirty && mySet == null} onClick={confirm}>
               {mySet && checked.filter(u => !mySet.has(u)).length > 0
@@ -178,9 +178,10 @@ export default function UIDPickerModal({ open, onClose, uidItems, loading, selec
                 : `确定（${checked.length} 个）`}
             </Button>
           </Space>
-        </Space>
+        </div>
       }
     >
+      {error && <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} />}
       <Space style={{ width: '100%', marginBottom: 8 }} direction="vertical" size={6}>
         <Space.Compact style={{ width: '100%' }}>
           <Input
@@ -210,6 +211,7 @@ export default function UIDPickerModal({ open, onClose, uidItems, loading, selec
             columns={columns}
             dataSource={sorted}
             pagination={false}
+            scroll={{ x: 760 }}
             rowClassName={u => (checkedSet.has(u.uid) ? 'uid-row-picked' : (mySet != null && mySet.has(u.uid) ? 'uid-row-mine' : ''))}
             onRow={u => ({
               onClick: () => toggle(u.uid),

@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Alert, Button, Card, Checkbox, Collapse, InputNumber, Popconfirm, Progress, Select, Space, Tabs, Tag, Typography, message } from 'antd';
-import { PlayCircleOutlined, PauseCircleOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons';
+import { PlayCircleOutlined, PauseCircleOutlined, ReloadOutlined, SearchOutlined, SettingOutlined } from '@ant-design/icons';
 import AutoEnrollAdvanced from './AutoEnrollAdvanced';
 import WatchCard from './WatchCard';
 import SMSPlatforms from './SMSPlatforms';
@@ -27,6 +27,8 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
   const [groupOptions, setGroupOptions] = useState([]);
   const [groupError, setGroupError] = useState('');
   const [advanced, setAdvanced] = useState(null);
+  const [initialPicker, setInitialPicker] = useState(null);
+  const h5Ready = hz.h5?.has === true && hz.h5?.expired !== true;
   const [follow, setFollow] = useState(true);
   const poller = useRef(null);
   const logBox = useRef(null);
@@ -92,6 +94,15 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
           <div className="enroll-muted enroll-field-wide">平台网络故障的重试可能延长等待时间。费用按供应商结算规则计算，账号注册失败不代表短信免费。</div>
         </div> }]} />
         </> : <div className="enroll-settings-note">本批目标 {progress.want} 个账号 · {platformNames[status?.provider] || '自动选择'} · 并发 {status?.workers || workers}<div className="enroll-muted" style={{ marginTop: 8 }}>参数已锁定，下方可查看进度和日志。停止后可创建下一批任务。</div></div>}
+        <div className="enroll-settings-note" style={{ marginTop: 20, marginBottom: 0 }}>
+          <Space wrap size={[12, 8]}>
+            <Text strong>豪猪对接码</Text>
+            <Text type="secondary">{hz.sid ? `项目 ${hz.sid}` : '尚未选择项目'} · {(hz.uids || []).length ? `轮换池 ${(hz.uids || []).length} 个码` : hz.uid ? '已指定单码' : '平台自动分配'}</Text>
+            <Button aria-label="搜索对接码" icon={<SearchOutlined />} disabled={!!busy || !loaded || !h5Ready} onClick={() => { setInitialPicker('uids'); setAdvanced('haozhuma'); }}>搜索对接码</Button>
+            <Button type="link" disabled={!!busy || !loaded} onClick={() => setAdvanced('haozhuma')}>项目与取号设置</Button>
+          </Space>
+          <div className="enroll-muted" style={{ marginTop: 8 }}>{!h5Ready ? '搜索需要有效的豪猪 H5 会话，请在右侧「豪猪 · 配置 → 豪猪增强功能」中保存会话；也可进入项目与取号设置手动填码。' : '按码、运营商或省份筛选，查看价格与库存。选择只回填草稿，保存后才生效；仅作用于豪猪。'}</div>
+        </div>
         <div className="enroll-actions">
           <Button aria-label="开始加号" type="primary" icon={<PlayCircleOutlined />} loading={starting} disabled={!!busy || !loaded || !!statusError || (!ready.haozhuma && !ready.ecode)} onClick={start}>开始加号</Button>
           <Button aria-label={status?.source === 'monitor' ? '暂停监控并停止本批' : '停止本批'} danger icon={<PauseCircleOutlined />} loading={stopping} disabled={!status?.running || status?.stopping} onClick={stop}>{status?.source === 'monitor' ? '暂停监控并停止本批' : '停止本批'}</Button>
@@ -128,6 +139,6 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
       { key: 'manual', label: '加号工作台', children: <Space direction="vertical" size={20} style={{ width: '100%' }}>{taskCard}</Space> },
       { key: 'monitor', label: '豪猪自动监控', children: <><Alert className="enroll-monitor-note" showIcon type="info" message="监控按计划自动加号，与手动任务共用执行队列" description="这里的预算是本地预估支出上限，不是给豪猪充值。费用以供应商账单为准。" /><WatchCard api={api} h5Ready={!!hz.h5?.has && !hz.h5?.expired} onConfigure={() => setTab('manual')} /></> },
     ]} />
-    <AutoEnrollAdvanced open={!!advanced} provider={advanced} onClose={() => setAdvanced(null)} api={api} config={config} running={!!busy} onSaveSettings={saveAdvanced} />
+    <AutoEnrollAdvanced open={!!advanced} provider={advanced} initialPicker={initialPicker} onClose={() => { setAdvanced(null); setInitialPicker(null); }} api={api} config={config} running={!!busy} onSaveSettings={saveAdvanced} />
   </div>;
 }

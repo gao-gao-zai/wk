@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Alert, Button, Divider, Drawer, Form, Input, InputNumber, message, Modal, Popconfirm, Select, Space, Tag, Typography,
 } from 'antd';
@@ -27,7 +27,7 @@ const DEFAULTS = { min_balance: 2.2, consecutive_fails: 15, retry_delay_seconds:
  *
  * 保存时只提交差异字段，项目与任务保护使用同一个配置请求。
  */
-export default function AutoEnrollAdvanced({ open, onClose, api, config, running, onSaveSettings, provider = 'haozhuma' }) {
+export default function AutoEnrollAdvanced({ open, onClose, api, config, running, onSaveSettings, provider = 'haozhuma', initialPicker = null }) {
   const [form] = Form.useForm();
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -53,42 +53,36 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
   const [uidLoading, setUidLoading] = useState(false);
   const [uidError, setUidError] = useState('');
 
-  // 选中项目后加载对接码列表。参数是数字项目 ID（表单值）。
-  const loadUIDs = async (projectId) => {
+  const uidRequest = useRef(0);
+  // 只接收当前项目的最新请求，关闭窗口后不再覆盖新打开的列表。
+  const loadUIDs = async (projectId, knownHex) => {
     if (!h5Ready || !projectId) return;
-    const hexSid = hexSidMap[projectId];
-    if (!hexSid) {
-      // 没有映射（手填的项目 ID / 映射丢失）：先搜索该 ID 拿 hex sid。
-      try {
-        const resp = await api(`/admin/account/sms/haozhuma/projects?q=${encodeURIComponent(projectId)}`);
-        const hit = (resp.projects || []).find(p => p.project_id === projectId);
-        if (!hit) { setUidItems(null); return; }
-        setHexSidMap(current => ({ ...current, [projectId]: hit.sid }));
-        loadUIDsByHex(hit.sid);
-      } catch {
-        setUidItems(null); // 搜不到就保持手填
-      }
-      return;
-    }
-    loadUIDsByHex(hexSid);
-  };
-
-  const loadUIDsByHex = async (hexSid) => {
+    const request = ++uidRequest.current;
     setUidLoading(true);
     setUidError('');
     try {
+      let hexSid = knownHex || hexSidMap[projectId];
+      if (!hexSid) {
+        const resp = await api(`/admin/account/sms/haozhuma/projects?q=${encodeURIComponent(projectId)}`);
+        if (request !== uidRequest.current) return;
+        const hit = (resp.projects || []).find(p => p.project_id === projectId);
+        if (!hit) throw new Error('没有找到当前项目，请先点击「搜索项目」选择项目');
+        hexSid = hit.sid;
+        setHexSidMap(current => ({ ...current, [projectId]: hexSid }));
+      }
       const resp = await api(`/admin/account/sms/haozhuma/uids?sid=${encodeURIComponent(hexSid)}`);
-      setUidItems(resp.uids || []);
+      if (request === uidRequest.current) setUidItems(resp.uids || []);
     } catch (err) {
-      setUidError(err.message);
-      setUidItems(null); // 失败退化为手填
+      if (request === uidRequest.current) { setUidError(err.message); setUidItems(null); }
     } finally {
-      setUidLoading(false);
+      if (request === uidRequest.current) setUidLoading(false);
     }
   };
 
   // 每次打开抽屉都用最新生效值重置表单：不残留上次草稿。
   useEffect(() => {
+    setProjectPickerOpen(false);
+    setUidPickerOpen(false);
     if (open) {
       form.setFieldsValue({
         sid: hz.sid || '',
@@ -105,11 +99,17 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       setHexSidMap({});
       setUidItems(null);
       setUidError('');
+      setUidLoading(false);
+      if (hao && h5Ready && initialPicker === 'uids') {
+        if (hz.sid) setUidPickerOpen(true);
+        else setProjectPickerOpen(true);
+      }
       // 已有 sid 且 H5 可用：自动拉一次对接码列表（内部会先搜索补映射）。
       if (hao && h5Ready && hz.sid) loadUIDs(hz.sid);
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }
-  }, [open, provider]);
+    return () => { uidRequest.current++; };
+  }, [open, provider, initialPicker]);
 
   // 浮窗选中项目：写表单（数字 ID）、记映射（hex sid）、拉对接码列表。
   const handlePickProject = (p) => {
@@ -122,7 +122,8 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
     setDirty(true);
     setUidItems(null);
     setUidError('');
-    loadUIDsByHex(p.sid);
+    loadUIDs(p.project_id, p.sid);
+    if (initialPicker === 'uids') setUidPickerOpen(true);
   };
 
   const handleClose = () => {
@@ -239,8 +240,8 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           message={h5.expired ? 'H5 会话已失效，选择器退化为手填' : '未配置 H5 会话，项目/对接码为手填模式'}
           description={
             h5.expired
-              ? '到「自动加号 → 鉴权与增强设置」重新粘贴 PHPSESSID 后，这里会升级为搜索选择。'
-              : '在「自动加号 → 鉴权与增强设置」粘贴 PHPSESSID 后，这里会升级为带价格/库存的项目搜索与对接码选择。'
+              ? '到主页面「豪猪 · 配置 → 豪猪增强功能」重新粘贴 PHPSESSID 后，这里会升级为搜索选择。'
+              : '在主页面「豪猪 · 配置 → 豪猪增强功能」粘贴 PHPSESSID 后，这里会升级为带价格/库存的项目搜索与对接码选择。'
           }
         />
       )}
@@ -255,6 +256,8 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           setDirty(true);
           // 项目切换后重新拉对接码列表（H5 可用时）。
           if (changed.sid !== undefined && h5Ready) {
+            uidRequest.current++;
+            setUidLoading(false);
             setUidItems(null);
             setUidError('');
             if (changed.sid) loadUIDs(changed.sid);
@@ -411,6 +414,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
         open={uidPickerOpen}
         onClose={() => setUidPickerOpen(false)}
         uidItems={uidItems}
+        error={uidError}
         loading={uidLoading}
         selectedUids={form.getFieldValue('uids') || []}
         api={api}
