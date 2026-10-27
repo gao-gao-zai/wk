@@ -254,6 +254,10 @@ func (s *watcherState) clone() watcherState {
 // 也在循环 goroutine 里同步等待完成——等待期间不会再拉表（本来也不该），
 // 也不会错过停止信号（select ctx.Done / 任务完成）。
 type UIDWatcher struct {
+	configGeneration uint64
+	configured       func() bool
+	prepare          func(context.Context) error
+
 	// en 派活对象（复用 AutoEnroller 全部加号链路）。
 	en *AutoEnroller
 	// h5 拉码表/加码（强依赖：H5 未配置时 watcher 无法工作）。
@@ -335,16 +339,19 @@ func (w *UIDWatcher) Run(ctx context.Context) {
 		return
 	}
 	w.mu.Lock()
-	cfg := w.cfg
-	running := w.loopRunning
-	w.loopRunning = true
-	w.mu.Unlock()
-	if running {
+	if w.loopRunning {
+		w.mu.Unlock()
 		return // 已有一个循环（main 启动 + Reconfigure 热启动的双保险）
 	}
+	// 配置快照和通知通道同时发布，避免 Reconfigure 在启动间隙丢失开启信号。
+	cfg := w.cfg
+	reload := make(chan struct{}, 1)
+	w.loopRunning, w.reloadCh = true, reload
+	w.mu.Unlock()
 	defer func() {
 		w.mu.Lock()
 		w.loopRunning = false
+		w.reloadCh = nil
 		w.mu.Unlock()
 	}()
 
@@ -352,18 +359,6 @@ func (w *UIDWatcher) Run(ctx context.Context) {
 	interval := cfg.interval()
 	ticker = time.NewTicker(interval)
 	defer ticker.Stop()
-
-	// reload 通道：Reconfigure 换配置后通知循环重建 ticker。存进
-	// w.reloadCh，Reconfigure 在 Run 未启动时安全调（nil 检查）。
-	reload := make(chan struct{}, 1)
-	w.mu.Lock()
-	w.reloadCh = reload
-	w.mu.Unlock()
-	defer func() {
-		w.mu.Lock()
-		w.reloadCh = nil
-		w.mu.Unlock()
-	}()
 
 	if cfg.Enabled && len(cfg.Projects) > 0 {
 		w.log("监控启动：%d 个项目，间隔 %s，额度余 ¥%.2f",
@@ -449,6 +444,7 @@ func (w *UIDWatcher) Reconfigure(cfg WatchConfig) {
 	w.mu.Lock()
 	prev := w.cfg
 	w.cfg = cfg
+	w.configGeneration++
 	ch := w.reloadCh
 	w.mu.Unlock()
 	if ch != nil {
@@ -527,6 +523,9 @@ type WatchDaySummary struct {
 // Status 当前配置 + 状态 + 日志 + 事件流水 + 今日汇总。
 func (w *UIDWatcher) Status() WatchStatus {
 	available := w.h5 != nil && w.en != nil && w.en.HasHaozhuma()
+	if w.configured != nil {
+		available = w.h5 != nil && w.en != nil && w.configured()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	st := WatchStatus{
@@ -624,6 +623,20 @@ func (w *UIDWatcher) AddBudget(add float64, set *float64) (float64, error) {
 // 在 Run 的 goroutine 里串行执行，天然无并发问题（state 读写仍走锁，
 // 因为 AddBudget/Status 会并发进来）。
 func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
+	w.mu.Lock()
+	generation := w.configGeneration
+	w.mu.Unlock()
+	current := func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.configGeneration == generation && ctx.Err() == nil
+	}
+	if w.prepare != nil && w.en != nil && !w.en.Status().Running {
+		if err := w.prepare(ctx); err != nil {
+			w.setPaused("豪猪接码暂不可用：" + err.Error())
+			return
+		}
+	}
 	if w.en == nil || !w.en.HasHaozhuma() {
 		w.setPaused("豪猪接码未配置；E码云自动加号不受影响")
 		return
@@ -768,6 +781,9 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 				return
 			}
 			syncAll(candSkip)
+			if !current() {
+				return
+			}
 			w.executeTrigger(ctx, cfg, targetProj, target, targetCand.price,
 				fmt.Sprintf("持续收割 ¥%.2f（余 %d）", targetCand.price, targetCand.stock))
 			w.clearTransientPause()
@@ -808,6 +824,9 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 	}
 	dispatched := 0
 	for _, c := range candidates[:min(len(candidates), watchMaxPerRound)] {
+		if !current() {
+			return
+		}
 		// 额度判定。不足时：暂停派活，剩余候选基线全部保留（充值后
 		// 事件仍成立）。
 		snap := w.stateSnapshot()
@@ -937,19 +956,15 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	w.mu.Unlock()
 
 	// 2) 快照当前取号参数，切换到触发码。
-	sid, author, singleUID, poolUIDs, isp := w.en.FetchSnapshot()
-	w.en.SetSid(p.Sid)
-	w.en.UpdateFetchOptions(author, "", []string{uid}, isp)
+	restore, err := w.en.borrowMonitorFetch(p.Sid, uid)
+	if err != nil {
+		w.log("任务参数正在使用，跳过本轮")
+		return 0
+	}
 	w.mu.Lock()
 	w.running = true
 	w.mu.Unlock()
-	defer func() {
-		w.en.SetSid(sid)
-		w.en.UpdateFetchOptions(author, singleUID, poolUIDs, isp)
-		w.mu.Lock()
-		w.running = false
-		w.mu.Unlock()
-	}()
+	defer func() { restore(); w.mu.Lock(); w.running = false; w.mu.Unlock() }()
 
 	// 3) 跑任务。AutoRunWith 报"已在进行中"（竞态：手动任务刚启动）时放弃本轮。
 	// 尝试上限收紧为 want×watchAttemptCapFactor（下限 floor）：值班场景
@@ -960,7 +975,16 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	if maxAttempts < watchAttemptCapFloor {
 		maxAttempts = watchAttemptCapFloor
 	}
-	err := w.en.AutoRunWith(AutoRunOptions{
+	affordable := int(w.stateSnapshot().BudgetRemaining / price)
+	if affordable < 1 {
+		w.setPaused("预估预算不足，未创建批次")
+		return 0
+	}
+	if maxAttempts > affordable {
+		maxAttempts = affordable
+	}
+	err = w.en.AutoRunWith(AutoRunOptions{
+		Source:       "monitor",
 		ProviderMode: "haozhuma",
 		Want:         want,
 		Workers:      cfg.workers(),
@@ -985,7 +1009,7 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 			st = w.en.Status()
 			if st.Running {
 				// 还在跑：用当前成功数记账（保守），标记状态。
-				w.charge(uid, price, st.OK, st.StopReason)
+				w.chargeReceived(uid, price, st.OK, st.MessagesReceived, st.StopReason)
 				w.recordEvent(p, uid, ev, price, want, start, st.OK, st.StopReason)
 				return st.OK
 			}
@@ -994,13 +1018,13 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 		}
 	}
 	st := w.en.Status()
-	w.charge(uid, price, st.OK, st.StopReason)
+	w.chargeReceived(uid, price, st.OK, st.MessagesReceived, st.StopReason)
 	w.recordEvent(p, uid, ev, price, want, start, st.OK, st.StopReason)
 
 	// 差码处理：一轮下来 0 成功（典型 = 给出号收不到码）→ 冷却 +
 	// 从豪猪账户移除。冷却不是拉黑（24h 后自动恢复，真补了好库存仍能
 	// 触发补货事件再次被用），但不会每轮在同一个差码上浪费额度和时间。
-	if st.OK == 0 {
+	if st.OK == 0 && st.Received == 0 && st.NoSMS > 0 && st.OtherErrors == 0 && !st.ManualStop {
 		w.markBadUID(ctx, uid, st.StopReason)
 	}
 	return st.OK
@@ -1019,7 +1043,7 @@ func (w *UIDWatcher) recordEvent(p WatchProject, uid, ev string, price float64, 
 		Price:    price,
 		Want:     want,
 		OK:       ok,
-		Cost:     round2(price * float64(ok)),
+		Cost:     round2(price * float64(w.en.Status().MessagesReceived)),
 		Duration: int(now.Sub(start).Round(time.Second).Seconds()),
 		Note:     stopReason,
 	}
@@ -1060,11 +1084,15 @@ func (w *UIDWatcher) markBadUID(ctx context.Context, uid, stopReason string) {
 // 触发计数（TriggerTotal）在派活时就已入账——全失败的轮也要算"触发过"，
 // 否则统计低估值班员的活跃度。
 func (w *UIDWatcher) charge(uid string, price float64, ok int, stopReason string) {
-	if ok <= 0 {
-		w.log("本轮加号未成功（%s）：不扣额度", stopReason)
+	w.chargeReceived(uid, price, ok, ok, stopReason)
+}
+
+func (w *UIDWatcher) chargeReceived(uid string, price float64, ok, received int, stopReason string) {
+	if received <= 0 {
+		w.log("本轮未收到验证码（%s）：未计入预估接码支出", stopReason)
 		return
 	}
-	cost := round2(price * float64(ok))
+	cost := round2(price * float64(received))
 	w.mu.Lock()
 	w.state.BudgetRemaining = round2(w.state.BudgetRemaining - cost)
 	w.state.SpentTotal = round2(w.state.SpentTotal + cost)
@@ -1074,7 +1102,7 @@ func (w *UIDWatcher) charge(uid string, price float64, ok int, stopReason string
 	}
 	w.mu.Unlock()
 	w.persist()
-	w.log("完成：%d 个号（%s）花费 ¥%.2f，额度余 ¥%.2f", ok, uid, cost, w.stateSnapshot().BudgetRemaining)
+	w.log("完成：%d 个号（%s）预估接码费用 ¥%.2f，预算余 ¥%.2f", ok, uid, cost, w.stateSnapshot().BudgetRemaining)
 	if stopReason != "" {
 		w.log("任务提前结束：%s", stopReason)
 	}

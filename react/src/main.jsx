@@ -18,6 +18,7 @@ import {
 import 'antd/dist/reset.css';
 import './theme.css';
 import AutoEnrollPage from './pages/AutoEnroll';
+import { mergeSavedConfig } from './lib/autoEnroll';
 import GroupsAndKeysPage from './pages/GroupsAndKeys';
 import ProxyPoolPage from './pages/ProxyPool';
 import ReqProxyPage from './pages/ReqProxy';
@@ -430,12 +431,9 @@ function Console() {
           sms: { haozhuma: patch },
         }),
       });
-      // 本地乐观合并：sid/author/uid/isp 直写；user/pass/token 是凭据，
-      // 只在后端回显里体现，这里不往 config 里塞草稿值。
-      setConfig(current => ({
-        ...current,
-        sms: { haozhuma: { ...(current.sms?.haozhuma || {}), ...patch } },
-      }));
+      // 只接收服务端脱敏后的配置，禁止把凭据草稿放进全局状态。
+      const saved = await api('/admin/config');
+      setConfig(current => mergeSavedConfig(current, saved));
       return result;
     } catch (error) {
       message.error(error.message);
@@ -712,7 +710,7 @@ function Console() {
     playground: ['请求测试', '发送 Responses API 请求并查看标准化的 output_text。'],
     requests: ['请求日志', '按时间、模型、状态、错误码、端点、账号、版本、首字耗时和请求 ID 筛选历史请求。'],
     accounts: ['账号配置', '添加与授权账号：OAuth 登录链接、短信直登，以及账号池区域信息。'],
-    'auto-enroll': ['自动加号', '接码平台（豪猪/E码云双平台）批量添加中国区账号：取号 → 发码 → 收码 → 自动落盘，全程免浏览器。'],
+    'auto-enroll': ['自动加号', '分别配置接码平台，按批次执行并集中查看进度；豪猪自动监控独立管理。'],
     proxy: ['注册代理', '短信直登链路的出口代理（旧模块）：池内容量、冷却状态。'],
     reqproxy: ['请求代理', '实际请求账号的代理池：v2rayN 订阅与多协议节点导入、按规则筛选、账号与槽位绑定，全部在此管理。'],
     groups: ['分组与密钥', '账号分组与 API 密钥管理：分组密钥只能使用绑定分组的账号；管理员密钥不受限。'],
@@ -1050,7 +1048,7 @@ function Console() {
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-        <Sider breakpoint="lg" collapsedWidth="0">
+        <Sider breakpoint="lg" collapsedWidth="0" zeroWidthTriggerStyle={{ top: 16 }}>
           <div style={{ color: '#172033', fontSize: 18, fontWeight: 700, padding: '22px 20px' }}>WorkBuddy<span style={{ color: '#356ae6' }}>2API</span></div>
           <Menu theme="light" mode="inline" selectedKeys={[activeSection]} items={menuItems} onClick={({ key }) => setActiveSection(key)} />
         </Sider>
@@ -1072,8 +1070,8 @@ function Console() {
               })()}
             </Space>
             <Space>
-              <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
-              <Button icon={<KeyOutlined />} onClick={() => {
+              <Button aria-label="刷新控制台" icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
+              <Button aria-label="设置 API Key" icon={<KeyOutlined />} onClick={() => {
                 // setApiKey 已经足够；不再写 sessionStorage（HIGH-006）。
                 const key = window.prompt('API Key（仅保留在当前页面内存中，刷新后需重新输入）', apiKey);
                 if (key !== null) {

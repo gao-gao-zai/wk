@@ -30,6 +30,13 @@ import (
 //   - 连续失败达到熔断阈值（通道或接收率崩了，继续跑也不会有结果）
 //   - token 失效：自动重登一次，重登后仍失败则终止
 type AutoEnroller struct {
+	runBillable                           int
+	runSupplierCounts                     map[string]int
+	runWant                               int
+	runProvider, runSource                string
+	runReceived, runNoSMS, runOtherErrors int
+	manualStop, fetchLease                bool
+
 	sms *smslogin.Manager
 	hzm *haozhuma.Client
 	// sid 豪猪项目 ID。运行时可改（SetSid）：换对接项目不停服。
@@ -196,6 +203,18 @@ func normalizeRunGroups(in []string) []string {
 }
 
 type AutoEnrollStatus struct {
+	SupplierCounts   map[string]int `json:"supplier_counts"`
+	MessagesReceived int            `json:"messages_received"`
+	Want             int            `json:"want"`
+	Provider         string         `json:"provider"`
+	Source           string         `json:"source"`
+	Groups           []string       `json:"groups"`
+	Received         int            `json:"received"`
+	NoSMS            int            `json:"no_sms"`
+	OtherErrors      int            `json:"other_errors"`
+	ManualStop       bool           `json:"stopping"`
+	ConfigBusy       bool           `json:"config_busy"`
+
 	Running    bool     `json:"running"`
 	Attempts   int      `json:"attempts"`
 	OK         int      `json:"ok"`
@@ -383,7 +402,13 @@ func (a *AutoEnroller) logf(format string, args ...any) {
 func (a *AutoEnroller) Status() AutoEnrollStatus {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	counts := map[string]int{}
+	for k, v := range a.runSupplierCounts {
+		counts[k] = v
+	}
 	return AutoEnrollStatus{
+		SupplierCounts: counts, MessagesReceived: a.runBillable,
+		Want: a.runWant, Provider: a.runProvider, Source: a.runSource, Groups: append([]string(nil), a.runGroups...), Received: a.runReceived, NoSMS: a.runNoSMS, OtherErrors: a.runOtherErrors, ManualStop: a.manualStop, ConfigBusy: a.fetchLease,
 		Running:     a.running,
 		Attempts:    a.attempts,
 		OK:          a.ok,
@@ -518,6 +543,9 @@ func (a *AutoEnroller) FetchSnapshot() (sid, author, uid string, uids []string, 
 // 零值成员一律取默认值，所以调用方只填用户显式给的部分即可——这样新增参数
 // 不会打破既有调用点。
 type AutoRunOptions struct {
+	Client *haozhuma.Client
+	Source string
+
 	ProviderMode string
 	// Want 目标成功数（必填，>0）。
 	Want int
@@ -569,25 +597,44 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 		limit = maxAttemptsLimit
 	}
 	a.mu.Lock()
-	if a.running {
+	if a.running || (a.fetchLease && opts.Source != "monitor") || (opts.Client != nil && len(a.held) > 0) {
 		a.mu.Unlock()
 		return errors.New("自动加号已在进行中")
 	}
-	if a.hzm == nil {
+	target := a.hzm
+	if opts.Client != nil {
+		target = opts.Client
+	}
+	if target == nil {
 		a.mu.Unlock()
 		return errors.New("接码客户端未配置")
 	}
-	if err := a.hzm.ValidateMode(opts.ProviderMode); err != nil {
+	if err := target.ValidateMode(opts.ProviderMode); err != nil {
 		a.mu.Unlock()
 		return err
 	}
 	// 快照本次启动检查用的阈值（SetLimits 运行中热改只影响后续轮次）。
 	minBalance := a.minBalance
 	// 开跑前先看余额：不够一次成功就别启动，省得用户以为在跑其实取不到号。
-	if bal, err := a.hzm.Balance(haozhuma.WithMode(context.Background(), opts.ProviderMode)); err == nil && bal >= 0 && bal < minBalance {
+	if bal, err := target.Balance(haozhuma.WithMode(context.Background(), opts.ProviderMode)); err == nil && bal >= 0 && bal < minBalance {
 		a.mu.Unlock()
 		return fmt.Errorf("接码平台余额不足（当前 %.2f 元，低于阈值 %.2f 元），请充值后再启动", bal, minBalance)
 	}
+	a.hzm = target
+	if opts.Client != nil {
+		a.sid = target.Project()
+	}
+	a.runWant, a.runProvider, a.runSource = n, opts.ProviderMode, opts.Source
+	if a.runProvider == "" {
+		a.runProvider = target.Mode()
+	}
+	if a.runSource == "" {
+		a.runSource = "manual"
+	}
+	a.runReceived, a.runNoSMS, a.runOtherErrors = 0, 0, 0
+	a.manualStop = false
+	a.runSupplierCounts = map[string]int{}
+	a.runBillable = 0
 	a.running = true
 	a.attempts = 0
 	a.ok = 0
@@ -663,6 +710,7 @@ func (a *AutoEnroller) Stop(reason string) bool {
 		reason = "用户手动停止"
 	}
 	a.cancel()
+	a.manualStop = true
 	// 记下来是为了让前端在轮询里看到"为什么停了"；run 返回时若已有
 	// 更具体的原因会覆盖它（setStop 只写非空值）。
 	if a.stopReason == "" {
@@ -791,6 +839,13 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 				}
 
 				a.mu.Lock()
+				if !ok && err != nil {
+					if errors.Is(err, ErrNoSMS) {
+						a.runNoSMS++
+					} else {
+						a.runOtherErrors++
+					}
+				}
 				a.attempts++
 				if ok {
 					a.ok++
@@ -1298,6 +1353,16 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 	}
 	// 从这里开始，号码已经被占用，任何退出路径都要计入消耗。
 	usedPhone = true
+	a.mu.Lock()
+	if a.runSupplierCounts == nil {
+		a.runSupplierCounts = map[string]int{}
+	}
+	provider := "haozhuma"
+	if isEcode {
+		provider = "ecode"
+	}
+	a.runSupplierCounts[provider]++
+	a.mu.Unlock()
 	// 记进账本：任务收尾时会按它兜底释放，保证不会把号留在豪猪那边占额度。
 	a.trackHeld(phone)
 	// 对接码池自动生命周期：GetPhone 已把失效的码移出轮换池（drained），
@@ -1388,6 +1453,9 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 
 	// 5) 验码（Verify 内部走完整 12 步并落凭据）。
 	if waitErr == nil && code != "" {
+		a.mu.Lock()
+		a.runReceived++
+		a.mu.Unlock()
 		creds, verr := a.sms.Verify(ctx, send.SessionID, code)
 		if verr == nil {
 			// 6) 落盘。
@@ -1453,6 +1521,8 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 //
 // "等待"是正常轮询状态（豪猪返回 code=-1 msg=等待短信）——GetMessage 把它
 // 当成功返回空 sms，这里只记轮次。
+var ErrNoSMS = errors.New("验证码等待超时")
+
 func (a *AutoEnroller) pollCode(ctx context.Context, sid, phone string, count int) (string, error) {
 	pollInterval := a.pollInterval
 	if pollInterval <= 0 {
@@ -1475,6 +1545,7 @@ func (a *AutoEnroller) pollCode(ctx context.Context, sid, phone string, count in
 		count = maxPollCount
 	}
 	var polls, temporaryFailures int
+	sawMessage := false
 	for polls < count {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -1512,6 +1583,12 @@ func (a *AutoEnroller) pollCode(ctx context.Context, sid, phone string, count in
 			}
 		}
 		temporaryFailures = 0
+		if strings.TrimSpace(sms) != "" && !sawMessage {
+			a.mu.Lock()
+			a.runBillable++
+			a.mu.Unlock()
+			sawMessage = true
+		}
 		polls++
 		if code := haozhuma.ExtractCode(sms); code != "" {
 			// 诊断日志（本机文件，不脱敏）：完整短信原文 + 提取到的码，
@@ -1534,7 +1611,7 @@ func (a *AutoEnroller) pollCode(ctx context.Context, sid, phone string, count in
 		case <-time.After(pollInterval):
 		}
 	}
-	return "", fmt.Errorf("验证码等待超时（轮询 %d 次未收到短信）", polls)
+	return "", fmt.Errorf("%w（轮询 %d 次未收到短信）", ErrNoSMS, polls)
 }
 
 func shortUID(uid string) string {

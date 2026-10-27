@@ -946,7 +946,7 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 }
 
 func newSMSCodeClient(cfg *Config) *haozhuma.Client {
-	s := cfg.SMS.Haozhuma
+	s := cfg.SMS.Haozhuma.Normalized()
 	if s.Project() == "" || (s.Token == "" && s.User == "") {
 		return nil
 	}

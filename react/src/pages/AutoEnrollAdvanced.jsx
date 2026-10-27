@@ -15,7 +15,7 @@ const DEFAULTS = { min_balance: 2.2, consecutive_fails: 15, retry_delay_seconds:
 /**
  * AutoEnrollAdvanced 自动加号「高级设置」抽屉。
  *
- * 与主页面的"逐项即时保存"相反，这里是**低频批量改统一提交**模式：
+ * 修改统一提交：
  * 所有修改以底部「保存高级设置」为唯一提交点，有脏改动关抽屉先确认。
  *
  * 三组参数：
@@ -25,16 +25,16 @@ const DEFAULTS = { min_balance: 2.2, consecutive_fails: 15, retry_delay_seconds:
  *   - 取号策略：运营商优先级 isp / 对接方标识 author
  *   - 任务控制：余额保护阈值 / 连续失败熔断 / 尝试间隔
  *
- * 保存时 diff：haozhuma 字段与 autoenroll 字段分两个 patch 提交
- * （两次都成功才提示保存成功；失败保留抽屉打开 + 错误常驻顶部）。
+ * 保存时只提交差异字段，项目与任务保护使用同一个配置请求。
  */
-export default function AutoEnrollAdvanced({ open, onClose, api, config, running, onSaveHaozhuma, onSaveAutoEnroll }) {
+export default function AutoEnrollAdvanced({ open, onClose, api, config, running, onSaveSettings, provider = 'haozhuma' }) {
   const [form] = Form.useForm();
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState('');
 
   const hz = config.sms?.haozhuma || {};
+  const hao = provider === 'haozhuma';
   const ae = config.autoenroll || {};
   const h5 = hz.h5 || {};
   const h5Ready = h5.has === true && h5.expired !== true;
@@ -106,10 +106,10 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       setUidItems(null);
       setUidError('');
       // 已有 sid 且 H5 可用：自动拉一次对接码列表（内部会先搜索补映射）。
-      if (h5Ready && hz.sid) loadUIDs(hz.sid);
+      if (hao && h5Ready && hz.sid) loadUIDs(hz.sid);
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }
-  }, [open]);
+  }, [open, provider]);
 
   // 浮窗选中项目：写表单（数字 ID）、记映射（hex sid）、拉对接码列表。
   const handlePickProject = (p) => {
@@ -143,11 +143,13 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
   // 保存：diff 出显式改动的字段分两组提交。未变的字段不发（指针语义，
   // 后端增量合并）。uids（轮换池）数组 diff：排序后比较。
   const save = async () => {
-    const values = await form.validateFields();
+    let values;
+    try { values = await form.validateFields(); } catch { return; }
     setSaving(true);
     setSaveError('');
     try {
       const haozhumaPatch = {};
+      if (hao) {
       if ((values.sid || '') !== (hz.sid || '')) haozhumaPatch.sid = values.sid || '';
       if ((values.uid || '') !== (hz.uid || '')) haozhumaPatch.uid = values.uid || '';
       const uidList = (values.uids || []).map(s => s.trim()).filter(Boolean);
@@ -159,6 +161,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       if (ispJoined !== (hz.isp || '')) haozhumaPatch.isp = ispJoined;
       if ((values.author || '') !== (hz.author || '')) haozhumaPatch.author = values.author || '';
 
+      }
       const aePatch = {};
       const mb = Number(values.min_balance);
       if (mb !== Number(ae.min_balance ?? DEFAULTS.min_balance)) aePatch.min_balance = mb;
@@ -172,19 +175,20 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
         setSaving(false);
         return;
       }
-      const results = [];
-      if (Object.keys(haozhumaPatch).length) results.push(await onSaveHaozhuma?.(haozhumaPatch));
-      if (Object.keys(aePatch).length) results.push(await onSaveAutoEnroll?.(aePatch));
-      if (results.some(r => !r)) {
-        // 具体 message.error 已由 saveHaozhuma/saveAutoEnroll 弹过；这里只
-        // 保持抽屉打开，让用户修正后重试。
-        setSaveError('部分设置保存失败，请检查后重试（未成功的项未生效）');
-        setSaving(false);
+      const body = {
+        ...(Object.keys(haozhumaPatch).length ? {sms:{haozhuma:haozhumaPatch}} : {}),
+        ...(Object.keys(aePatch).length ? {autoenroll:aePatch} : {}),
+      };
+      const result = await onSaveSettings(body);
+      if (result.updated?.uid_sync_errors?.length) {
+        setSaveError('配置已保存，但豪猪账户同步未完成：'+result.updated.uid_sync_errors.join('；'));
         return;
       }
       message.success('高级设置已保存并即时生效');
       setDirty(false);
       onClose();
+    } catch(e) {
+      setSaveError(e.message);
     } finally {
       setSaving(false);
     }
@@ -204,7 +208,6 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
             description="只重置表单（不保存），仍需点「保存高级设置」提交。"
             onConfirm={() => {
               form.setFieldsValue({
-                sid: '', uid: '', uids: [], isp: [], author: '',
                 min_balance: DEFAULTS.min_balance,
                 consecutive_fails: DEFAULTS.consecutive_fails,
                 retry_delay_seconds: DEFAULTS.retry_delay_seconds,
@@ -217,7 +220,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           </Popconfirm>
           <div>
             <Button onClick={handleClose} style={{ marginRight: 8 }}>取消</Button>
-            <Button type="primary" loading={saving} onClick={save} disabled={!dirty}>
+            <Button type="primary" loading={saving} onClick={save} disabled={!dirty || running || saving}>
               保存高级设置
             </Button>
           </div>
@@ -225,10 +228,10 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
       )}
     >
       <Paragraph type="secondary" style={{ marginTop: 0 }}>
-        不常用参数；保存即写入 config.json 并即时生效（新取号立刻用新值，在途号码按旧值收尾）。
+        保护设置统一保存。豪猪项目和对接码仅在任务空闲时修改，避免影响正在进行的接码。
       </Paragraph>
       {saveError && <Alert type="warning" showIcon style={{ marginBottom: 12 }} message={saveError} />}
-      {!h5Ready && (
+      {hao && !h5Ready && (
         <Alert
           type="info"
           showIcon
@@ -244,6 +247,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
 
       <Form
         form={form}
+        disabled={running || saving}
         layout="horizontal"
         labelCol={{ span: 8 }}
         wrapperCol={{ span: 16 }}
@@ -257,6 +261,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           }
         }}
       >
+        {hao && <>
         <Divider orientation="left" plain style={{ margin: '4px 0 12px' }}>项目与对接码</Divider>
         <Form.Item
           label="项目"
@@ -323,7 +328,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
             <>
               <Form.Item name="uids" noStyle>
                 <Select
-                  mode="multiple"
+                  mode="tags"
                   allowClear
                   placeholder="轮换池（从浮窗勾选，也可手动粘贴码）"
                   tokenSeparators={[',', '\n', ' ']}
@@ -368,18 +373,19 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
           <Input allowClear placeholder="留空" />
         </Form.Item>
 
-        <Divider orientation="left" plain style={{ margin: '20px 0 12px' }}>任务控制</Divider>
+        </>}
+        <Divider orientation="left" plain style={{ margin: '20px 0 12px' }}>任务保护</Divider>
         <Form.Item
           name="min_balance"
           label="余额保护阈值"
-          extra="豪猪余额低于此值不再取新号（只在收码成功时扣费，留够一次的钱即可）。0 = 关闭保护——可能收到码却扣不了费。"
+          extra="所选接码平台余额低于此值时停止取新号。0 表示关闭保护；这是余额阈值，不是单号价格。"
         >
           <InputNumber min={0} max={1000} step={0.1} addonAfter="元" style={{ width: '100%' }} />
         </Form.Item>
         <Form.Item
           name="consecutive_fails"
           label="连续失败熔断"
-          extra="连续这么多个号都失败说明通道坏了，及时止损停止任务。失败号不扣费。"
+          extra="连续失败达到阈值时停止任务。验证码已收到但注册失败，也可能产生平台费用。"
         >
           <InputNumber min={1} max={100} addonAfter="次" style={{ width: '100%' }} />
         </Form.Item>
@@ -400,9 +406,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
         onPick={handlePickProject}
       />
 
-      {/* 浮窗式对接码选择器：多选组成轮换池。勾选 → 确定：未加入账户的码
-          自动在豪猪侧加入（官方 API 只认已加入的码）；取消勾选的码在保存
-          配置时由后端 diff 自动移出账户。 */}
+      {/* 选择器仅回填草稿；外层保存时按差异同步账户。 */}
       <UIDPickerModal
         open={uidPickerOpen}
         onClose={() => setUidPickerOpen(false)}

@@ -54,7 +54,7 @@ function CommitInputNumber({ value, onCommit, validate, formatMessage, ...rest }
  *   PUT  /admin/account/sms/haozhuma/watch         整体保存配置
  *   POST /admin/account/sms/haozhuma/watch/budget  充值/重置额度
  */
-export default function WatchCard({ api, h5Ready }) {
+export default function WatchCard({ api, h5Ready, onConfigure }) {
   const [watch, setWatch] = useState(null); // GET /watch 结果
   const [watchError, setWatchError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -63,6 +63,8 @@ export default function WatchCard({ api, h5Ready }) {
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   // 草稿项目列表（编辑中；保存时整体 PUT）。
   const [draftProjects, setDraftProjects] = useState(null);
+  const [draftParams, setDraftParams] = useState({});
+  const [projectsDirty, setProjectsDirty] = useState(false);
   // 分组选项（与手动加号卡片同一接口；加载失败保持禁用+占位）。
   const [groupOptions, setGroupOptions] = useState(null);
   const [groupsFailed, setGroupsFailed] = useState(false);
@@ -90,7 +92,7 @@ export default function WatchCard({ api, h5Ready }) {
     api('/admin/groups')
       .then(body => {
         if (!alive) return;
-        setGroupOptions((body.groups || []).map(g => g.name));
+        setGroupOptions((body.groups || []).filter(g => !g.region || g.region === 'all' || g.region === 'cn').map(g => g.name));
       })
       .catch(() => alive && setGroupsFailed(true));
     return () => { alive = false; };
@@ -98,13 +100,13 @@ export default function WatchCard({ api, h5Ready }) {
 
   // 草稿与服务器同步：打开编辑时（watch 变化且草稿未动）刷新。
   useEffect(() => {
-    if (watch && draftProjects === null) {
+    if (watch && !projectsDirty) {
       setDraftProjects(watch.projects || []);
     }
-  }, [watch]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [watch, projectsDirty]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!h5Ready) {
-    return null; // H5 未配置：整卡隐藏（高级设置里粘贴 PHPSESSID 后出现）
+    return <Card title="配置豪猪监控"><Alert showIcon type="info" message="需要豪猪接码配置和 H5 会话" description="在接码平台卡片的豪猪增强功能中保存 H5 会话。" /><Space style={{ marginTop: 16 }}><Button onClick={onConfigure}>去工作台配置豪猪</Button><Button disabled={!watch?.enabled || saving} onClick={async()=>{setSaving(true);try{const r=await api('/admin/account/sms/haozhuma/watch',{method:'PATCH',body:JSON.stringify({enabled:false})});setWatch(r.watch);}catch(e){message.error(e.message);}finally{setSaving(false);}}}>暂停已保存的监控</Button></Space></Card>;
   }
 
   const available = watch?.available !== false;
@@ -122,8 +124,7 @@ export default function WatchCard({ api, h5Ready }) {
   }
 
   const projects = draftProjects ?? watch?.projects ?? [];
-  const dirty = draftProjects !== null
-    && JSON.stringify(draftProjects) !== JSON.stringify(watch?.projects || []);
+  const dirty = Object.keys(draftParams).length > 0 || (draftProjects !== null && JSON.stringify(draftProjects) !== JSON.stringify(watch?.projects || []));
 
   const paused = !!watch?.paused_reason;
   const running = !!watch?.running;
@@ -147,7 +148,7 @@ export default function WatchCard({ api, h5Ready }) {
       });
       if (!body.ok) throw new Error(body.error || '保存失败');
       setWatch(body.watch);
-      setDraftProjects(null);
+      setDraftProjects(null); setDraftParams({}); setProjectsDirty(false);
       message.success('监控设置已保存并即时生效');
     } catch (err) {
       message.error(`保存失败：${err.message}`);
@@ -157,23 +158,21 @@ export default function WatchCard({ api, h5Ready }) {
   };
 
   const toggleEnabled = async (on) => {
-    if (on && projects.length === 0) {
-      message.warning('先添加至少一个监控项目再开启');
+    if (on && (watch?.projects || []).length === 0) {
+      message.warning('请先保存至少一个监控项目再开启');
       return;
     }
-    await saveParam({ enabled: on });
+    setSaving(true);
+    try {
+      const r = await api('/admin/account/sms/haozhuma/watch', { method:'PATCH', body:JSON.stringify({enabled:on}) });
+      setWatch(r.watch); message.success(on ? '监控已开启，使用已保存配置' : '监控已暂停；当前批次请在工作台单独停止');
+    } catch(e) { message.error(e.message); }
+    finally { setSaving(false); }
   };
 
   // saveParam 用当前配置 + 覆盖项整体保存（参数区控件共用）。
-  const saveParam = (patch) => save({
-    enabled: watch?.enabled || false,
-    interval_seconds: watch?.interval_seconds || 0,
-    want_per_trigger: watch?.want_per_trigger || 1,
-    workers: watch?.workers || 1,
-    groups: watch?.groups || [],
-    projects,
-    ...patch,
-  });
+  const saveParam = patch => setDraftParams(cur => ({...cur,...patch}));
+  const shown = {...watch,...draftParams};
 
   const saveProjects = async () => {
     // 客户端先校验一遍（后端还会再验）：给用户即时反馈。
@@ -188,22 +187,23 @@ export default function WatchCard({ api, h5Ready }) {
       workers: watch?.workers || 1,
       groups: watch?.groups || [],
       projects,
+      ...draftParams,
     });
   };
 
   const addBudget = async () => {
-    if (!(addAmount > 0)) { message.error('充值金额需大于 0'); return; }
+    if (!(addAmount > 0)) { message.error('预算金额需大于 0'); return; }
     setBudgetAdding(true);
     try {
       const body = await api('/admin/account/sms/haozhuma/watch/budget', {
         method: 'POST',
         body: JSON.stringify({ add: addAmount }),
       });
-      if (!body.ok) throw new Error(body.error || '充值失败');
-      message.success(`已充值 ¥${addAmount}，额度恢复为 ¥${body.budget_remaining.toFixed(2)}`);
+      if (!body.ok) throw new Error(body.error || '增加预算失败');
+      message.success(`已增加预估预算 ¥${addAmount}，额度恢复为 ¥${body.budget_remaining.toFixed(2)}`);
       load();
     } catch (err) {
-      message.error(`充值失败：${err.message}`);
+      message.error(`增加预算失败：${err.message}`);
     } finally {
       setBudgetAdding(false);
     }
@@ -224,14 +224,17 @@ export default function WatchCard({ api, h5Ready }) {
   };
 
   const updateProject = (idx, patch) => {
+    setProjectsDirty(true);
     setDraftProjects(cur => (cur || watch?.projects || []).map((p, i) => (i === idx ? { ...p, ...patch } : p)));
   };
 
   const removeProject = (idx) => {
+    setProjectsDirty(true);
     setDraftProjects(cur => (cur || watch?.projects || []).filter((_, i) => i !== idx));
   };
 
   const pickProject = (p) => {
+    setProjectsDirty(true);
     if (!p || !p.project_id || !p.sid) {
       message.warning('该项目缺少数字 ID 或会话标识，无法监控');
       return;
@@ -244,7 +247,7 @@ export default function WatchCard({ api, h5Ready }) {
       min_stock: 5,
       enabled: true,
     }]);
-    message.info('已加入草稿，调好价格/库存后点「保存项目」');
+    message.info('已加入草稿，调好参数后点「保存监控设置」');
   };
 
   const columns = [
@@ -258,7 +261,7 @@ export default function WatchCard({ api, h5Ready }) {
           min={0.01}
           step={0.1}
           value={p.max_price}
-          onChange={v => updateProject(i, { max_price: v })}
+          disabled={saving} onChange={v => updateProject(i, { max_price: v })}
           size="small"
           style={{ width: '100%' }}
         />
@@ -272,7 +275,7 @@ export default function WatchCard({ api, h5Ready }) {
         <InputNumber
           min={1}
           value={p.min_stock}
-          onChange={v => updateProject(i, { min_stock: v })}
+          precision={0} disabled={saving} onChange={v => updateProject(i, { min_stock: v })}
           size="small"
           style={{ width: '100%' }}
         />
@@ -283,7 +286,7 @@ export default function WatchCard({ api, h5Ready }) {
       key: 'enabled',
       width: 70,
       render: (_, p, i) => (
-        <Switch size="small" checked={p.enabled} onChange={v => updateProject(i, { enabled: v })} />
+        <Switch size="small" checked={p.enabled} disabled={saving} onChange={v => updateProject(i, { enabled: v })} />
       ),
     },
     {
@@ -292,7 +295,7 @@ export default function WatchCard({ api, h5Ready }) {
       width: 60,
       render: (_, p, i) => (
         <Popconfirm title="移除该监控项目？" onConfirm={() => removeProject(i)}>
-          <Button size="small" danger type="text">移除</Button>
+          <Button size="small" danger type="text" disabled={saving}>移除</Button>
         </Popconfirm>
       ),
     },
@@ -350,17 +353,17 @@ export default function WatchCard({ api, h5Ready }) {
         {/* 额度 + 统计 */}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24, alignItems: 'center' }}>
           <div>
-            <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>监控额度</Text>
+            <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>剩余预估预算</Text>
             <Text strong style={{ fontSize: 22, color: budget <= 0 ? '#cf1322' : undefined }}>
               ¥{budget.toFixed(2)}
             </Text>
           </div>
           <div>
-            <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>已花费 / 已加号</Text>
+            <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>预估支出 / 已加号</Text>
             <Text style={{ fontSize: 22 }}>¥{spent.toFixed(2)} · {enrolled} 个</Text>
           </div>
           <div>
-            <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>充值</Text>
+            <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>增加预算</Text>
             <Space.Compact>
               <InputNumber
                 min={1}
@@ -369,8 +372,8 @@ export default function WatchCard({ api, h5Ready }) {
                 addonAfter="元"
                 style={{ width: 140 }}
               />
-              <Button type="primary" loading={budgetAdding} onClick={addBudget}>充值</Button>
-              <Popconfirm title="额度清零？（监控会在额度耗尽时暂停）" onConfirm={resetBudget}>
+              <Button type="primary" loading={budgetAdding} onClick={addBudget}>增加预算</Button>
+              <Popconfirm title="清零未来预算？当前已开始的批次不会自动停止。" onConfirm={resetBudget}>
                 <Button danger>清零</Button>
               </Popconfirm>
             </Space.Compact>
@@ -381,16 +384,16 @@ export default function WatchCard({ api, h5Ready }) {
         <Space wrap size={16} align="end">
           <div>
             <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
-              每次触发加号数（1-10，改完回车/点别处生效）
+              每次触发加号数（1-10，编辑后统一保存）
             </Text>
             <CommitInputNumber
               min={1}
               max={10}
-              value={watch?.want_per_trigger || 1}
+              value={shown?.want_per_trigger || 1}
               validate={v => v >= 1 && v <= 10}
               formatMessage={() => '每次触发加号数需在 1-10 之间'}
               onCommit={v => saveParam({ want_per_trigger: v })}
-              style={{ width: 120 }}
+              precision={0} disabled={saving} style={{ width: 120 }}
             />
           </div>
           <div>
@@ -400,11 +403,11 @@ export default function WatchCard({ api, h5Ready }) {
             <CommitInputNumber
               min={0}
               max={3600}
-              value={watch?.interval_seconds || 0}
+              value={shown?.interval_seconds || 0}
               validate={v => v === 0 || (v >= 60 && v <= 3600)}
               formatMessage={() => '拉取间隔需 60-3600 秒（0 = 默认 300）'}
               onCommit={v => saveParam({ interval_seconds: v })}
-              style={{ width: 120 }}
+              precision={0} disabled={saving} style={{ width: 120 }}
             />
           </div>
           <div>
@@ -415,8 +418,8 @@ export default function WatchCard({ api, h5Ready }) {
             </Text>
             <Select
               mode="multiple"
-              value={watch?.groups?.length ? watch.groups : ['default']}
-              onChange={v => saveParam({ groups: v.length ? v : ['default'] })}
+              value={shown?.groups?.length ? shown.groups : ['default']}
+              disabled={saving || groupsFailed} onChange={v => saveParam({ groups: v.length ? v : ['default'] })}
               style={{ minWidth: 200 }}
               placeholder="default"
               loading={!groupOptions && !groupsFailed}
@@ -430,19 +433,19 @@ export default function WatchCard({ api, h5Ready }) {
         {/* 项目列表 */}
         <div>
           <Space style={{ marginBottom: 8 }}>
-            <Button size="small" icon={<PlusOutlined />} onClick={() => setProjectPickerOpen(true)}>
+            <Button size="small" icon={<PlusOutlined />} disabled={saving} onClick={() => setProjectPickerOpen(true)}>
               添加监控项目
             </Button>
             <Button
               size="small"
               type="primary"
-              disabled={!dirty}
+              disabled={!dirty || saving}
               loading={saving}
               onClick={saveProjects}
             >
-              保存项目
+              保存监控设置
             </Button>
-            {dirty && <Text type="warning">有未保存的项目改动</Text>}
+            {dirty && <Text type="warning">有未保存的修改，监控仍使用原配置</Text>}
           </Space>
           {projects.length === 0 ? (
             <Empty

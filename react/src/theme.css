@@ -204,7 +204,7 @@ button, input, textarea, select { font: inherit; }
   .ant-layout-content { padding: 18px !important; }
   .ant-layout-header { padding: 0 16px !important; }
   .ant-layout-header .ant-space { gap: 8px !important; }
-  .ant-layout-header .ant-btn span { display: none; }
+  .ant-layout-header .ant-btn > span:not(.ant-btn-icon) { display: none; }
   .trend-grid { grid-template-columns: 1fr; }
   .trend-layout { align-items: flex-start; flex-direction: column; }
   .sparkline { width: 100%; min-width: 0; }
@@ -231,4 +231,9 @@ button, input, textarea, select { font: inherit; }
 /* 对接码浮窗：已勾选（待入池）的行淡蓝底 */
 .uid-row-picked > td {
   background: #e6f4ff !important;
+}
+
+/* 收起导航后的菜单入口放在顶栏，避免遮挡页面标题。 */
+@media (max-width: 991px) {
+  .ant-layout-header { padding-left: 56px !important; }
 }

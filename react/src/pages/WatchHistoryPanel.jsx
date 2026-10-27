@@ -31,7 +31,7 @@ const fmtDur = (sec) => {
  * 字段（父组件 WatchCard 轮询好传入，这里纯展示，不自己发请求）：
  *   - 今日成果一览（触发/成功/花费/成功率）
  *   - 触发事件流水（倒序，最新在前）：每个码什么时候、因什么事件、
- *     什么价触发，加了几个号、真实花费、耗时、结果（差码冷却会标注）
+ *     什么价触发，加了几个号、预估接码费用、耗时、结果（差码冷却会标注）
  *   - 对接码消耗排行：哪个码贡献最多号、单价如何
  */
 export default function WatchHistoryPanel({ watch }) {
@@ -82,7 +82,7 @@ export default function WatchHistoryPanel({ watch }) {
       ),
     },
     {
-      title: '花费', dataIndex: 'cost', key: 'cost', width: 80, align: 'right',
+      title: '预估费用', dataIndex: 'cost', key: 'cost', width: 80, align: 'right',
       render: c => (c > 0 ? `¥${Number(c).toFixed(2)}` : <Text type="secondary">¥0</Text>),
     },
     { title: '耗时', dataIndex: 'duration', key: 'duration', width: 70, align: 'right', render: fmtDur },
@@ -105,7 +105,7 @@ export default function WatchHistoryPanel({ watch }) {
     { title: '对接码', dataIndex: 'uid', key: 'uid', ellipsis: true },
     { title: '轮数', dataIndex: 'rounds', key: 'rounds', width: 70, align: 'right' },
     { title: '成功加号', dataIndex: 'ok', key: 'ok', width: 90, align: 'right' },
-    { title: '累计花费', key: 'cost', width: 90, align: 'right', render: r => `¥${r.cost.toFixed(2)}` },
+    { title: '累计预估费用', key: 'cost', width: 90, align: 'right', render: r => `¥${r.cost.toFixed(2)}` },
     { title: '最近单价', key: 'lastPrice', width: 90, align: 'right', render: r => `¥${r.lastPrice.toFixed(2)}` },
   ];
 
@@ -138,7 +138,7 @@ export default function WatchHistoryPanel({ watch }) {
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24, marginBottom: 16 }}>
             {stat('今日触发', today.triggers, '轮')}
             {stat('今日成功加号', today.ok, '个')}
-            {stat('今日花费', `¥${Number(today.spent).toFixed(2)}`)}
+            {stat('今日预估费用', `¥${Number(today.spent).toFixed(2)}`)}
             {stat(
               '今日成功率',
               `${today.success_rate}%`,

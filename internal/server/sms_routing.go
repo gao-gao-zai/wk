@@ -39,7 +39,7 @@ func (a *AutoEnroller) ProviderMode() string {
 func (a *AutoEnroller) ApplySMSUpdate(replacement *haozhuma.Client, mode *string, persist func() error) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if replacement != nil && (a.running || len(a.held) > 0) {
+	if replacement != nil && (a.running || a.fetchLease || len(a.held) > 0) {
 		return ErrBusyAuth
 	}
 	target := a.hzm
@@ -93,11 +93,31 @@ func supplierPatchPresent(p *smsPatch) bool {
 		return false
 	}
 	s := p.Haozhuma
-	return s.User != nil || s.Pass != nil || s.Token != nil || s.Provider != nil ||
+	return s.Profile != nil || s.User != nil || s.Pass != nil || s.Token != nil || s.Provider != nil ||
 		s.EcodeBase != nil || s.EcodeKeyword != nil || s.EcodeCardType != nil ||
 		s.EcodeProvince != nil || s.Fallback != nil || s.FallbackBase != nil ||
-		s.FallbackCardType != nil || s.FallbackProvince != nil
+		s.FallbackCardType != nil || s.FallbackProvince != nil || s.FallbackEnabled != nil
 }
+
+// 在更改 provider 前保存旧平台凭据，避免把旧 token 误归到新平台。
+func normalizeSMSDoc(doc map[string]any) {
+	sms, _ := doc["sms"].(map[string]any)
+	if sms == nil {
+		sms = map[string]any{}
+	}
+	hz, _ := sms["haozhuma"].(map[string]any)
+	if hz == nil {
+		hz = map[string]any{}
+	}
+	s := smsSettingsFromDoc(doc).Normalized()
+	hz["credentials"] = s.Credentials
+	hz["user"], hz["pass"], hz["token"] = s.User, s.Pass, s.Token
+	hz["ecode_base"], hz["ecode_card_type"], hz["ecode_province"] = s.EcodeBase, s.EcodeCardType, s.EcodeProvince
+	hz["fallback_base"], hz["fallback_card_type"], hz["fallback_province"] = s.EcodeBase, s.EcodeCardType, s.EcodeProvince
+	hz["fallback"] = s.Fallback
+	sms["haozhuma"], doc["sms"] = hz, sms
+}
+
 func mergeSMSCredentials(doc map[string]any, p *smsPatch) {
 	if p == nil {
 		return
@@ -110,19 +130,61 @@ func mergeSMSCredentials(doc map[string]any, p *smsPatch) {
 	if hz == nil {
 		hz = map[string]any{}
 	}
+	s := smsSettingsFromDoc(doc)
+	if s.Credentials == nil {
+		s = s.Normalized()
+	}
+	creds := *s.Credentials
+	active := &creds.Haozhuma
+	target := s.Provider
+	if p.Haozhuma.Profile != nil {
+		target = *p.Haozhuma.Profile
+	}
+	if target == "ecode" {
+		active = &creds.Ecode
+	}
 	for key, value := range map[string]*string{"user": p.Haozhuma.User, "pass": p.Haozhuma.Pass, "token": p.Haozhuma.Token} {
 		if value != nil {
 			v := *value
 			if key != "pass" {
 				v = strings.TrimSpace(v)
 			}
-			hz[key] = v
+			switch key {
+			case "user":
+				active.User = v
+			case "pass":
+				active.Pass = v
+			case "token":
+				active.Token = v
+			}
 		}
 	}
-	if user, _ := hz["user"].(string); user != "" && hz["provider"] != "ecode" &&
+	if active.User != "" && target != "ecode" &&
 		(p.Haozhuma.User != nil || p.Haozhuma.Pass != nil || p.Haozhuma.Token != nil) {
-		hz["token"] = ""
+		active.Token = ""
 	}
+	if p.Haozhuma.Fallback != nil && strings.TrimSpace(*p.Haozhuma.Fallback) != "" {
+		creds.Ecode.Token = strings.TrimSpace(*p.Haozhuma.Fallback)
+	}
+	// 兼容旧前端的兜底参数补丁；E码云统一使用一套独立参数。
+	for key, value := range map[string]*string{"ecode_base": p.Haozhuma.FallbackBase, "ecode_card_type": p.Haozhuma.FallbackCardType, "ecode_province": p.Haozhuma.FallbackProvince} {
+		if value != nil {
+			hz[key] = strings.TrimSpace(*value)
+		}
+	}
+	if p.Haozhuma.FallbackEnabled != nil {
+		if *p.Haozhuma.FallbackEnabled {
+			if creds.Ecode.Token == "" {
+				hz["fallback"] = ""
+			} else {
+				hz["fallback"] = creds.Ecode.Token
+			}
+		} else {
+			hz["fallback"] = ""
+		}
+	}
+	hz["credentials"] = &creds
 	sms["haozhuma"] = hz
 	doc["sms"] = sms
+	normalizeSMSDoc(doc)
 }

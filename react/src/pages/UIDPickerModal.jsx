@@ -7,12 +7,11 @@ const { Text } = Typography;
 /**
  * UIDPickerModal 浮窗式对接码选择器（豪猪 H5 type=8/3/4），多选轮换池版。
  *
- * 交互：每行一个勾选框，勾上即加入「待选集」；点「加入 N 个并确定」时，
- * 把未加入账户的码先经后端在豪猪侧加入（type=4，官方 API 只认已加入的
- * 码），然后整体回填表单的 uids 轮换池字段。已勾选但未保存的行淡蓝底。
+ * 交互：每行一个勾选框，勾上即加入「待选集」；点「选择 N 个并回填」时，
+ * 仅回填外层表单草稿。外层保存时才同步豪猪账户，取消不产生平台写操作。
  *
  * 「加入」语义（关键业务规则）：官方取号 API 只认**已加入账户**的对接码
- * （市场挂牌 ≠ 拥有）。已加入的行标绿；未加入的勾选后保存时自动加入。
+ * （市场挂牌 ≠ 拥有）。已加入的行标绿；未加入的勾选后在外层保存时同步加入。
  * 取消勾选并保存 → 上层 diff 后自动从账户移出（type=41）。
  */
 export default function UIDPickerModal({ open, onClose, uidItems, loading, selectedUids, onConfirm, api }) {
@@ -80,34 +79,8 @@ export default function UIDPickerModal({ open, onClose, uidItems, loading, selec
     return arr;
   }, [filtered, sorter, mySet, checkedSet]);
 
-  // 确定：未加入账户的勾选项先加入（type=4），全部成功才回填。
+  // 确定只回填草稿，账户同步归外层保存事务处理。
   const confirm = async () => {
-    if (mySet) {
-      const toAdd = checked.filter(u => !mySet.has(u));
-      if (toAdd.length > 0) {
-        setAdding(true);
-        try {
-          for (const uid of toAdd) {
-            await api('/admin/account/sms/haozhuma/add-uid', {
-              method: 'POST',
-              body: JSON.stringify({ uid }),
-            });
-          }
-          setMySet(cur => {
-            const next = new Set(cur);
-            toAdd.forEach(u => next.add(u));
-            return next;
-          });
-          message.success(`已把 ${toAdd.length} 个码加入豪猪账户（官方 API 现在能用它们取号）`);
-        } catch (err) {
-          message.error(`加入失败：${err.message}（已勾选未加入的码没有回填）`);
-          setAdding(false);
-          return;
-        } finally {
-          setAdding(false);
-        }
-      }
-    }
     onConfirm?.(checked);
     onClose?.();
   };
@@ -195,13 +168,13 @@ export default function UIDPickerModal({ open, onClose, uidItems, loading, selec
       footer={
         <Space style={{ width: '100%', justifyContent: 'space-between' }}>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            勾选多个组成轮换池：取号逐个轮着用，失效自动移出。官方 API 只认<b>已加入</b>账户的码（绿色）——未加入的勾选后点确定会自动加入。
+            勾选多个组成轮换池：取号逐个轮着用，失效自动移出。官方 API 只认<b>已加入</b>账户的码（绿色）——这里只更新草稿；点击外层「保存高级设置」才会同步到账户。
           </Text>
           <Space>
             <Button onClick={onClose}>取消</Button>
             <Button type="primary" loading={adding} disabled={!dirty && mySet == null} onClick={confirm}>
               {mySet && checked.filter(u => !mySet.has(u)).length > 0
-                ? `加入 ${checked.filter(u => !mySet.has(u)).length} 个并确定`
+                ? `选择 ${checked.length} 个`
                 : `确定（${checked.length} 个）`}
             </Button>
           </Space>

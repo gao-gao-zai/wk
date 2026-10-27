@@ -1,930 +1,133 @@
 import React, { useEffect, useRef, useState } from 'react';
-import {
-  Alert, Button, Card, Checkbox, Collapse, Divider, Empty, Input, InputNumber,
-  Popconfirm, Progress, Segmented, Select, Space, Statistic, Tag, Tooltip, Typography, message,
-} from 'antd';
-import {
-  ApiOutlined, CheckCircleOutlined, LinkOutlined, PauseCircleOutlined,
-  PlayCircleOutlined, ReloadOutlined, SettingOutlined,
-} from '@ant-design/icons';
-
+import { Alert, Button, Card, Checkbox, Collapse, InputNumber, Popconfirm, Progress, Select, Space, Tabs, Tag, Typography, message } from 'antd';
+import { PlayCircleOutlined, PauseCircleOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons';
 import AutoEnrollAdvanced from './AutoEnrollAdvanced';
 import WatchCard from './WatchCard';
 import SMSPlatforms from './SMSPlatforms';
+import { compatibleGroups, createTaskPoller, platformNames, readyPlatforms, taskPlatformOptions, taskProgress, validTaskPlatform } from '../lib/autoEnroll.js';
+import './autoEnroll.css';
+const { Text } = Typography;
+const Field = ({ label, children, wide }) => <div className={`enroll-field ${wide ? 'enroll-field-wide' : ''}`}><label>{label}</label>{children}</div>;
 
-const { Text, Paragraph } = Typography;
-
-// POLL_MS 任务状态轮询间隔（2s：带 200 行日志的接口打得太密没必要）。
-const POLL_MS = 2000;
-// SUMMARY_MS 账户概览慢轮询（30s）：余额/占用是免费接口但没必要高频打，
-// 且与任务状态的 2s 快轮询是两个时钟两个接口，不合并。
-const SUMMARY_MS = 30000;
-// MAX_WORKERS 与后端 maxWorkers 一致（超出会被后端夹住，这里先拦一层）。
-const MAX_WORKERS = 8;
-// MAX_POLL_COUNT / MAX_ATTEMPTS 与后端 maxPollCount / maxAttemptsLimit 一致。
-// 前端先拦一道，用户拿到的是明确报错而不是被静默夹住。
-const MAX_POLL_COUNT = 36;
-const MAX_ATTEMPTS = 2000;
-// DEFAULT_POLL_COUNT 与后端 defaultPollCount 一致（90s / 5s）。
-const DEFAULT_POLL_COUNT = 18;
-// 每号轮询次数 → 大约多少秒（间隔 5s）。给用户一个能对照验证码有效期的数字。
-const pollSeconds = n => Math.round((Number(n) || 0) * 5);
-// 豪猪项目单价（估）：余额换算"约可成功 N 个"用。52283 腾讯项目 2.2 元/次。
-const PRICE_PER_SUCCESS = 2.2;
-// E码云单价：0.45 元/条（估）。
-const ECODE_PRICE_PER_SUCCESS = 0.45;
-
-// logTone 给日志行着色：扫一眼就能看出这轮顺不顺。
-function logTone(text) {
-  if (text.includes('加号成功')) return '#389e0d';
-  if (text.includes('失败') || text.includes('终止')) return '#cf1322';
-  if (text.includes('取号')) return '#667085';
-  return undefined;
-}
-
-// 脱敏账号还原展示：豪猪回显 user 形如 "my***er"，直接展示即可。
-// authText 把鉴权状态拼成一句话，折叠区顶部/空态共用。
-function authSummary(auth) {
-  if (!auth || auth.mode === 'none') return '尚未配置接码平台凭据';
-  if (auth.mode === 'token') return `Token 模式${auth.has_token ? '（已保存）' : ''}`;
-  return `账号密码模式（${auth.user || '?'}）`;
-}
-
-/**
- * AutoEnroll 自动加号页。
- *
- * 数据来源：
- *   POST /admin/account/sms/auto-enroll        启动（{count, workers, poll_count, ...}）
- *   GET  /admin/account/sms/auto-enroll        进度（logs / balance / stop_reason）
- *   POST /admin/account/sms/auto-enroll/stop   停止
- *   GET  /admin/account/sms/haozhuma/summary  账户概览（余额/占用/账本）
- *   POST /admin/account/sms/haozhuma/verify   凭据试算（不保存）
- *   POST /admin/config                        豪猪/任务控制参数保存
- *
- * 布局四块（视觉设计文档 §1）：账户卡片 → 启动卡片（含统计条）→ 告警 → 日志。
- * 高级设置是 Drawer（AutoEnrollAdvanced），不在本文件。
- */
-export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma, onSaveAutoEnroll, onToggleGrowthTasks }) {
+export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma, onToggleGrowthTasks }) {
   const hz = config.sms?.haozhuma || {};
-  const auth = hz.auth || { mode: 'none' };
-  const autoenrollCfg = config.autoenroll || {};
-
-  // —— 任务参数（启动卡片） ——
-  const [count, setCount] = useState(5);
-  const [workers, setWorkers] = useState(3);
-  // pollCount 每号收码轮询次数；0 表示交给后端默认（18 次 ≈ 90 秒）。
-  const [pollCount, setPollCount] = useState(DEFAULT_POLL_COUNT);
-  // maxAttempts 总尝试次数上限；null/0 表示按目标数推导（count*12，下限 20）。
-  const [maxAttempts, setMaxAttempts] = useState(null);
-  // groups 任务新账号登记的分组（多选，默认 default）。
-  const [selectedGroups, setSelectedGroups] = useState(['default']);
-  const [groupOptions, setGroupOptions] = useState(null);
-  // 任务级取号平台（POST auto-enroll 的 provider 字段）：空 = 跟全局 mode。
-  const [runProvider, setRunProvider] = useState('');
-  // 全局平台模式（POST /admin/config sms.haozhuma.mode 热切换）。
-  const [mode, setMode] = useState('');
-  const [modeSaving, setModeSaving] = useState(false);
-  const fallbackMounted = hz.fallback_mounted ?? false;
-
-  // —— 任务状态 ——
+  const ready = readyPlatforms(hz);
+  const [tab, setTab] = useState('manual');
   const [status, setStatus] = useState(null);
+  const [statusError, setStatusError] = useState('');
+  const [actionError, setActionError] = useState('');
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
-  const [error, setError] = useState('');
-  const [loadingStatus, setLoadingStatus] = useState(false);
-  const logBoxRef = useRef(null);
-  // 轮询句柄。running 时按 POLL_MS 续期；停下就不再排期。
-  const timerRef = useRef(null);
-
-  // —— 账户概览（独立慢时钟） ——
-  const [summary, setSummary] = useState(null);
-  const [summaryLoading, setSummaryLoading] = useState(false);
-  const summaryTimerRef = useRef(null);
-
-  // —— 高级设置抽屉 ——
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-
-  const load = async () => {
-    setLoadingStatus(true);
-    try {
-      const body = await api('/admin/account/sms/auto-enroll');
-      setStatus(body);
-      setError('');
-      return body;
-    } catch (err) {
-      setError(err.message);
-      return null;
-    } finally {
-      setLoadingStatus(false);
-    }
-  };
-
-  const loadSummary = async () => {
-    setSummaryLoading(true);
-    try {
-      setSummary(await api('/admin/account/sms/haozhuma/summary'));
-    } catch {
-      // 未配置豪猪/网络抖动：保持上次值，卡片 Tag 会显示"未连接"。
-      setSummary(current => current);
-    } finally {
-      setSummaryLoading(false);
-    }
-  };
-
-  // 首屏载入 + 自续期轮询：只要后端还在跑就继续轮询，停了自然结束。
+  const [provider, setProvider] = useState('auto');
+  const [count, setCount] = useState(5);
+  const [workers, setWorkers] = useState(3);
+  const [pollCount, setPollCount] = useState(18);
+  const [maxAttempts, setMaxAttempts] = useState(null);
+  const [groups, setGroups] = useState(['default']);
+  const [groupOptions, setGroupOptions] = useState([]);
+  const [groupError, setGroupError] = useState('');
+  const [advanced, setAdvanced] = useState(null);
+  const [follow, setFollow] = useState(true);
+  const poller = useRef(null);
+  const logBox = useRef(null);
+  const alive = useRef(true);
   useEffect(() => {
-    let alive = true;
-    const tick = async () => {
-      const body = await load();
-      if (!alive) return;
-      if (body?.running) {
-        timerRef.current = setTimeout(tick, POLL_MS);
-      } else {
-        timerRef.current = null;
-      }
-    };
-    tick();
-    return () => {
-      alive = false;
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // 账户概览：进入页面拉一次 + 任务运行期间 30s 慢轮询（跟钱有关的数字
-  // 在跑任务时值得盯），空闲时不再自动刷（手动刷新按钮兜底）。
+    alive.current = true;
+    const p = createTaskPoller(() => api('/admin/account/sms/auto-enroll'), body => { setStatus(body); setStatusError(''); }, e => setStatusError(e.message));
+    poller.current = p; p.refresh();
+    return () => { alive.current = false; p.close(); poller.current = null; };
+  }, [api]);
   useEffect(() => {
-    loadSummary();
-    return () => {
-      if (summaryTimerRef.current) clearTimeout(summaryTimerRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  useEffect(() => {
-    if (status?.running) {
-      if (!summaryTimerRef.current) {
-        const tick = async () => {
-          await loadSummary();
-          summaryTimerRef.current = setTimeout(tick, SUMMARY_MS);
-        };
-        summaryTimerRef.current = setTimeout(tick, SUMMARY_MS);
-      }
-    } else if (summaryTimerRef.current) {
-      clearTimeout(summaryTimerRef.current);
-      summaryTimerRef.current = null;
-    }
-  }, [status?.running]);
-
-  // 日志自动滚到底：任务跑起来后最关心的是最新几行。
-  useEffect(() => {
-    const box = logBoxRef.current;
-    if (box) box.scrollTop = box.scrollHeight;
-  }, [status?.logs]);
-
-  // 分组选项：加载失败（老后端没有分组端点）时**保持选择器占位并禁用**，
-  // 不隐藏——控件闪现/消失比禁用更让人不安。行为退回"新账号进 default"。
-  // 区域约束：自动加号拉的都是中国区账号 → 只列 cn/all 分组（后端同样校验）。
-  const [groupsFailed, setGroupsFailed] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    api('/admin/groups')
-      .then(body => {
-        if (!alive) return;
-        const all = body.groups || [];
-        const names = all.filter(g => !g.region || g.region === 'all' || g.region === 'cn').map(g => g.name);
-        setGroupOptions(names);
-        setSelectedGroups(current => (
-          current.every(g => names.includes(g)) ? current : current.filter(g => names.includes(g)).length ? current.filter(g => names.includes(g)) : ['default']
-        ));
-      })
-      .catch(() => alive && setGroupsFailed(true));
-    return () => { alive = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // 全局平台模式：config 回显 → state（运行中后端热切换，本地跟随）。
-  useEffect(() => {
-    if (hz.mode !== undefined) setMode(hz.mode || 'auto');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hz.mode]);
-
-  // 切换全局平台模式（热切换，落盘 + 运行时立即生效）。
-  const switchMode = async (next) => {
-    if (!next || next === mode) return;
-    setModeSaving(true);
-    try {
-      await api('/admin/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sms: { haozhuma: { mode: next } } }),
-      });
-      setMode(next);
-      message.success(
-        next === 'auto' ? '已切换：豪猪优先，失败自动切 E码云'
-          : next === 'haozhuma' ? '已切换：仅豪猪'
-          : next === 'ecode' ? '已切换：仅 E码云'
-          : '已切换：双平台轮换（豪猪+E码云交替）',
-      );
-    } catch (err) {
-      message.error(err.message);
-    } finally {
-      setModeSaving(false);
-    }
-  };
-
+    let active = true;
+    api('/admin/groups').then(body => {
+      if (!active) return;
+      const names = compatibleGroups(body.groups).map(g => g.name);
+      setGroupOptions(names.map(value => ({ value, label: value })));
+      setGroups(cur => cur.filter(g => names.includes(g)).length ? cur.filter(g => names.includes(g)) : names.includes('default') ? ['default'] : names.slice(0, 1));
+    }).catch(e => { if (active) setGroupError(e.message); });
+    return () => { active = false; };
+  }, [api]);
+  useEffect(() => { setProvider(cur => validTaskPlatform(cur, ready)); }, [ready.haozhuma, ready.ecode]);
+  useEffect(() => { if (follow && logBox.current) logBox.current.scrollTop = logBox.current.scrollHeight; }, [status?.logs, follow]);
+  const busy = status?.running || status?.config_busy || (status?.held || 0) > 0 || starting || stopping;
+  const progress = taskProgress(status);
+  const loaded = status !== null;
+  const refresh = async () => { await refreshConfig?.(); poller.current?.refresh(); };
   const start = async () => {
-    setStarting(true);
-    setError('');
+    if (![count, workers, pollCount].every(Number.isInteger) || !count || !workers || !pollCount || (maxAttempts !== null && (!Number.isInteger(maxAttempts) || maxAttempts < 1))) { message.error('目标数、并发和轮询次数需要填写正整数'); return; }
+    if (provider !== validTaskPlatform(provider, ready)) { message.error('所选平台尚未配置完整'); return; }
+    setStarting(true); setActionError('');
     try {
-      const body = await api('/admin/account/sms/auto-enroll', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          count,
-          workers,
-          poll_count: Number(pollCount) || 0,
-          max_attempts: Number(maxAttempts) || 0,
-          groups: selectedGroups.length ? selectedGroups : ['default'],
-          provider: runProvider,
-        }),
-      });
-      // 提示用后端回的**生效值**：填了超范围的值时，这里显示的就是真实生效的那个。
-      const effPoll = body?.poll_count ?? pollCount;
-      message.success(
-        `已启动：目标 ${count} 个，并发 ${body?.workers ?? workers}，每号轮询 ${effPoll} 次（约 ${pollSeconds(effPoll)} 秒）`,
-      );
-      const st = await load();
-      // 上一轮轮询可能已结束（timerRef 为 null），重新排期继续跟进度。
-      if (body?.running && !timerRef.current) {
-        const tick = async () => {
-          const next = await load();
-          if (next?.running) timerRef.current = setTimeout(tick, POLL_MS);
-          else timerRef.current = null;
-        };
-        timerRef.current = setTimeout(tick, POLL_MS);
-      }
-      if (!st) return;
-    } catch (err) {
-      // 余额不足 / 已在运行 都走这里；后端已给出可读文案。
-      setError(err.message);
-      message.error(err.message);
-    } finally {
-      setStarting(false);
-    }
+      await api('/admin/account/sms/auto-enroll', { method: 'POST', body: JSON.stringify({ count, workers, poll_count: pollCount, max_attempts: maxAttempts || 0, groups, provider, use_saved_platforms: true }) });
+      setFollow(true); message.success('任务已启动');
+    } catch (e) { setActionError(e.message); }
+    finally { if (alive.current) { setStarting(false); poller.current?.refresh(); } }
   };
-
   const stop = async () => {
-    setStopping(true);
-    try {
-      const body = await api('/admin/account/sms/auto-enroll/stop', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: '控制台手动停止' }),
-      });
-      if (body.ok) message.success('已请求停止，正在收尾');
-      else message.info(body.note || '当前没有正在运行的任务');
-      await load();
-    } catch (err) {
-      message.error(err.message);
-    } finally {
-      setStopping(false);
-    }
+    setStopping(true); setActionError('');
+    try { await api('/admin/account/sms/auto-enroll/stop', { method: 'POST', body: JSON.stringify({ reason: '控制台手动停止', pause_monitor: status?.source === 'monitor' }) }); message.info('已请求停止，正在结束在途号码'); }
+    catch (e) { setActionError(e.message); }
+    finally { if (alive.current) { setStopping(false); poller.current?.refresh(); } }
   };
-
-  // releaseAll 一键释放豪猪名下所有占用号码（cancelAllRecv），同时清空
-  // 本地账本。额度被历史遗留号占满时的手动兜底——语义同豪猪后台的
-  // 「释放全部」按钮。任务运行中后端会拒绝（409）。
-  const [releasingAll, setReleasingAll] = useState(false);
-  const releaseAll = async () => {
-    setReleasingAll(true);
-    try {
-      const body = await api('/admin/account/sms/release-all', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      });
-      if (body.ok) {
-        message.success(`已释放豪猪名下全部占用号码（含账本遗留 ${body.ledger_cleared || 0} 个）`);
-      }
-      await load();
-      await loadSummary();
-    } catch (err) {
-      message.error(err.message);
-    } finally {
-      setReleasingAll(false);
-    }
+  const saveAdvanced = async body => {
+    const result = await api('/admin/config', { method: 'POST', body: JSON.stringify(body) });
+    await refresh(); return result;
   };
-
-  const running = status?.running === true;
-  const ok = Number(status?.ok || 0);
-  const attempts = Number(status?.attempts || 0);
-  const fail = Number(status?.fail || 0);
-  const consumed = Number(status?.consumed || 0);
-  const holding = Number(status?.held || 0);
-  const goal = Number(count || 0);
-  const percent = goal > 0 ? Math.min(100, Math.round((ok / goal) * 100)) : 0;
-  const successRate = attempts > 0 ? Math.round((ok / attempts) * 100) : 0;
-  const logs = status?.logs || [];
-
-  // 高级设置"偏离默认值"计数（入口按钮徽标用）：后端已回显当前值，
-  // 前端纯本地比较，不打接口。
-  const advancedDirtyCount = [
-    hz.uid && hz.uid !== '',
-    hz.isp && hz.isp !== '',
-    hz.author && hz.author !== '',
-    Number(autoenrollCfg.min_balance) !== 2.2,
-    Number(autoenrollCfg.consecutive_fails) !== 15,
-    Number(autoenrollCfg.retry_delay_seconds) !== 5,
-  ].filter(Boolean).length;
-
-  // —— 账户卡片显示值：概览接口优先（含实时余额/占用），没拉到时用配置回显。
-  const balance = summary?.balance ?? null;
-  const occupied = summary?.occupied ?? -1; // -1 = 平台未返回
-  const heldLocal = summary?.held_local ?? holding;
-  const connected = !!summary && auth.mode !== 'none';
-  // provider 感知文案：E码云主用时账户/计费提示说 E码云的话。
-  const isEcode = hz.provider === 'ecode';
-  const approxCount = balance != null && balance > 0
-    ? (isEcode || fallbackMounted ? null : Math.floor(balance / PRICE_PER_SUCCESS))
-    : null;
-
-  // 账户 Tag：连接状态一眼可读。未配置/未拉到概览时灰色，凭据在但查询
-  // 失败也是灰色（不能因为一次网络抖动就红——豪猪侧波动很常见）。
-  const accountTag = auth.mode === 'none'
-    ? <Tag>未配置</Tag>
-    : connected
-      ? <Tag color="green">已连接</Tag>
-      : <Tag color="orange">连接异常</Tag>;
-
-  return (
-    <Space direction="vertical" size={16} style={{ width: '100%' }}>
-      <Alert
-        type="info"
-        showIcon
-        message={isEcode ? "E码云自动接码" : "按成功计费，失败不扣费"}
-        description={isEcode
-          ? "E码云由平台自动释放号码；具体计费和号码回收规则以供应商为准。"
-          : "豪猪只在收到短信验证码时扣费；取号后收不到码不扣费。每个取到的号（成功或失败）都会加入黑名单，不会被重复取到。"}
-      />
-
-      {status?.enabled === false && <Alert type="info" showIcon message="配置接码平台后即可启用" description={status.reason} />}
-      {summary?.warning && <Alert type="warning" showIcon message={summary.warning} />}
-      {error && <Alert type="error" showIcon message="操作失败" description={error} />}
-
-      {/* —— 卡片① 接码平台账户 —— */}
-      <Card
-        title={isEcode ? 'E码云账户' : '豪猪账户'}
-        extra={<Space>{accountTag}<Button size="small" icon={<ReloadOutlined />} loading={summaryLoading} onClick={loadSummary} /></Space>}
-      >
-        {auth.mode === 'none' && !connected ? (
-          <Paragraph type="secondary" style={{ marginBottom: 8 }}>
-            {isEcode
-              ? <>自动加号使用 E码云接码（eomsg.com）。在下方「接码平台配置」中选择 E码云并粘贴 API token（后台「API对接中心」创建，需先充值）即可开始。</>
-              : <>自动加号支持豪猪和 E码云。在下方「接码平台配置」中选择平台并保存凭据；仅使用 E码云无需配置豪猪。</>}
-          </Paragraph>
-        ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: 16 }}>
-            <Statistic
-              title="余额"
-              value={balance != null ? balance.toFixed(2) : '—'}
-              suffix={balance != null ? '元' : ''}
-              valueStyle={{ color: Number(autoenrollCfg.min_balance) > 0 && balance != null && balance < Number(autoenrollCfg.min_balance) ? '#cf1322' : undefined, fontSize: 22 }}
-            />
-            <div>
-              <Statistic
-                title="号码占用（平台侧）"
-                value={occupied >= 0 ? occupied : '未知'}
-                valueStyle={{ fontSize: 22, color: occupied >= 0 && occupied !== heldLocal ? '#d46b08' : undefined }}
-              />
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                本地账本 {heldLocal} 个{occupied >= 0 && occupied !== heldLocal ? '（不一致：有未归还号，可下方一键释放）' : ''}
-              </Text>
-            </div>
-            <div>
-              <Statistic title={isEcode ? '短信关键词' : '项目'} value={(isEcode ? hz.ecode_keyword || hz.sid : hz.sid) || '未配置'} valueStyle={{ fontSize: 22 }} />
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {approxCount != null ? `约可成功 ${approxCount} 个` : ''}
-              </Text>
-            </div>
-          </div>
-        )}
-        <Collapse
-          ghost
-          defaultActiveKey={auth.mode === 'none' ? ['auth'] : []}
-          style={{ marginTop: 4, marginLeft: -16, marginRight: -16 }}
-          items={[{
-            key: 'auth',
-            label: <Text type="secondary">鉴权与增强设置（{authSummary(auth)}）</Text>,
-            children: (
-              <AuthPanel
-                api={api}
-                auth={auth}
-                h5={hz.h5}
-                running={running}
-                isEcode={isEcode}
-                onSaveHaozhuma={onSaveHaozhuma}
-                onSaved={() => { loadSummary(); }}
-                onH5Saved={() => { refreshConfig?.(); }}
-                fallbackMounted={fallbackMounted}
-                onFallbackChanged={() => { refreshConfig?.(); loadSummary(); }}
-              />
-            ),
-          }]}
-        />
-      </Card>
-
-      <SMSPlatforms settings={hz} running={running} onSave={onSaveHaozhuma} onSaved={() => { refreshConfig?.(); load(); loadSummary(); }} />
-      {/* —— 卡片② 启动任务（参数 + 主按钮 + 统计条 + 进度） —— */}
-      <Card
-        title="启动任务"
-        extra={<Tag color={running ? 'processing' : 'default'}>{running ? '运行中' : '空闲'}</Tag>}
-      >
-        {/* 双平台取号模式：热切换（下一次取号立即按新模式路由）。 */}
-        <div style={{ marginBottom: 16 }}>
-          <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
-            <Tooltip title="豪猪与 E码云双平台共存。自动=豪猪优先、失败切换 E码云；仅豪猪/仅E码云=锁定单平台；并行=两平台交替取号，失败自动换边。切换立即生效（运行中任务的下一次取号也按新值）。">
-              <span style={{ borderBottom: '1px dashed #bfbfbf' }}>取号平台</span>
-            </Tooltip>
-            {fallbackMounted ? <Tag color="green" style={{ marginLeft: 8 }}>双平台已挂载</Tag> : <Tag style={{ marginLeft: 8 }}>单平台</Tag>}
-          </Text>
-          <Segmented
-            value={mode || 'auto'}
-            onChange={v => switchMode(v)}
-            disabled={modeSaving}
-            options={[
-              { label: isEcode ? '自动（E码云）' : '自动（豪猪优先）', value: 'auto' },
-              { label: '仅豪猪', value: 'haozhuma', disabled: isEcode },
-              { label: '仅E码云', value: 'ecode', disabled: !isEcode && !fallbackMounted },
-              { label: '双平台轮换', value: 'both', disabled: isEcode || !fallbackMounted },
-            ]}
-          />
-          <Text type="secondary" style={{ display: 'block', marginTop: 4, fontSize: 12 }}>
-            {mode === 'both' && '轮换模式：豪猪/E码云交替取号；一侧失败时尝试另一侧。'}
-            {mode === 'ecode' && '仅 E码云：不碰豪猪（余额为 E码云余额）。'}
-            {mode === 'haozhuma' && '仅豪猪：失败不上 E码云兜底。'}
-            {(!mode || mode === 'auto') && (isEcode ? '使用已配置的 E码云平台。' : '豪猪优先；失败时尝试已配置的 E码云。')}
-          </Text>
+  const stateLabel = status?.stopping && status?.running ? '正在停止' : status?.running ? (status.source === 'monitor' ? '监控正在加号' : '手动任务运行中') : status?.config_busy ? '正在收尾' : loaded ? '空闲' : '读取状态中';
+  const taskCard = <>
+    <div className="enroll-grid">
+      <Card title="创建加号任务" extra={<Tag color={status?.running ? 'processing' : 'default'}>{stateLabel}</Tag>}>
+        {!ready.haozhuma && !ready.ecode && <Alert showIcon type="info" message="先配置一个接码平台" description="在右侧选择豪猪或 E码云，保存凭据和接码项目后即可开始。" style={{ marginBottom: 20 }} />}
+        {!busy ? <>
+        <div className="enroll-fields">
+          <Field label="本次任务使用的平台" wide><Select aria-label="本次任务平台" value={provider} onChange={setProvider} disabled={!!busy} options={taskPlatformOptions(ready)} /></Field>
+          <Field label="目标账号数"><InputNumber aria-label="目标账号数" min={1} max={50} precision={0} value={count} onChange={setCount} disabled={!!busy} /></Field>
+          <Field label="并发数"><InputNumber aria-label="并发数" min={1} max={8} precision={0} value={workers} onChange={setWorkers} disabled={!!busy} /></Field>
+          <Field label="新账号所属分组" wide><Select aria-label="新账号所属分组" mode="multiple" value={groups} onChange={setGroups} disabled={!!busy || !!groupError} options={groupOptions} placeholder="留空使用 default" /></Field>
         </div>
-        <Space wrap size={16} align="end">
-          <div>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>目标账号数</Text>
-            <InputNumber min={1} max={50} value={count} onChange={setCount} disabled={running} style={{ width: 130 }} />
-          </div>
-          <div>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
-              <Tooltip title="本次任务用哪个平台取号（只影响这一批，不改上面的全局模式）。">
-                <span style={{ borderBottom: '1px dashed #bfbfbf' }}>本次任务平台</span>
-              </Tooltip>
-            </Text>
-            <Select
-              value={runProvider}
-              onChange={setRunProvider}
-              disabled={running}
-              style={{ width: 150 }}
-              options={[
-                { value: '', label: '跟随全局模式' },
-                { value: 'haozhuma', label: '仅豪猪', disabled: isEcode },
-                { value: 'ecode', label: '仅E码云', disabled: !isEcode && !fallbackMounted },
-                { value: 'both', label: '双平台轮换', disabled: isEcode || !fallbackMounted },
-              ]}
-            />
-          </div>
-          <div>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>并发数</Text>
-            <InputNumber min={1} max={MAX_WORKERS} value={workers} onChange={setWorkers} disabled={running} style={{ width: 130 }} />
-          </div>
-          <div>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
-              <Tooltip title="每个号最多查几次短信。腾讯验证码 60 秒有效，但豪猪短信入库有延迟，默认 18 次（约 90 秒）能兜住晚到的码。收不到码时可调大。">
-                <span style={{ borderBottom: '1px dashed #bfbfbf' }}>收码轮询次数</span>
-              </Tooltip>
-            </Text>
-            <InputNumber
-              min={1}
-              max={MAX_POLL_COUNT}
-              value={pollCount}
-              onChange={setPollCount}
-              disabled={running}
-              style={{ width: 160 }}
-              addonAfter={`≈${pollSeconds(pollCount)}秒`}
-            />
-          </div>
-          <div>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
-              <Tooltip title="整个任务最多尝试多少个号。留空按目标数推导（目标×12，最少 20）。对接商质量差、成功率低时可以调大，但连续失败熔断仍会兜底。">
-                <span style={{ borderBottom: '1px dashed #bfbfbf' }}>最多尝试次数</span>
-              </Tooltip>
-            </Text>
-            <InputNumber
-              min={1}
-              max={MAX_ATTEMPTS}
-              value={maxAttempts}
-              onChange={setMaxAttempts}
-              disabled={running}
-              placeholder={`自动（${Math.max(20, count * 12)}）`}
-              style={{ width: 160 }}
-            />
-          </div>
-          <div>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
-              <Tooltip title="新加的账号登记进这些分组（可多选）。分组密钥只能用对应分组里的账号。">
-                <span style={{ borderBottom: '1px dashed #bfbfbf' }}>所属分组</span>
-              </Tooltip>
-            </Text>
-            <Select
-              mode="multiple"
-              value={selectedGroups}
-              onChange={setSelectedGroups}
-              disabled={running}
-              style={{ minWidth: 220 }}
-              placeholder="default"
-              loading={!groupOptions && !groupsFailed}
-              status={groupsFailed ? 'warning' : undefined}
-              options={(groupOptions || []).map(g => ({ value: g, label: g }))}
-              notFoundContent={groupsFailed ? '分组服务不可用，新账号将进 default' : '暂无分组'}
-            />
-          </div>
-          <Button type="primary" icon={<PlayCircleOutlined />} loading={starting} disabled={running || status?.enabled === false} onClick={start}>
-            开始加号
-          </Button>
-          <Tooltip title={running ? '请求停止当前任务' : '当前没有运行中的任务'}>
-            <Button icon={<PauseCircleOutlined />} danger loading={stopping} disabled={!running} onClick={stop}>
-              停止
-            </Button>
-          </Tooltip>
-          <Button icon={<ReloadOutlined />} loading={loadingStatus} onClick={load}>刷新</Button>
-          {!isEcode && <Tooltip title="调用豪猪「释放全部」（cancelAllRecv），释放账户名下所有占用中的号码，并清空本地遗留账本。额度被旧号占满时的手动兜底；任务运行中不可用。">
-            <Button loading={releasingAll} disabled={running} onClick={releaseAll}>
-              一键释放全部号码
-            </Button>
-          </Tooltip>}
-          <Button type="link" icon={<SettingOutlined />} onClick={() => setAdvancedOpen(true)}>
-            高级设置{advancedDirtyCount > 0 ? `（${advancedDirtyCount}）` : ''}
-          </Button>
-        </Space>
-
-        <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
-          并发越高越快，但腾讯对同批次注册有风控，建议 3-4。每个号开始时会绑定一个专属代理出口，全程不换 IP。
-          {' '}收不到码时先调大「收码轮询次数」——豪猪短信入库有延迟，多轮几次常能捞到。
-        </Paragraph>
-
-        <Divider style={{ margin: '12px 0' }} />
-        <Checkbox
-          checked={config.autoenroll_growth_tasks !== false}
-          onChange={e => onToggleGrowthTasks?.(e.target.checked)}
-        >
-          加号成功后自动跑成长任务
-          <Text type="secondary" style={{ marginLeft: 8, fontWeight: 400 }}>
-            （约 +1950 积分/号；异步执行不占加号并发；含数条真实短对话）
-          </Text>
-        </Checkbox>
-
-        {(attempts > 0 || running) && (
-          <>
-            <Divider style={{ margin: '12px 0 8px' }} />
-            <Space split={<Divider type="vertical" />} wrap size={16}>
-              <Statistic title="本次成功" value={ok} valueStyle={{ fontSize: 18, color: '#389e0d' }} />
-              <Statistic title="尝试" value={attempts} valueStyle={{ fontSize: 18 }} />
-              <Statistic title="成功率" value={successRate} suffix="%" valueStyle={{ fontSize: 18 }} />
-              <Statistic title="号码消耗" value={consumed} valueStyle={{ fontSize: 18 }} />
-              <Statistic title={isEcode ? '已结束本地占用' : '已释放'} value={status?.released ?? 0} valueStyle={{ fontSize: 18 }} />
-              <Statistic
-                title="连续失败熔断"
-                value={autoenrollCfg.consecutive_fails ?? 15}
-                suffix="次"
-                valueStyle={{ fontSize: 18 }}
-              />
-            </Space>
-            {goal > 0 && (
-              <Progress
-                percent={percent}
-                status={running ? 'active' : (ok >= goal ? 'success' : 'normal')}
-                format={() => `${ok} / ${goal}`}
-                style={{ marginTop: 4 }}
-              />
-            )}
-            <Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0, fontSize: 12 }}>
-              生效参数：并发 {status?.workers ?? workers} · 每号轮询 {status?.poll_count ?? pollCount} 次
-              （约 {pollSeconds(status?.poll_count ?? pollCount)} 秒）· 最多尝试 {status?.max_attempts ?? '自动'}
-              {status?.max_attempts ? ' 次' : ''} · 余额保护 {Number(autoenrollCfg.min_balance ?? 2.2).toFixed(1)} 元
-            </Paragraph>
-          </>
-        )}
+        {groupError && <Alert type="warning" message="分组列表不可用，本次将使用 default" style={{ marginTop: 12 }} />}
+        <Collapse style={{ marginTop: 20 }} items={[{ key: 'task', label: '等待与重试参数', children: <div className="enroll-fields">
+          <Field label={`每号最多查询短信次数 · 约 ${pollCount * 5} 秒起`}><InputNumber aria-label="收码轮询次数" min={1} max={36} precision={0} value={pollCount} onChange={setPollCount} disabled={!!busy} /></Field>
+          <Field label="最多尝试号码数"><InputNumber aria-label="最多尝试次数" min={1} max={2000} precision={0} value={maxAttempts} onChange={setMaxAttempts} disabled={!!busy} placeholder={`自动：${Math.max(20, count * 12)}`} /></Field>
+          <div className="enroll-muted enroll-field-wide">平台网络故障的重试可能延长等待时间。费用按供应商结算规则计算，账号注册失败不代表短信免费。</div>
+        </div> }]} />
+        </> : <div className="enroll-settings-note">本批目标 {progress.want} 个账号 · {platformNames[status?.provider] || '自动选择'} · 并发 {status?.workers || workers}<div className="enroll-muted" style={{ marginTop: 8 }}>参数已锁定，下方可查看进度和日志。停止后可创建下一批任务。</div></div>}
+        <div className="enroll-actions">
+          <Button aria-label="开始加号" type="primary" icon={<PlayCircleOutlined />} loading={starting} disabled={!!busy || !loaded || !!statusError || (!ready.haozhuma && !ready.ecode)} onClick={start}>开始加号</Button>
+          <Button aria-label={status?.source === 'monitor' ? '暂停监控并停止本批' : '停止本批'} danger icon={<PauseCircleOutlined />} loading={stopping} disabled={!status?.running || status?.stopping} onClick={stop}>{status?.source === 'monitor' ? '暂停监控并停止本批' : '停止本批'}</Button>
+          <Button type="text" icon={<SettingOutlined />} disabled={!!busy} onClick={() => setAdvanced(provider === 'ecode' ? 'ecode' : 'common')}>任务保护设置</Button>
+        </div>
+        <div className="enroll-muted" style={{ marginTop: 14 }}>平台和参数在启动时确定。需要更换平台时，请先停止当前批次；在途号码会按原平台收尾。</div>
+        {!busy && <Checkbox style={{ marginTop: 18 }} checked={config.autoenroll_growth_tasks !== false} onChange={e => onToggleGrowthTasks?.(e.target.checked)}>成功后执行成长任务 <Text type="secondary">（会发起真实对话）</Text></Checkbox>}
       </Card>
+      <SMSPlatforms settings={hz} running={!!busy} api={api} onSave={onSaveHaozhuma} onSaved={refresh} onAdvanced={setAdvanced} />
+    </div>
+    <Card title="当前 / 最近一批任务" extra={<Button type="text" icon={<ReloadOutlined />} onClick={() => poller.current?.refresh()}>刷新状态</Button>}>
+      {status?.monitor_enabled && <Alert type="info" showIcon message="豪猪监控已开启，会按监控设置自动创建批次" action={<Button size="small" onClick={() => setTab('monitor')}>管理监控</Button>} />}
+      {progress.want > 0 ? <>
+        <div className="enroll-muted" style={{ marginTop: 14 }}>来源：{status.source === 'monitor' ? '豪猪监控' : '手动启动'} · 平台：{platformNames[status.provider] || '自动选择'} · 并发 {status.workers} · 每号查询 {status.poll_count} 次 · 最多尝试 {status.max_attempts} 次</div>
+        <div className="enroll-stats">{[['成功账号', status.ok || 0], ['已收到验证码', status.received || 0], ['尝试号码', status.consumed || 0], ['在途号码', status.held || 0]].map(([label, value]) => <div className="enroll-stat" key={label}><Text type="secondary">{label}</Text><strong>{value}</strong></div>)}</div>
+        {status.supplier_counts && <div className="enroll-muted" style={{ marginBottom: 12 }}>实际取号：豪猪 {status.supplier_counts.haozhuma || 0} 个 · E码云 {status.supplier_counts.ecode || 0} 个</div>}
+        <Progress percent={progress.percent} status={status.running ? 'active' : progress.ok >= progress.want ? 'success' : 'normal'} format={() => `${progress.ok} / ${progress.want}`} />
+        {status.stop_reason && <Alert style={{ marginTop: 16 }} showIcon type={status.stopping ? 'info' : 'warning'} message="本批结束原因" description={status.stop_reason} />}
+      </> : <div className="enroll-muted" style={{ padding: '20px 0' }}>暂无任务。启动后会在这里显示实际平台、进度和在途号码。</div>}
+      <div style={{ marginTop: 24 }}>
+        <div className="enroll-log-toolbar"><Text strong>运行日志</Text><Text type="secondary">最近 {(status?.logs || []).length} 行</Text><Checkbox checked={follow} onChange={e => setFollow(e.target.checked)}>跟随最新日志</Checkbox></div>
+        <div className="enroll-log" ref={logBox} onScroll={e => { const box = e.currentTarget; if (box.scrollHeight - box.clientHeight - box.scrollTop > 60) setFollow(false); }}>
+          {(status?.logs || []).length ? status.logs.map((line, i) => <div key={i} style={{ color: line.includes('加号成功') ? '#86efac' : line.includes('失败') || line.includes('故障') ? '#fda4af' : undefined }}>{line}</div>) : <span style={{ color: '#94a3b8' }}>等待任务日志…</span>}
+        </div>
+      </div>
+    </Card>
+  </>;
+  return <div className="enroll-page">
 
-      {holding > 0 && !isEcode && (
-        <Alert
-          type="error"
-          showIcon
-          message={`还有 ${holding} 个号码占着豪猪额度`}
-          description={(
-            <div>
-              未归还的号会占住豪猪的并发额度，额度满了后续取号会一直返回「您的余额不足,请释放拉黑后再取号」（看着像没钱，其实是号没还）。
-              正常任务结束会自动归还。也可以直接点上方「一键释放全部号码」（豪猪 cancelAllRecv，立即归还全部占用并清空本地账本）。
-              <div style={{ marginTop: 8 }}>
-                <Button size="small" danger loading={releasingAll} disabled={running} onClick={releaseAll}>
-                  一键释放全部号码
-                </Button>
-              </div>
-            </div>
-          )}
-        />
-      )}
-
-      {status?.stop_reason && (
-        <Alert type="warning" showIcon message="任务终止原因" description={status.stop_reason} />
-      )}
-
-      {/* —— 卡片③ 监控加号（H5 已配置才显示；值班员盯对接码市场） —— */}
-      {!isEcode && <WatchCard api={api} h5Ready={!!(hz.h5 && hz.h5.has && !hz.h5.expired)} />}
-
-      {/* —— 卡片④ 运行日志 —— */}
-      <Card
-        title="运行日志"
-        extra={(
-          <Space>
-            <Text type="secondary">{logs.length} 行</Text>
-            {logs.length > 0 && (
-              <Button size="small" type="text" onClick={() => setStatus(current => ({ ...current, logs: [] }))}>
-                清空
-              </Button>
-            )}
-          </Space>
-        )}
-      >
-        {logs.length === 0
-          ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无日志，启动任务后会实时刷新" />
-          : (
-            <div
-              ref={logBoxRef}
-              style={{
-                maxHeight: 380, overflowY: 'auto', background: '#fafbfc',
-                border: '1px solid #e7ebf1', borderRadius: 8, padding: '10px 12px',
-                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                fontSize: 12.5, lineHeight: 1.75,
-              }}
-            >
-              {logs.map((line, index) => (
-                <div key={index} style={{ color: logTone(line), whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                  {line}
-                </div>
-              ))}
-            </div>
-          )}
-      </Card>
-
-      <AutoEnrollAdvanced
-        open={advancedOpen}
-        onClose={() => setAdvancedOpen(false)}
-        api={api}
-        config={config}
-        running={running}
-        onSaveHaozhuma={onSaveHaozhuma}
-        onSaveAutoEnroll={onSaveAutoEnroll}
-      />
-    </Space>
-  );
-}
-
-/**
- * AuthPanel 鉴权与增强设置折叠区（账户卡片内）。
- *
- * 受控组件风格（与主页一致，不用 antd Form）：
- *   - 鉴权方式二选一：账密（可自动重登）/ 直接填 token
- *   - [验证连接]：POST verify 试算，不保存；结果内联显示（绿字/红字原文）
- *   - [保存并重连]：inline confirm（按钮原地变确认），onSaveHaozhuma 落盘
- *     并触发后端 ReplaceClient；失败 Alert 顶部常驻（回滚由后端保证）
- *   - 密码/token 框：已保存时留空 = 不修改（placeholder 说明）
- *   - H5 会话（P1 增强）：粘贴 PHPSESSID 解锁项目搜索/对接码选择。
- *     后端验证通过才落盘；失效（410）提示重贴。
- */
-function AuthPanel({ api, auth, h5, running, isEcode, onSaveHaozhuma, onSaved, onH5Saved, fallbackMounted, onFallbackChanged }) {
-  // ecode 主用（无账密登录概念）强制 token 形态。
-  const [mode, setMode] = useState(isEcode || auth.mode === 'token' ? 'token' : 'userpass');
-  useEffect(() => { if (isEcode) setMode('token'); }, [isEcode]);
-  const [userDraft, setUserDraft] = useState('');
-  const [passDraft, setPassDraft] = useState('');
-  const [tokenDraft, setTokenDraft] = useState('');
-  const [verifying, setVerifying] = useState(false);
-  const [verifyResult, setVerifyResult] = useState(null); // {ok,balance} | {error}
-  const [confirming, setConfirming] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState('');
-
-  const [h5Draft, setH5Draft] = useState('');
-  const [h5Saving, setH5Saving] = useState(false);
-
-  const h5Has = h5?.has === true;
-  const h5Expired = h5?.expired === true;
-
-  const pasteH5 = async () => {
-    const session = h5Draft.trim();
-    if (!session) { message.info('先粘贴 PHPSESSID（浏览器 F12 → 应用 → Cookie）'); return; }
-    setH5Saving(true);
-    try {
-      await api('/admin/account/sms/haozhuma/h5-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session }),
-      });
-      message.success('会话已保存，项目搜索/对接码选择已解锁');
-      setH5Draft('');
-      onH5Saved?.();
-    } catch (err) {
-      message.error(err.message);
-    } finally {
-      setH5Saving(false);
-    }
-  };
-
-  const clearH5 = async () => {
-    setH5Saving(true);
-    try {
-      await api('/admin/account/sms/haozhuma/h5-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session: '' }),
-      });
-      message.success('H5 会话已清空，选择器退化为手填');
-      onH5Saved?.();
-    } catch (err) {
-      message.error(err.message);
-    } finally {
-      setH5Saving(false);
-    }
-  };
-
-  const verify = async () => {
-    setVerifying(true);
-    setVerifyResult(null);
-    try {
-      const body = mode === 'userpass'
-        ? { mode, user: userDraft || auth.user, pass: passDraft }
-        : { mode, token: tokenDraft };
-      const resp = await api('/admin/account/sms/haozhuma/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      setVerifyResult({ ok: true, balance: resp.balance });
-    } catch (err) {
-      setVerifyResult({ error: err.message });
-    } finally {
-      setVerifying(false);
-    }
-  };
-
-  const save = async () => {
-    setSaving(true);
-    setSaveError('');
-    const patch = {};
-    if (mode === 'userpass') {
-      if (userDraft) patch.user = userDraft;
-      if (passDraft) patch.pass = passDraft;
-    } else if (tokenDraft) {
-      patch.token = tokenDraft; patch.user = ""; patch.pass = "";
-    }
-    const result = await onSaveHaozhuma?.(patch);
-    setSaving(false);
-    setConfirming(false);
-    if (result) {
-      const updated = result?.updated || {};
-      if (updated.haozhuma_auth === 'reconnected') {
-        message.success('鉴权已保存，新凭据立即生效');
-      } else if (updated.haozhuma_auth_restart_required) {
-        message.warning('凭据已保存，重启后自动加号可用（短信直登模块未启用）');
-      } else {
-        message.success('已保存');
-      }
-      setUserDraft(''); setPassDraft(''); setTokenDraft(''); setVerifyResult(null);
-      onSaved?.();
-    }
-  };
-
-  const handleSaveClick = () => {
-    // 没有任何草稿时保存无意义（后端 patch 全空）。
-    const hasDraft = mode === 'userpass' ? !!(userDraft || passDraft) : !!tokenDraft;
-    if (!hasDraft) { message.info('没有要保存的改动'); return; }
-    if (confirming) { save(); return; }
-    setConfirming(true);
-  };
-
-  return (
-    <Space direction="vertical" size={8} style={{ width: '100%' }}>
-      {saveError && <Alert type="error" showIcon closable message="保存失败" description={saveError} onClose={() => setSaveError('')} />}
-      <Space wrap size={16} align="end">
-        {!isEcode && (
-          <div>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>鉴权方式</Text>
-            <Select
-              value={mode}
-              onChange={v => { setMode(v); setVerifyResult(null); setConfirming(false); }}
-              disabled={running}
-              style={{ width: 180 }}
-              options={[
-                { value: 'userpass', label: '账号密码（可自动重登）' },
-                { value: 'token', label: '直接填 Token' },
-              ]}
-            />
-          </div>
-        )}
-        {mode === 'userpass' && !isEcode ? (
-          <>
-            <div>
-              <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>账号</Text>
-              <Input
-                value={userDraft}
-                onChange={e => setUserDraft(e.target.value)}
-                placeholder={auth.mode === 'userpass' ? `${auth.user}（已保存，留空不修改）` : '豪猪 API 账号'}
-                disabled={running}
-                style={{ width: 200 }}
-                allowClear
-              />
-            </div>
-            <div>
-              <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>密码</Text>
-              <Input.Password
-                value={passDraft}
-                onChange={e => setPassDraft(e.target.value)}
-                placeholder={auth.has_pass ? '已保存，留空则不修改' : '豪猪 API 密码'}
-                disabled={running}
-                style={{ width: 200 }}
-              />
-            </div>
-          </>
-        ) : mode === 'token' || isEcode ? (
-          <div>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>Token</Text>
-            <Input.Password
-              value={tokenDraft}
-              onChange={e => setTokenDraft(e.target.value)}
-              placeholder={auth.has_token ? '已保存，留空则不修改；填写则覆盖' : (isEcode ? '接码平台 API token' : '豪猪后台提取的 API token')}
-              disabled={running}
-              style={{ width: 280 }}
-            />
-          </div>
-        ) : null}
-        <Tooltip title="用当前填写的草稿真调一次接码平台接口，不保存。建议先验证再保存，避免把坏凭据写进配置。">
-          <Button icon={<ApiOutlined />} loading={verifying} onClick={verify}>验证连接</Button>
-        </Tooltip>
-        {confirming ? (
-          <Popconfirm
-            title="确认保存？新凭据将立即生效"
-            onConfirm={save}
-            onCancel={() => setConfirming(false)}
-            okText="确认保存"
-            cancelText="取消"
-            open={confirming}
-            disabled={running}
-          >
-            <Button type="primary" danger loading={saving} disabled={running}>确认保存并重连</Button>
-          </Popconfirm>
-        ) : (
-          <Tooltip title={running ? '任务运行中不可更换鉴权（等任务结束后再试）' : ''}>
-            <Button type="primary" loading={saving} disabled={running} onClick={handleSaveClick}>
-              保存并重连
-            </Button>
-          </Tooltip>
-        )}
-      </Space>
-      {verifyResult && (
-        verifyResult.ok
-          ? <Text type="success">连接成功，当前余额 {Number(verifyResult.balance).toFixed(2)} 元</Text>
-          : <Text type="danger" style={{ wordBreak: 'break-all' }}>{verifyResult.error}</Text>
-      )}
-      <Text type="secondary" style={{ fontSize: 12 }}>
-        账密模式 token 失效可自动重登；只填 token 则失效后需手动更新。
-        豪猪 API 账密在豪猪网页后台左侧「API」处获取。
-      </Text>
-
-      <Divider style={{ margin: '4px 0' }} plain />
-      <Space wrap size={12} align="center">
-        <Text type="secondary">H5 增强（项目搜索/对接码选择）</Text>
-        {h5Expired
-          ? <Tag color="red">会话已失效，请重贴</Tag>
-          : h5Has
-            ? <Tag color="green">已启用</Tag>
-            : <Tag>未配置</Tag>}
-        <Input.Password
-          value={h5Draft}
-          onChange={e => setH5Draft(e.target.value)}
-          placeholder={h5Has ? '粘贴新 PHPSESSID 覆盖' : '浏览器登录 h5.haozhuma.com 后 F12 复制 PHPSESSID'}
-          style={{ width: 340 }}
-          disabled={h5Saving}
-          visibilityToggle={false}
-        />
-        <Button loading={h5Saving} onClick={pasteH5}>保存会话</Button>
-        {h5Has && (
-          <Popconfirm title="清空 H5 会话？项目/对接码选择器将退化为手填。" onConfirm={clearH5}>
-            <Button danger type="text" loading={h5Saving}>清空</Button>
-          </Popconfirm>
-        )}
-      </Space>
-      <Text type="secondary" style={{ fontSize: 12 }}>
-        一次性操作：豪猪网页版登录后按 F12 → 应用/存储 → Cookie → 复制 PHPSESSID 的值粘到这里。
-        后端每 7 天自动保活（官方有效期 10 天滑动）。该会话只用于选择器数据源，与接码任务链路无关。
-      </Text>
-
-    </Space>
-  );
+    {statusError && <Alert type="error" showIcon message="任务状态暂不可用，正在自动重试" description={statusError} />}
+    {!status?.running && (status?.held || 0)>0 && <Alert type="warning" showIcon message={`有 ${status.held} 个遗留号码等待释放`} description="为保护在途号码，暂不能更换配置或启动新批次。" action={<Popconfirm title="释放豪猪账户全部占用号码？" description="此操作也会释放本服务账本之外的账户占用号。" onConfirm={async()=>{try{await api('/admin/account/sms/release-all',{method:'POST',body:'{}'});poller.current?.refresh();}catch(e){setActionError(e.message);}}}><Button danger size="small">释放占用</Button></Popconfirm>} />}
+    {actionError && <Alert type="error" showIcon message="操作未完成" description={actionError} closable onClose={() => setActionError('')} />}
+    <Tabs activeKey={tab} onChange={setTab} items={[
+      { key: 'manual', label: '加号工作台', children: <Space direction="vertical" size={20} style={{ width: '100%' }}>{taskCard}</Space> },
+      { key: 'monitor', label: '豪猪自动监控', children: <><Alert className="enroll-monitor-note" showIcon type="info" message="监控按计划自动加号，与手动任务共用执行队列" description="这里的预算是本地预估支出上限，不是给豪猪充值。费用以供应商账单为准。" /><WatchCard api={api} h5Ready={!!hz.h5?.has && !hz.h5?.expired} onConfigure={() => setTab('manual')} /></> },
+    ]} />
+    <AutoEnrollAdvanced open={!!advanced} provider={advanced} onClose={() => setAdvanced(null)} api={api} config={config} running={!!busy} onSaveSettings={saveAdvanced} />
+  </div>;
 }
