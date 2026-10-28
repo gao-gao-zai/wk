@@ -200,7 +200,7 @@ func (h *Handler) monitorEnabledPatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "watch": h.cfg.UIDWatcher.Status()})
 }
 func (h *Handler) syncUIDSelection(ctx context.Context, before, after []string) []string {
-	h5 := h.cfg.HaozhumaH5
+	h5 := h.H5Client()
 	mine, err := h5.MyUIDs(ctx, "")
 	if err != nil {
 		return []string{"读取豪猪账户失败：" + err.Error()}

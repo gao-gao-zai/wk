@@ -3,11 +3,13 @@ import { Alert, Button, Card, Collapse, Input, Modal, Popconfirm, Select, Space,
 import { SettingOutlined, ReloadOutlined } from '@ant-design/icons';
 import { platformNames, readyPlatforms } from '../lib/autoEnroll.js';
 import HaozhumaTokenGuide from '../components/HaozhumaTokenGuide.jsx';
+import { webTokenStatus } from '../lib/smsPlatforms.js';
 const { Text } = Typography;
 const Field = ({ label, children, wide }) => <div className={`enroll-field ${wide ? 'enroll-field-wide' : ''}`}><label>{label}</label>{children}</div>;
 
 function ProfileEditor({ provider, settings, api, onSave, onSaved, onRefresh, onAdvanced, busy, onDirtyChange, onBusyChange }) {
   const hao = provider === 'haozhuma';
+  const webStatus = webTokenStatus(settings.h5);
   const auth = settings.platform_auth?.haozhuma || (settings.provider !== 'ecode' ? settings.auth : {}) || {};
   const [method, setMethod] = useState(auth.mode === 'userpass' ? 'userpass' : 'token');
   const [token, setToken] = useState('');
@@ -58,8 +60,14 @@ function ProfileEditor({ provider, settings, api, onSave, onSaved, onRefresh, on
   const saveSession = async () => {
     if (!session.trim()) { message.error('请先粘贴豪猪 Web 登录令牌'); return; }
     setSaving(true);
-    try { await api('/admin/account/sms/haozhuma/h5-session', { method: 'POST', body: JSON.stringify({ token: session.trim() }) }); message.success('Web 登录令牌已验证，本次服务运行期间生效'); setSession(''); onRefresh?.(); }
-    catch (e) { setResult({ ok: false, text: e.message }); }
+    try { const saved = await api('/admin/account/sms/haozhuma/h5-session', { method: 'POST', body: JSON.stringify({ token: session.trim() }) }); message.success(saved.persisted ? 'Web 登录令牌已加密保存，重启后自动恢复' : 'Web 登录令牌已验证，仅本次运行生效'); setSession(''); onRefresh?.(); }
+    catch (e) { setResult({ ok: false, text: e.message }); onRefresh?.(); }
+    finally { setSaving(false); }
+  };
+  const clearSession = async () => {
+    setSaving(true);
+    try { await api('/admin/account/sms/haozhuma/h5-session', { method: 'POST', body: JSON.stringify({ session: '' }) }); setSession(''); message.success('Web 登录令牌已清空'); onRefresh?.(); }
+    catch (e) { setResult({ ok: false, text: e.message }); onRefresh?.(); }
     finally { setSaving(false); }
   };
   return <Space direction="vertical" size={20} style={{ width: '100%' }}>
@@ -81,12 +89,13 @@ function ProfileEditor({ provider, settings, api, onSave, onSaved, onRefresh, on
       <div className="enroll-actions"><Button type="primary" loading={saving} disabled={busy || checking} onClick={save}>保存{platformNames[provider]}配置</Button><Button loading={checking} disabled={busy || saving} onClick={check}>验证连接</Button></div>
     </fieldset>
     {result && <Alert type={result.ok ? 'success' : 'error'} showIcon message={result.text} />}
-    {hao && <fieldset disabled={busy || saving || checking} style={{border:0, margin:0, padding:0, width:'100%'}}><Collapse items={[{ key: 'h5', label: `豪猪增强功能 · ${settings.h5?.has && !settings.h5?.expired ? '会话已配置' : '可选'}`, children: <Space direction="vertical" style={{ width: '100%' }}>
+    {hao && <fieldset disabled={busy || saving || checking} style={{border:0, margin:0, padding:0, width:'100%'}}><Collapse items={[{ key: 'h5', label: `豪猪增强功能 · ${webStatus.title}`, children: <Space direction="vertical" style={{ width: '100%' }}>
       <Text type="secondary">仅项目搜索、对接码选择和监控需要 Web 登录令牌。普通手动加号不需要。</Text>
+      <Alert type={webStatus.type} showIcon message={webStatus.title} description={webStatus.description} />
       <Input.Password aria-label="豪猪 Web 登录令牌" value={session} onChange={e => setSession(e.target.value)} placeholder="粘贴豪猪 qs_web_token" />
       <HaozhumaTokenGuide />
-      <Space wrap><Button loading={saving} disabled={busy} onClick={saveSession}>验证并使用令牌</Button>
-      {settings.h5?.has && <Popconfirm title="清空豪猪 Web 登录令牌？" description="项目搜索与监控将不可用，普通接码不受影响。" onConfirm={async () => { await api('/admin/account/sms/haozhuma/h5-session',{method:'POST',body:JSON.stringify({session:''})});onRefresh?.(); }}><Button disabled={busy}>清空会话</Button></Popconfirm>}</Space>
+      <Space wrap><Button loading={saving} disabled={busy} onClick={saveSession}>{webStatus.saveLabel}</Button>
+      {(settings.h5?.has || settings.h5?.storage_error) && <Popconfirm title="清空豪猪 Web 登录令牌？" description={webStatus.clearDescription} onConfirm={clearSession}><Button disabled={busy}>清空令牌</Button></Popconfirm>}</Space>
       <Button disabled={busy} onClick={goAdvanced}>项目与对接码高级设置</Button>
       <Popconfirm title="释放豪猪账户全部占用号码？" description="包括本服务账本以外的占用号。请确认没有其它任务在使用该账户。" onConfirm={async () => { try {await api('/admin/account/sms/release-all',{method:'POST',body:'{}'});message.success('平台占用号码已释放');onRefresh?.();}catch(e){setResult({ok:false,text:e.message});} }}><Button danger disabled={busy}>释放豪猪账户全部占用号码</Button></Popconfirm>
     </Space> }]} /></fieldset>}

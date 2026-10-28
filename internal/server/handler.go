@@ -90,13 +90,9 @@ type Config struct {
 	// FallbackModeEcho 当前兜底挂载状态回显（前端切换按钮用）。
 	// NewHandler 组装后自动接上；无 AutoEnroll 时返回 false。
 	FallbackModeEcho func() bool
-	// HaozhumaH5 豪猪网页版只读客户端（可选，P1 增强）。main 在
-	// sms.haozhuma.h5_session 非空时创建并注入；nil = 未启用，项目搜索/
-	// 对接码选择端点返回 503，前端退化为手填。会话可随时热贴
-	//（SetHaozhumaH5Session），与任务链路完全无关。
+	// HaozhumaH5 is initialized before serving, with optional encrypted storage.
 	HaozhumaH5 *haozhumah5.Client
-	// SetHaozhumaH5Session 运行时粘贴/清空 PHPSESSID。main 注入（指向
-	// HaozhumaH5.Session）；未注入时粘贴只落盘（重启后生效）。
+	// SetHaozhumaH5Session is retained for transient legacy callers.
 	SetHaozhumaH5Session func(session string)
 	// SetAutoEnrollLimits 运行时更新自动加号任务控制参数（余额阈值/熔断）。
 	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘。
@@ -232,6 +228,8 @@ type Handler struct {
 	// 同时落盘 config.json 供重启后保持）。读侧在请求热路径，写侧仅管理
 	// 端点，锁竞争可忽略。
 	featuresMu   sync.RWMutex
+	h5Mu         sync.RWMutex
+	h5UpdateMu   sync.Mutex
 	passthrough  bool
 	responsesOff bool
 	creditPolicy CreditPolicy
@@ -602,10 +600,10 @@ func NewHandler(cfg Config) *Handler {
 			}
 			// 2) 豪猪账户：H5 type=41 移出（H5 未配置时跳过——账户侧残留
 			// 无害，用户下次保存配置时同步逻辑会清掉）。
-			if h.cfg.HaozhumaH5 != nil {
+			if c := h.H5Client(); c != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
-				if err := h.cfg.HaozhumaH5.RemoveUIDs(ctx, uids); err != nil {
+				if err := c.RemoveUIDs(ctx, uids); err != nil {
 					log.Printf("[haozhuma] 对接码 %v 从账户移出失败: %v", uids, err)
 				} else {
 					log.Printf("[haozhuma] 对接码 %v 已自动移出豪猪账户（用完/失效）", uids)
@@ -653,17 +651,22 @@ func (h *Handler) AutoEnroller() *AutoEnroller {
 	return h.cfg.AutoEnroll
 }
 
-// SetHaozhumaH5 main 启动时注入 H5 只读客户端（h5_session 已配置的
-// 部署）。main 专属：粘贴/热更走 haozhumaH5Session 端点内联处理。
+// SetHaozhumaH5 installs the client; the session endpoint updates it in place.
 func (h *Handler) SetHaozhumaH5(c *haozhumah5.Client) {
+	h.h5Mu.Lock()
+	defer h.h5Mu.Unlock()
 	h.cfg.HaozhumaH5 = c
-	// 顺便接上 SetHaozhumaH5Session：main 不需要单独注入，这里与
-	// SetHaozhumaSid 的自接线模式一致。
-	h.cfg.SetHaozhumaH5Session = c.Session
+	if c != nil {
+		h.cfg.SetHaozhumaH5Session = c.Session
+	} else {
+		h.cfg.SetHaozhumaH5Session = nil
+	}
 }
 
 // H5Client 返回注入的 H5 客户端（main 组装 UIDWatcher 用；nil = 未配置）。
 func (h *Handler) H5Client() *haozhumah5.Client {
+	h.h5Mu.RLock()
+	defer h.h5Mu.RUnlock()
 	return h.cfg.HaozhumaH5
 }
 
@@ -1351,16 +1354,19 @@ func maskCredential(s string) string {
 	return string(rs[:2]) + "***" + string(rs[len(rs)-2:])
 }
 
-// h5SessionEcho H5 会话回显（脱敏）：只报 has/expired/last_seen/last_error，
-// PHPSESSID 值本体绝不出接口（泄露 = 豪猪账号完全被盗，见设计文档 §6.2）。
-// configuredSession 来自配置文件（未启动 client 时只知道配没配）。
+// h5SessionEcho returns status and persistence metadata, never the credential.
 func (h *Handler) h5SessionEcho(_ string) map[string]any {
-	echo := map[string]any{"has": false, "configured": false, "storage": "memory", "auth_mode": "web_token"}
-	if h.cfg.HaozhumaH5 != nil {
-		info := h.cfg.HaozhumaH5.Info()
+	echo := map[string]any{"has": false, "configured": false, "storage": "memory", "persisted": false, "auth_mode": "web_token"}
+	if c := h.H5Client(); c != nil {
+		info := c.Info()
 		echo["has"] = info.Has
 		echo["configured"] = info.Has
 		echo["expired"] = info.Expired
+		echo["storage"] = info.Storage
+		echo["persisted"] = info.Persisted
+		if info.StorageError != "" {
+			echo["storage_error"] = info.StorageError
+		}
 		if !info.LastSeen.IsZero() {
 			echo["last_seen"] = info.LastSeen.Format(time.RFC3339)
 		}
@@ -2055,7 +2061,7 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var uidSyncErrors []string
-	if req.SMS != nil && req.SMS.Haozhuma.UIDs != nil && h.cfg.HaozhumaH5 != nil {
+	if req.SMS != nil && req.SMS.Haozhuma.UIDs != nil && h.H5Client() != nil {
 		var oldDoc map[string]any
 		_ = json.Unmarshal(raw, &oldDoc)
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -2366,10 +2372,8 @@ func (h *Handler) haozhumaSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s)
 }
 
-// haozhumaH5Session 粘贴/清空 PHPSESSID（WebUI 增强设置）。验证通过才
-// 落盘：立即用新会话真调一次项目搜索（gjc=腾讯——豪猪最主流的项目族，
-// 命中即视为会话有效）。清空（session=""）不验证直接落盘。
-// 运行中的任务不受任何影响：H5 只服务选择器，与接码 API 完全独立。
+// haozhumaH5Session validates a Web token, then commits storage before activation.
+// Clearing is persisted without contacting the provider.
 func (h *Handler) haozhumaH5Session(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Session string  `json:"session"`
@@ -2387,9 +2391,15 @@ func (h *Handler) haozhumaH5Session(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "令牌格式不正确"})
 		return
 	}
+	h.h5UpdateMu.Lock()
+	defer h.h5UpdateMu.Unlock()
+	c := h.H5Client()
 	if token == "" {
-		if h.cfg.HaozhumaH5 != nil {
-			h.cfg.HaozhumaH5.Session("")
+		if c != nil {
+			if err := c.SaveSession(""); err != nil {
+				writeJSON(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "cleared": true})
 		return
@@ -2401,17 +2411,22 @@ func (h *Handler) haozhumaH5Session(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "Web 登录令牌验证失败：" + err.Error()})
 		return
 	}
-	if h.cfg.HaozhumaH5 == nil {
+	if c == nil {
 		h.SetHaozhumaH5(probe)
 	} else {
-		h.cfg.HaozhumaH5.Session(token)
+		if err := c.SaveSession(token); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "storage": "memory"})
+	info := h.H5Client().Info()
+	writeJSON(w, 200, map[string]any{"ok": true, "storage": info.Storage, "persisted": info.Persisted})
 }
 
 // haozhumaProjects 项目搜索（代理 H5 type=30）。q 为搜索关键词。
 func (h *Handler) haozhumaProjects(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.HaozhumaH5 == nil {
+	c := h.H5Client()
+	if c == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "项目搜索未启用（需在增强设置里粘贴 Web 登录令牌）"})
 		return
 	}
@@ -2422,7 +2437,7 @@ func (h *Handler) haozhumaProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	projects, err := h.cfg.HaozhumaH5.Projects(ctx, q)
+	projects, err := c.Projects(ctx, q)
 	if err != nil {
 		writeH5Error(w, err)
 		return
@@ -2433,7 +2448,8 @@ func (h *Handler) haozhumaProjects(w http.ResponseWriter, r *http.Request) {
 // haozhumaUIDs 对接码列表（代理 H5 type=8）。sid 支持 16 位 hex 会话
 // 标识与数字项目 ID 两种（上游两者都收）。
 func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.HaozhumaH5 == nil {
+	c := h.H5Client()
+	if c == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码列表未启用（需在增强设置里粘贴 Web 登录令牌）"})
 		return
 	}
@@ -2444,7 +2460,7 @@ func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	uids, err := h.cfg.HaozhumaH5.UIDs(ctx, sid)
+	uids, err := c.UIDs(ctx, sid)
 	if err != nil {
 		writeH5Error(w, err)
 		return
@@ -2459,7 +2475,8 @@ func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
 // 看到的码必须先加入才能取号（否则报「没有这个[xxx]专属码」）。
 // 前端选码后调用本端点完成"加入"，再保存配置。
 func (h *Handler) haozhumaAddUID(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.HaozhumaH5 == nil {
+	c := h.H5Client()
+	if c == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码增强未启用（需粘贴 PHPSESSID）"})
 		return
 	}
@@ -2477,7 +2494,7 @@ func (h *Handler) haozhumaAddUID(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	if err := h.cfg.HaozhumaH5.AddUID(ctx, uid); err != nil {
+	if err := c.AddUID(ctx, uid); err != nil {
 		writeH5Error(w, err)
 		return
 	}
@@ -2488,13 +2505,14 @@ func (h *Handler) haozhumaAddUID(w http.ResponseWriter, r *http.Request) {
 // haozhumaMyUIDs 我账户已加入的对接码（代理 H5 type=3）。前端用它
 // 标注市场列表里哪些码"已加入可直接取号"。
 func (h *Handler) haozhumaMyUIDs(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.HaozhumaH5 == nil {
+	c := h.H5Client()
+	if c == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码增强未启用（需粘贴 PHPSESSID）"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	uids, err := h.cfg.HaozhumaH5.MyUIDs(ctx, strings.TrimSpace(r.URL.Query().Get("q")))
+	uids, err := c.MyUIDs(ctx, strings.TrimSpace(r.URL.Query().Get("q")))
 	if err != nil {
 		writeH5Error(w, err)
 		return

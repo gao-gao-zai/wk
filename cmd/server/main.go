@@ -24,7 +24,6 @@ import (
 	"workbuddy2api/internal/collectionservice"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
-	"workbuddy2api/internal/haozhumah5"
 	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/promptguard"
@@ -611,8 +610,11 @@ func main() {
 		SoftCooldown:        cfg.SoftRateDur,
 	})
 
-	// Web token is independent of the SMS API token and stays in memory.
-	h.SetHaozhumaH5(haozhumah5.New(strings.TrimSpace(os.Getenv("HAOZHUMA_WEB_TOKEN"))))
+	h5Client, h5Err := loadHaozhumaWebClient(cfg, promptSecret)
+	if h5Err != nil {
+		log.Printf("haozhuma Web token: %v", h5Err)
+	}
+	h.SetHaozhumaH5(h5Client)
 
 	// 对接码监控（UID Watcher，可选）：autoenroll.watch 配置 + 豪猪 H5 +
 	// AutoEnroll 三者齐备才组装。状态文件在 state.json 同目录（卷内，
