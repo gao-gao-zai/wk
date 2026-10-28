@@ -748,6 +748,19 @@ func (p *Pool) Add(a *auth.Auth) {
 	p.markDirtyUpLocked(a.UID)
 }
 
+// AddDisabled installs a new imported account without a routable interval.
+// An existing account is never overwritten by an import.
+func (p *Pool) AddDisabled(a *auth.Auth, reason string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.byUID[a.UID]; exists {
+		return false
+	}
+	p.byUID[a.UID] = &entry{a: a, disabled: true, reason: reason}
+	p.noteChangeLocked(a.UID)
+	return true
+}
+
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化（文件模式回写 state.json / DB 模式删行），避免已删账号在
 // 下次启动时复活。
@@ -796,7 +809,11 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	e := &entry{a: a, disabled: a.ImportDisabled}
+	if a.ImportDisabled {
+		e.reason = "imported; awaiting administrator enable"
+	}
+	p.byUID[a.UID] = e
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

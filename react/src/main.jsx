@@ -708,7 +708,7 @@ function Console() {
     'prompt-guard': ['系统提示词', '配置通用内容替换，记录 11128 拦截，定位触发片段并验证替换结果。'],
 	traffic: ['流量统计', '按全站、账号、API key、账号分组、代理分组和单代理查看 RPM、并发与请求用量。'],
     dashboard: ['运营概览', '账号池、请求量和 token 用量实时汇总，数据每 30 秒自动更新。'],
-    pool: ['账号列表', '账号池全量明细：状态、冷却/熔断、积分与凭证有效期，支持搜索和多维筛选。'],
+    pool: ['账号管理', '统一管理账号池，支持多选、批量操作、分组与加密迁移。'],
     models: ['模型与请求', '查看当前可用的上游模型。'],
     playground: ['请求测试', '发送 Responses API 请求并查看标准化的 output_text。'],
     requests: ['请求日志', '按时间、模型、状态、错误码、端点、账号、版本、首字耗时和请求 ID 筛选历史请求。'],
@@ -724,7 +724,7 @@ function Console() {
   const menuItems = [
     { key: 'dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: 'traffic', icon: <ThunderboltOutlined />, label: '流量统计' },
-    { key: 'pool', icon: <TeamOutlined />, label: '账号列表' },
+    { key: 'pool', icon: <TeamOutlined />, label: '账号管理' },
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
     { key: 'playground', icon: <SendOutlined />, label: '请求测试' },
     { key: 'requests', icon: <FileSearchOutlined />, label: '请求日志' },

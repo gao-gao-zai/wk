@@ -483,6 +483,14 @@ Tokens prefixed with @ are paths the user explicitly referenced. Relative paths 
 
 ## API 端点
 
+### 账号管理
+
+控制台「账号管理」（`#/pool`）支持中国区/海外版账号搜索、状态/区域/分组/凭证筛选、跨页多选，以及批量启用、禁用、清冷却、分组调整、签到、保活和删除。默认每页 25 条，可切换 50/100 条；筛选改变会清空选择，批量执行展示逐项结果，可取消后续操作或重试失败项。删除需输入 `DELETE`；签到、保活和刷新上游积分会明确确认真实上游请求。
+
+分组调整支持替换、追加和移出，遵守区域约束。实例间迁移使用「加密导出」和「导入账号」：密码至少 12 字符，迁移包经 PBKDF2-SHA256（600000 次）与 AES-256-GCM 加密，只包含所选账号凭据与分组。先解密预览、选择后导入，不覆盖已有 UID 或授权文件；新账号均停用，核对后手动启用。导出不会停用或删除来源账号，需在目标验证后自行处理来源。导入仅保留目标已有且区域兼容的分组，不迁移管理员密钥、代理、临时冷却和计费统计。「导出清单」仅包含展示信息，不含凭据。
+
+管理员接口：`POST /admin/accounts/export`（`uids,password`），`POST /admin/accounts/import/preview`（`bundle,password`），`POST /admin/accounts/import`（`bundle,password,uids`）。最多 1000 个账号、请求体最多 16 MiB，分组密钥禁止调用，迁移响应 `Cache-Control: no-store`。迁移不会主动登录或探测上游。批量操作复用原有单账号接口，离开页面停止尚未发送的请求；已发送的请求继续完成，网络中断后请刷新核对再重试。
+
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer | OpenAI 兼容聊天补全（流式/非流式） |

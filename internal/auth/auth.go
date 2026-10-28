@@ -27,6 +27,9 @@ type Auth struct {
 	EnterpriseID string
 	Nickname     string
 	FilePath     string // 来源文件；refresh 后原子写回此处
+	// ImportDisabled is immutable metadata: if pool state is lost or an import
+	// crashes after installing its file, a fresh pool must quarantine this auth.
+	ImportDisabled bool
 }
 
 // Credentials is an immutable point-in-time copy of an account credential.
@@ -210,6 +213,11 @@ func Parse(raw []byte) (*Auth, error) {
 			return nil, fmt.Errorf("parse_error: %s contains illegal characters", name)
 		}
 	}
+	if flag, ok := probe["_import_disabled"]; ok {
+		if err := json.Unmarshal(flag, &a.ImportDisabled); err != nil {
+			return nil, fmt.Errorf("parse_error: invalid import marker")
+		}
+	}
 	return &a, nil
 }
 
@@ -242,6 +250,7 @@ func (a *Auth) SaveAtomic() error {
 		return fmt.Errorf("no FilePath set")
 	}
 	doc := map[string]any{
+		"_import_disabled": a.ImportDisabled,
 		"auth": map[string]any{
 			"accessToken":  snapshot.AccessToken,
 			"refreshToken": snapshot.RefreshToken,

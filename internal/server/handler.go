@@ -203,20 +203,22 @@ type ResponseStore interface {
 
 // Handler 主路由。
 type Handler struct {
-	cacheRouter     *cacheroute.Router
-	cfg             Config
-	mux             *http.ServeMux
-	sessionsMu      sync.Mutex
-	sessions        map[string]time.Time
-	configMu        sync.Mutex
-	responsesMu     sync.Mutex
-	responseHistory map[string]*storedResponse
-	responseBytes   int64
-	responseOrder   responseHistoryHeap
-	responseExpiry  responseExpiryHeap
-	responsePolicy  responsehistory.Policy
-	unlockRateMu    sync.Mutex
-	unlockAttempts  map[string]unlockAttempt
+	cacheRouter       *cacheroute.Router
+	cfg               Config
+	mux               *http.ServeMux
+	sessionsMu        sync.Mutex
+	sessions          map[string]time.Time
+	configMu          sync.Mutex
+	accountAdminMu    sync.Mutex // serializes credential creation/import/deletion
+	accountTransferMu sync.Mutex // bounds concurrent password derivation work
+	responsesMu       sync.Mutex
+	responseHistory   map[string]*storedResponse
+	responseBytes     int64
+	responseOrder     responseHistoryHeap
+	responseExpiry    responseExpiryHeap
+	responsePolicy    responsehistory.Policy
+	unlockRateMu      sync.Mutex
+	unlockAttempts    map[string]unlockAttempt
 	// 全局解锁失败窗口（跨 IP），见 recordGlobalUnlockFailureLocked。
 	unlockGlobalFailures     int
 	unlockGlobalWindowStart  time.Time
@@ -477,6 +479,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/account/{uid}/checkin", h.withFrontend(h.checkinAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/keepalive", h.withFrontend(h.keepaliveAccount))
 	h.mux.HandleFunc("DELETE /admin/account/{uid}", h.withFrontend(h.deleteAccount))
+	h.mux.HandleFunc("POST /admin/accounts/export", h.withFrontend(h.exportAccounts))
+	h.mux.HandleFunc("POST /admin/accounts/import/preview", h.withFrontend(h.previewAccountImport))
+	h.mux.HandleFunc("POST /admin/accounts/import", h.withFrontend(h.importAccounts))
 	// 成长任务中心：任务列表 / 接受 / 领奖 / 一键完成（单任务/全量/全部账号）。
 	h.mux.HandleFunc("GET /admin/account/{uid}/tasks", h.withFrontend(h.accountTasks))
 	h.mux.HandleFunc("POST /admin/account/{uid}/tasks/accept", h.withFrontend(h.accountTaskAccept))
@@ -2967,6 +2972,8 @@ type accountCredential struct {
 //
 // region 是本次登录所属区域，仅用于决定是否要把 config.region 提升为 all。
 func (h *Handler) persistAccount(cred accountCredential, region string) (map[string]any, int, error) {
+	h.accountAdminMu.Lock()
+	defer h.accountAdminMu.Unlock()
 	if filepath.Base(cred.UID) != cred.UID || strings.ContainsAny(cred.UID, `/\`) {
 		return nil, http.StatusBadRequest, errors.New("授权返回的 UID 无效")
 	}
@@ -3555,6 +3562,8 @@ func (h *Handler) disableAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	h.accountAdminMu.Lock()
+	defer h.accountAdminMu.Unlock()
 	uid := strings.TrimSpace(r.PathValue("uid"))
 	if uid == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
