@@ -39,7 +39,8 @@
     "sanitize_blacklist_fingerprints": true,
     "passthrough": false,
     "codex_compat": false,
-    "dsh_compat": false
+    "dsh_compat": false,
+    "anthropic_api": false
   },
   "billing": {
     "input_credits_per_1k_tokens": 0,

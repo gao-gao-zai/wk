@@ -842,6 +842,7 @@ function Console() {
                   ['dsh_compat', 'DSH 兼容', '同义改写 DSH 系统提示词中的固定身份句、Web GUI 说明和路径引用说明；只改写 system/developer 文本，默认关闭。'],
                   ['sanitize_blacklist_fingerprints', '指纹脱敏', '剥离/改写出站请求中的 Claude Code 指纹模板句；关闭后完全原样发送（调试用）。'],
                   ['passthrough', '原始流透传', '流式响应原样转发上游 SSE 字节，保留扩展字段；单请求可用 X-WorkBuddy-Passthrough: false 临时关闭。'],
+                  ['anthropic_api', 'Anthropic Messages API', '开放 /v1/messages，支持 Anthropic 客户端；默认关闭，保存后立即生效。'],
                   ['responses_api', 'Responses API', '开放 /v1/responses 端点（OpenAI Responses 协议，Codex CLI 等客户端使用）；关闭后返回 404，只用 Chat Completions 的部署建议关掉。'],
                 ].filter(([key]) => !config.legacy_prompt_compat_migrated || !['codex_compat', 'dsh_compat'].includes(key)).map(([key, label, desc]) => (
                   <div key={key} style={{ display: 'flex', justifyContent: 'space-between', gap: 24, alignItems: 'flex-start' }}>

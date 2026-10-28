@@ -575,6 +575,7 @@ func main() {
 		// Responses 端点开关反转：Config 零值必须表示"开"（单测约定），
 		// 配置文件语义是 responses_api=true 开。
 		DisableResponses: !cfg.Features.ResponsesAPI,
+		AnthropicAPI:     cfg.Features.AnthropicAPI,
 		// WebUI 特性开关保存后即时推到 upstream Client（脱敏/Codex 改写）。
 		SetSanitizeFingerprints: up.SetSanitizeFingerprints,
 		SetCodexCompat:          upstream.SetCodexCompat,

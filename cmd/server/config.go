@@ -109,6 +109,8 @@ type Config struct {
 		// 用途：只用 Chat Completions 的部署关掉它，缩小攻击面与日志噪音
 		// （Responses 带会话历史存储，比 chat 多一块状态）。
 		ResponsesAPI bool `json:"responses_api"`
+		// AnthropicAPI enables the Anthropic Messages compatibility endpoint.
+		AnthropicAPI bool `json:"anthropic_api"`
 	} `json:"features"`
 
 	Billing struct {
@@ -493,6 +495,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_RESPONSES_API"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.ResponsesAPI = b
+		}
+	}
+	if v := os.Getenv("WB2A_ANTHROPIC_API"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.AnthropicAPI = b
 		}
 	}
 	limitEnv := os.Getenv("WB2A_MAX_REQUEST_BODY_MB")

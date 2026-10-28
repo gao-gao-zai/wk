@@ -76,6 +76,20 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 当前接口接收 JSON，不提供 multipart 文件上传接口；请求体上限默认 8 MB，可通过 `max_request_body_mb`（1-128）或控制台「管理设置 → 请求体大小限制」修改，WebUI 保存即时生效。图片模型能力由 WorkBuddy 上游账号决定，格式不完整时服务会返回 `400 invalid_image`。
 
+## Anthropic Messages 兼容接口
+
+默认关闭。设置 `features.anthropic_api: true`、环境变量 `WB2A_ANTHROPIC_API=true`，或在控制台「管理设置 → 特性开关」启用；控制台保存后立即生效并写回配置。关闭时已鉴权请求返回 404。接口使用与 Chat 相同的账号池、鉴权和分组权限，接受 `x-api-key` 或 `Authorization: Bearer`。
+
+```bash
+curl http://localhost:7863/v1/messages \
+  -H "x-api-key: $WB2A_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"glm-5.2","max_tokens":1024,"messages":[{"role":"user","content":"你好"}],"stream":true}'
+```
+
+支持文本、URL/Base64 图片、客户端工具定义和调用、工具结果、常见工具选择及流式和非流式响应。流式工具参数会在完成后按工具分别输出，以保证并行调用不串块。`thinking` 预算和 `output_config.effort` 近似映射到 `reasoning_effort`，具体效果由模型决定；不生成 Anthropic 签名 thinking 块，历史 thinking 块不会转发。`cache_control` 不映射为上游缓存断点；`top_k` 不转发。Anthropic 服务端工具、结构化输出格式、文档和其他未支持的内容块会返回 400，而不会伪装成原生支持；不提供 `/v1/messages/count_tokens`。计费和缓存统计依赖上游提供的 usage，缺失时不会凭空估算。停止序列触发情况及部分上游专有语义无法完整还原。
+
 ## 配置说明
 
 > **权威字段定义见 [`config.example.json`](config.example.json)**：它是当前 schema 的唯一权威，下方样例与之保持一致。`cp config.example.json config.json` 即可得到完整默认配置。
