@@ -69,9 +69,10 @@ func (k ErrKind) String() string {
 
 // Error 带分类的上游错误。
 type Error struct {
-	Kind   ErrKind
-	Status int
-	Msg    string
+	Kind       ErrKind
+	Status     int
+	Msg        string
+	RetryAfter time.Duration
 }
 
 func (e *Error) Error() string {
@@ -402,7 +403,7 @@ func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -413,7 +414,7 @@ func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error
 		if kind == ErrNone {
 			kind = ErrClient
 		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160)), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
 	}
 	return env.Data, nil
 }
@@ -665,8 +666,11 @@ type ModelInfo struct {
 // FetchModels 调上游动态模型接口。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	return c.FetchModelsContext(context.Background(), a)
+}
+func (c *Client) FetchModelsContext(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
 	url := c.chatBase(a) + "/console/enterprises/personal/models"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -688,7 +692,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, &Error{Kind: Classify(resp.StatusCode, string(raw)), Status: resp.StatusCode, Msg: truncate(string(raw), 120), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -811,6 +815,9 @@ type RequestUsage struct {
 
 // UserRequestUsage queries the web billing meter for recent request charges.
 func (c *Client) UserRequestUsage(a *auth.Auth, start, end time.Time, page, pageSize int) ([]RequestUsage, int, error) {
+	return c.UserRequestUsageContext(context.Background(), a, start, end, page, pageSize)
+}
+func (c *Client) UserRequestUsageContext(ctx context.Context, a *auth.Auth, start, end time.Time, page, pageSize int) ([]RequestUsage, int, error) {
 	if page <= 0 {
 		page = 1
 	}
@@ -823,7 +830,7 @@ func (c *Client) UserRequestUsage(a *auth.Auth, start, end time.Time, page, page
 		return nil, 0, err
 	}
 	usagePath := "/billing/meter/get-user-request-usage"
-	req, err := http.NewRequest(http.MethodPost, c.billingBase(a)+usagePath, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.billingBase(a)+usagePath, bytes.NewReader(raw))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -834,16 +841,22 @@ func (c *Client) UserRequestUsage(a *auth.Auth, start, end time.Time, page, page
 	}
 	var resp struct {
 		Data  []RequestUsage `json:"data"`
-		Total int            `json:"total"`
+		Total *int           `json:"total"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, 0, fmt.Errorf("request usage parse: %w", err)
 	}
-	return resp.Data, resp.Total, nil
+	if resp.Total == nil || resp.Data == nil || *resp.Total < 0 {
+		return nil, 0, fmt.Errorf("request usage response missing valid data/total")
+	}
+	return resp.Data, *resp.Total, nil
 }
 
 // UserResourceDetails queries the upstream credit counters for one account.
 func (c *Client) UserResourceDetails(a *auth.Auth) (ResourceUsage, error) {
+	return c.UserResourceDetailsContext(context.Background(), a)
+}
+func (c *Client) UserResourceDetailsContext(ctx context.Context, a *auth.Auth) (ResourceUsage, error) {
 	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
 	now := time.Now()
 	body := map[string]any{
@@ -855,7 +868,7 @@ func (c *Client) UserResourceDetails(a *auth.Auth) (ResourceUsage, error) {
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return ResourceUsage{}, err
 	}
@@ -881,6 +894,9 @@ func (c *Client) UserResourceDetails(a *auth.Auth) (ResourceUsage, error) {
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return ResourceUsage{}, fmt.Errorf("resource parse: %w", err)
+	}
+	if resp.Response.Data.Accounts == nil {
+		return ResourceUsage{}, fmt.Errorf("resource response missing Accounts")
 	}
 	usage := ResourceUsage{}
 	for _, acct := range resp.Response.Data.Accounts {

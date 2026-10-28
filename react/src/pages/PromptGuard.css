@@ -9,8 +9,27 @@
 .pg-prompt pre, .pg-candidate { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-height: 400px; overflow: auto; padding: 16px; border: 1px solid #e4e9f0; border-radius: 8px; background: #f7f9fc; font-size: 12px; line-height: 1.7; }
 .pg-settings { max-width: 780px; display: grid; gap: 10px; }
 .pg-notice { margin-bottom: 20px; }
+.pg-job, .pg-history { width: 100%; min-width: 0; }
+.pg-job-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; }
+.pg-job-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 16px 0 10px; }
+.pg-job-metrics > div { min-width: 0; padding: 12px; background: #f7f9fc; border: 1px solid #e4e9f0; border-radius: 8px; }
+.pg-job-metrics strong { display: block; margin-top: 6px; font-size: 19px; overflow-wrap: anywhere; }
+.pg-stages { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
+.pg-stage { min-width: 0; padding: 12px; border: 1px solid #e4e9f0; border-radius: 8px; }
+.pg-stage > div { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
+.pg-reason-code { font-family: monospace; font-size: 11px; overflow-wrap: anywhere; }
+.pg-job-time { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 12px; font-size: 12px; }
+.pg-trace { margin-top: 16px; }
 @media (max-width: 1000px) { .pg-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 520px) {
+  .pg-stages { grid-template-columns: minmax(0, 1fr); }
+  .pg-job-metrics { gap: 6px; }
+  .pg-job-metrics > div { padding: 8px; }
+  .pg-job-metrics strong { font-size: 16px; }
+  .pg-job-metrics .ant-typography { font-size: 12px; }
+  .pg-job .ant-card-body, .pg-history .ant-card-body { padding: 10px; }
+  .pg-history .ant-card-head-wrapper { flex-wrap: wrap; gap: 8px; padding: 8px 0; }
+  .pg-history .ant-card-head-title { white-space: normal; }
   .pg-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .pg-stats .ant-card-body { padding: 16px; }
   .pg-toolbar { align-items: flex-start; }

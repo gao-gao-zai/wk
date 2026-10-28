@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -202,7 +203,9 @@ func probeDocument(model string, messages []promptguard.Message) map[string]any 
 // credentials, rotates on failure, changes health or records its own probes.
 func (h *Handler) promptProbe(item promptguard.Case) promptguard.Probe {
 	pinned := item.UID
-	return func(parent context.Context, messages []promptguard.Message, rewrite bool) promptguard.ProbeResult {
+	return func(parent context.Context, messages []promptguard.Message, rewrite bool) (result promptguard.ProbeResult) {
+		attempted := false
+		defer func() { result.RequestAttempted = &attempted }()
 		unknown := func(httpStatus int, reason string) promptguard.ProbeResult {
 			return promptguard.ProbeResult{Outcome: "inconclusive", HTTP: httpStatus, Reason: reason}
 		}
@@ -243,8 +246,12 @@ func (h *Handler) promptProbe(item promptguard.Case) promptguard.Probe {
 		if err != nil {
 			return unknown(0, "invalid_prompt")
 		}
+		attempted = true
 		rc, status, raw, _, err := h.cfg.Upstream.ChatStreamPreparedWithPolicy(ctx, acct, body, upstream.StreamPolicy{Total: 45 * time.Second, Idle: 20 * time.Second})
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return unknown(status, "request_timeout")
+			}
 			return unknown(status, "transport_error")
 		}
 		if rc != nil {
@@ -254,6 +261,12 @@ func (h *Handler) promptProbe(item promptguard.Case) promptguard.Probe {
 			return promptguard.ProbeResult{Outcome: "blocked", HTTP: status, Reason: "11128"}
 		}
 		if status != 200 || rc == nil {
+			if status == 429 {
+				return unknown(status, "rate_limit")
+			}
+			if status == 401 || status == 403 {
+				return unknown(status, "upstream_auth_error")
+			}
 			return unknown(status, "upstream_error")
 		}
 		return classifyPromptStream(rc)

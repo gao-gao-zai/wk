@@ -60,17 +60,19 @@ type ModelCooldownStatus struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID                 string `json:"uid"`
-	Nickname            string `json:"nickname,omitempty"`
-	Region              string `json:"region"`
-	Credits             int64  `json:"credits"`
-	CapacitySize        int64  `json:"capacity_size,omitempty"`
-	CapacityRemain      int64  `json:"capacity_remain,omitempty"`
-	CapacityUsed        int64  `json:"capacity_used,omitempty"`
-	CycleCapacitySize   int64  `json:"cycle_capacity_size,omitempty"`
-	CycleCapacityRemain int64  `json:"cycle_capacity_remain,omitempty"`
-	CycleCapacityUsed   int64  `json:"cycle_capacity_used,omitempty"`
-	CreditUpdatedAt     int64  `json:"credit_updated_at,omitempty"`
+	UID                 string  `json:"uid"`
+	Nickname            string  `json:"nickname,omitempty"`
+	Region              string  `json:"region"`
+	Credits             int64   `json:"credits"`
+	EstimatedSpent      float64 `json:"estimated_spent"`
+	EffectiveCredits    float64 `json:"effective_credits"`
+	CapacitySize        int64   `json:"capacity_size,omitempty"`
+	CapacityRemain      int64   `json:"capacity_remain,omitempty"`
+	CapacityUsed        int64   `json:"capacity_used,omitempty"`
+	CycleCapacitySize   int64   `json:"cycle_capacity_size,omitempty"`
+	CycleCapacityRemain int64   `json:"cycle_capacity_remain,omitempty"`
+	CycleCapacityUsed   int64   `json:"cycle_capacity_used,omitempty"`
+	CreditUpdatedAt     int64   `json:"credit_updated_at,omitempty"`
 	// TokenExpiresAt 是 access token 到期时间（Unix 秒，0 = 未知）。只读观测字段，
 	// 供控制台提示凭证即将失效；不参与选号。
 	TokenExpiresAt  int64                          `json:"token_expires_at,omitempty"`
@@ -1552,6 +1554,14 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	return nil
 }
 
+// IsDisabled is a cheap eligibility check for background collection.
+func (p *Pool) IsDisabled(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e := p.byUID[uid]
+	return e == nil || e.disabled
+}
+
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
 // 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
 func (p *Pool) AvailableUIDs() []string {
@@ -1690,6 +1700,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:            e.a.Nickname,
 		Region:              e.a.Region(),
 		Credits:             e.credits,
+		EstimatedSpent:      e.spent,
+		EffectiveCredits:    max(0, float64(e.credits)-e.spent),
 		CapacitySize:        e.capacitySize,
 		CapacityRemain:      e.capacityRemain,
 		CapacityUsed:        e.capacityUsed,

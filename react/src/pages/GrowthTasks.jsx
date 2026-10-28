@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CollectionLaunch } from '../components/Collection';
+import { freshness } from '../lib/collection';
 import {
   App, Alert, Button, Card, Drawer, Empty, Input, Popconfirm, Progress,
   Skeleton, Space, Spin, Table, Tag, Tooltip, Typography,
@@ -48,6 +50,7 @@ function jobItemTag(item) {
 export default function GrowthTasks({ api, data, refresh }) {
   const { message } = App.useApp();
   const [tasks, setTasks] = useState(null);
+  const [taskSnapshot, setTaskSnapshot] = useState(null);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [autoActions, setAutoActions] = useState({});
   const [search, setSearch] = useState('');
@@ -182,6 +185,7 @@ export default function GrowthTasks({ api, data, refresh }) {
     try {
       const result = await api(`/admin/account/${uid}/tasks`);
       setTasks(result.tasks || []);
+      setTaskSnapshot(result.snapshot || null);
       setAutoActions(result.auto_actions || {});
     } catch (error) {
       message.error(error.message);
@@ -540,7 +544,7 @@ export default function GrowthTasks({ api, data, refresh }) {
               {ledgerOpen ? '收起明细' : '展开明细'}
             </Button>
           )}
-          <Button size="small" icon={<ReloadOutlined />} loading={ledgerLoading} onClick={() => loadLedger(true)}>刷新</Button>
+          <CollectionLaunch api={api} initialResources={["tasks"]} disabled={!accounts.some(a => !a.disabled)} uids={accounts.filter(a => !a.disabled).map(a => a.uid)} title="成长任务账号" onComplete={() => loadLedger()}>在线采集</CollectionLaunch>
         </Space>
       )}
     >
@@ -744,7 +748,7 @@ export default function GrowthTasks({ api, data, refresh }) {
         extra={drawerUid && (
           <Space>
             <Button icon={<CheckCircleOutlined />} onClick={() => acceptAll(drawerUid)}>全部接受</Button>
-            <Button icon={<ReloadOutlined />} onClick={() => loadTasks(drawerUid)}>刷新</Button>
+            <CollectionLaunch api={api} initialResources={["tasks"]} uids={[drawerUid]} title="当前账号" onComplete={() => loadTasks(drawerUid)}>在线采集</CollectionLaunch>
             <Popconfirm
               title="一键完成全部可自动任务"
               description="后台异步执行（可离开页面），页面顶部实时显示进度"
@@ -755,6 +759,7 @@ export default function GrowthTasks({ api, data, refresh }) {
           </Space>
         )}
       >
+        {taskSnapshot && <Alert type={taskSnapshot.error ? 'warning' : 'info'} showIcon style={{ marginBottom: 16 }} message={`${freshness(taskSnapshot)}${taskSnapshot.error ? ` · ${taskSnapshot.error}` : ''}，可通过在线采集更新。`} />}
         {tasksLoading && !tasks ? (
           <div style={{ textAlign: 'center', padding: 48 }}><Spin /></div>
         ) : !tasks || !tasks.length ? (

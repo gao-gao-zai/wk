@@ -347,6 +347,9 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 			}
 		}
 		success++
+		if h.cfg.Collection != nil {
+			h.cfg.Collection.Forget(uid)
+		}
 		results = append(results, map[string]any{"uid": uid, "ok": true, "detail": detail})
 	}
 	h.cfg.Pool.Flush()

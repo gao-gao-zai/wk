@@ -26,6 +26,8 @@ import RequestLogsPage from './pages/RequestLogs';
 import TrafficStatistics from './pages/TrafficStatistics';
 import AccountSettingsPage from './pages/AccountSettings';
 import AccountListPage from './pages/AccountList';
+import CollectionCenter from './pages/CollectionCenter';
+import { CollectionNotice } from './components/Collection';
 import GrowthTasksPage from './pages/GrowthTasks';
 import PromptGuardPage, { PromptGuardNotice } from './pages/PromptGuard';
 import RequestSummaryNotice from './components/RequestSummaryNotice';
@@ -56,7 +58,7 @@ const parseHours = value => String(value || '').split(',').map(item => item.trim
 
 // 页面标识。用 hash 路由（#/auto-enroll）而不是给每页单独打包：
 // 刷新能停在原页、地址可收藏转发，且不引入 react-router 依赖。
-const SECTIONS = ['dashboard', 'traffic', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'reqproxy', 'groups', 'growth', 'prompt-guard', 'settings'];
+const SECTIONS = ['dashboard', 'traffic', 'pool', 'collection', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'reqproxy', 'groups', 'growth', 'prompt-guard', 'settings'];
 
 // sectionFromHash 读取地址栏里的页面标识；非法/缺失时回落到仪表盘。
 function sectionFromHash() {
@@ -537,7 +539,7 @@ function Console() {
     try {
       const result = await api('/admin/credits/refresh', { method: 'POST' });
       message.success(result.message || '上游积分刷新已启动');
-      window.setTimeout(refresh, 2500);
+      window.location.hash = '#/collection';
     } catch (error) {
       message.error(error.message);
     } finally {
@@ -709,6 +711,7 @@ function Console() {
 	traffic: ['流量统计', '按全站、账号、API key、账号分组、代理分组和单代理查看 RPM、并发与请求用量。'],
     dashboard: ['运营概览', '账号池、请求量和 token 用量实时汇总，数据每 30 秒自动更新。'],
     pool: ['账号管理', '统一管理账号池，支持多选、批量操作、分组与加密迁移。'],
+    collection: ['上游采集中心', '查看采集进度、失败原因与历史记录，配置并发、速率和刷新周期。'],
     models: ['模型与请求', '查看当前可用的上游模型。'],
     playground: ['请求测试', '发送 Responses API 请求并查看标准化的 output_text。'],
     requests: ['请求日志', '按时间、模型、状态、错误码、端点、账号、版本、首字耗时和请求 ID 筛选历史请求。'],
@@ -725,6 +728,7 @@ function Console() {
     { key: 'dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: 'traffic', icon: <ThunderboltOutlined />, label: '流量统计' },
     { key: 'pool', icon: <TeamOutlined />, label: '账号管理' },
+    { key: 'collection', icon: <CloudServerOutlined />, label: '采集中心' },
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
     { key: 'playground', icon: <SendOutlined />, label: '请求测试' },
     { key: 'requests', icon: <FileSearchOutlined />, label: '请求日志' },
@@ -1087,6 +1091,7 @@ function Console() {
             </Space>
           </Header>
           <Content style={{ padding: 26 }}>
+            {!locked && activeSection !== 'collection' && <CollectionNotice api={api} />}
             {!locked && <PromptGuardNotice api={api} onOpen={() => setActiveSection('prompt-guard')} />}
             <Title level={2} style={{ marginTop: 0 }}>{pageTitle}</Title>
             <Paragraph type="secondary">{pageDescription}</Paragraph>
@@ -1159,6 +1164,7 @@ function Console() {
             {activeSection === 'prompt-guard' && !locked && <PromptGuardPage api={api} />}
             {activeSection === 'traffic' && <TrafficStatistics api={api} enabled={!locked} />}
             {activeSection === 'pool' && <AccountListPage api={api} data={data} refresh={refresh} refreshCredits={refreshCredits} creditRefreshing={creditRefreshing} />}
+            {activeSection === 'collection' && <CollectionCenter api={api} refresh={refresh} />}
             {activeSection === 'accounts' && <AccountSettingsPage api={api} refresh={refresh} region={config.region} />}
             {activeSection === 'auto-enroll' && (
               <AutoEnrollPage
