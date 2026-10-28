@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // withAnthropicAuth accepts the SDK's x-api-key as well as the normal Bearer
@@ -387,7 +389,7 @@ func anthropicMessage(role string, content any) ([]any, error) {
 	}
 	return out, nil
 }
-func anthropicStop(s string) string {
+func anthropicStop(s string, hasTools bool) string {
 	switch s {
 	case "length":
 		return "max_tokens"
@@ -396,6 +398,12 @@ func anthropicStop(s string) string {
 	case "content_filter":
 		return "refusal"
 	default:
+		// Some compatible upstreams finish successful tool calls with "stop".
+		// Keep explicit truncation/refusal above, but report the actual tool use
+		// instead of ending the client's tool loop.
+		if hasTools {
+			return "tool_use"
+		}
 		return "end_turn"
 	}
 }
@@ -423,10 +431,12 @@ func anthropicResponse(chat map[string]any, model string) (map[string]any, error
 	}
 	msg, _ := choice["message"].(map[string]any)
 	blocks := []any{}
+	hasTools := false
 	if text, ok := msg["content"].(string); ok && text != "" {
 		blocks = append(blocks, map[string]any{"type": "text", "text": text})
 	}
 	if calls, ok := msg["tool_calls"].([]any); ok {
+		hasTools = len(calls) > 0
 		for _, raw := range calls {
 			c, ok := raw.(map[string]any)
 			if !ok {
@@ -447,7 +457,7 @@ func anthropicResponse(chat map[string]any, model string) (map[string]any, error
 	}
 	finish, _ := choice["finish_reason"].(string)
 	usage, _ := chat["usage"].(map[string]any)
-	return map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": anthropicStop(finish), "stop_sequence": nil, "usage": anthropicUsage(usage)}, nil
+	return map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": anthropicStop(finish, hasTools), "stop_sequence": nil, "usage": anthropicUsage(usage)}, nil
 }
 
 // Tool arguments are buffered per upstream index until completion. This keeps
@@ -553,7 +563,7 @@ func (s *anthropicStream) Write(p []byte) (int, error) {
 				s.id = id
 			}
 			if u, ok := chunk["usage"].(map[string]any); ok {
-				s.usage = u
+				s.usage = upstream.MergeUsage(s.usage, u)
 			}
 			if err := s.start(); err != nil {
 				return 0, err
@@ -646,6 +656,6 @@ func (s *anthropicStream) finish() {
 		_ = s.emit("content_block_stop", map[string]any{"index": s.index})
 		s.index++
 	}
-	_ = s.emit("message_delta", map[string]any{"delta": map[string]any{"stop_reason": anthropicStop(s.reason), "stop_sequence": nil}, "usage": anthropicUsage(s.usage)})
+	_ = s.emit("message_delta", map[string]any{"delta": map[string]any{"stop_reason": anthropicStop(s.reason, len(s.calls) > 0), "stop_sequence": nil}, "usage": anthropicUsage(s.usage)})
 	_ = s.emit("message_stop", map[string]any{})
 }
