@@ -14,11 +14,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/cacheroute"
+	"workbuddy2api/internal/collection"
+	"workbuddy2api/internal/collectionservice"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/haozhumah5"
@@ -416,15 +419,28 @@ func main() {
 		up.DialProxy = reqProxyMgr.DialProxy
 	}
 
+	accountControl := &sync.Mutex{}
+	var collectionManager *collection.Manager
+	if stateDB != nil {
+		service, e := collectionservice.New(stateDB, p, up, metricsDB, accountControl)
+		if e != nil {
+			log.Printf("collection unavailable: %v", e)
+		} else {
+			collectionManager = service.Manager
+			defer collectionManager.Close()
+		}
+	}
 	sch := scheduler.New(scheduler.Config{
-		Pool:           p,
-		Upstream:       up,
-		RequestCredits: metricsDB,
-		CheckinHours:   cfg.Schedule.CheckinHours,
-		TravelHours:    cfg.Schedule.TravelHours,
-		ActivityHours:  cfg.Schedule.ActivityHours,
-		KeepaliveHours: cfg.Schedule.KeepaliveHours,
-		BlackcatHours:  cfg.Schedule.BlackcatHours,
+		Collection:         collectionManager,
+		CollectionRequired: true,
+		Pool:               p,
+		Upstream:           up,
+		RequestCredits:     metricsDB,
+		CheckinHours:       cfg.Schedule.CheckinHours,
+		TravelHours:        cfg.Schedule.TravelHours,
+		ActivityHours:      cfg.Schedule.ActivityHours,
+		KeepaliveHours:     cfg.Schedule.KeepaliveHours,
+		BlackcatHours:      cfg.Schedule.BlackcatHours,
 
 		CheckinDisabled:   !cfg.ScheduleEnabled.Checkin,
 		TravelDisabled:    !cfg.ScheduleEnabled.Travel,
@@ -478,22 +494,24 @@ func main() {
 		}
 	}
 	h := server.NewHandler(server.Config{
-		PromptGuard:      promptManager,
-		Pool:             p,
-		Upstream:         up,
-		APIKey:           cfg.APIKey,
-		FrontendPassword: cfg.FrontendPassword,
-		Groups:           groupStore,
-		ConfigPath:       *cfgPath,
-		AuthDir:          cfg.AuthDir,
-		Region:           cfg.Region,
-		LoginBin:         "/app/login",
+		Collection:         collectionManager,
+		CollectionRequired: true,
+		AccountAdminLock:   accountControl,
+		PromptGuard:        promptManager,
+		Pool:               p,
+		Upstream:           up,
+		APIKey:             cfg.APIKey,
+		FrontendPassword:   cfg.FrontendPassword,
+		Groups:             groupStore,
+		ConfigPath:         *cfgPath,
+		AuthDir:            cfg.AuthDir,
+		Region:             cfg.Region,
+		LoginBin:           "/app/login",
 		// 静态控制台资源目录与可信代理：前者只放行 index.html + assets 白名单，
 		// 后者决定是否采信 X-Forwarded-For（空 = 谁都不信，用 RemoteAddr）。
 		FrontendDir:      cfg.FrontendDir,
 		TrustedProxies:   cfg.TrustedProxies,
 		CheckinNow:       sch.RunCheckinNow,
-		CreditRefreshNow: sch.RunCreditRefreshNow,
 		CheckinAccount:   sch.CheckinAccount,
 		KeepaliveAccount: sch.KeepaliveAccount,
 		// 短信直登只走中国区 codebuddy.cn 的 OneID/Keycloak；海外版继续用 OAuth 链接。
@@ -637,8 +655,11 @@ func main() {
 			log.Printf("auto-enroll: reclaimed %d number(s) left over from a previous run", n)
 		}
 	}
-	go sch.RunCreditRefreshNow()
-	go sch.RunRequestCreditRefreshNow()
+	if collectionManager != nil {
+		go collectionManager.Schedule("startup")
+	} else {
+		log.Printf("collection disabled: durable state store unavailable")
+	}
 	go sch.Run(ctx)
 
 	// 对接码监控值班循环（常驻模型：Start 幂等拉起，enabled 由配置控制
@@ -674,6 +695,9 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		defer close(shutdownDone)
+		if collectionManager != nil {
+			collectionManager.Close()
+		}
 		p.Flush() // 信号触发：先落盘再做优雅停机
 		if promptManager != nil {
 			promptManager.Close()

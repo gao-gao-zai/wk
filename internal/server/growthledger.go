@@ -390,6 +390,18 @@ func (h *Handler) growthLedgerOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		accounts = append(accounts, a)
 	}
+	if h.cfg.Collection != nil || h.cfg.CollectionRequired {
+		results := make([][]upstream.Task, len(accounts))
+		for i, a := range accounts {
+			if h.cfg.Collection == nil {
+				continue
+			}
+			snap := h.cfg.Collection.Snapshot(a.UID, "tasks")
+			_ = json.Unmarshal(snap.Data, &results[i])
+		}
+		writeJSON(w, 200, h.buildLedgerOverview(accounts, results))
+		return
+	}
 	var results [][]upstream.Task
 	force := r.URL.Query().Get("refresh") == "1"
 	if !force {

@@ -28,6 +28,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/cacheroute"
+	"workbuddy2api/internal/collection"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/haozhumah5"
@@ -44,12 +45,15 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	PromptGuard      *promptguard.Manager
-	Traffic          *traffic.Tracker
-	Pool             *pool.Pool
-	Upstream         *upstream.Client
-	APIKey           string // 管理员密钥（空 = 无管理员密钥；多密钥体系下的全权限密钥）
-	FrontendPassword string // 前端控制台密码；空 = 不启用前端密码
+	Collection         *collection.Manager
+	CollectionRequired bool
+	AccountAdminLock   *sync.Mutex
+	PromptGuard        *promptguard.Manager
+	Traffic            *traffic.Tracker
+	Pool               *pool.Pool
+	Upstream           *upstream.Client
+	APIKey             string // 管理员密钥（空 = 无管理员密钥；多密钥体系下的全权限密钥）
+	FrontendPassword   string // 前端控制台密码；空 = 不启用前端密码
 	// Groups 分组 + 多密钥存储（可选；nil = 分组功能关闭，仅管理员密钥）。
 	Groups           *groups.Store
 	ConfigPath       string // 配置文件路径，供控制台保存签到配置
@@ -209,8 +213,8 @@ type Handler struct {
 	sessionsMu        sync.Mutex
 	sessions          map[string]time.Time
 	configMu          sync.Mutex
-	accountAdminMu    sync.Mutex // serializes credential creation/import/deletion
-	accountTransferMu sync.Mutex // bounds concurrent password derivation work
+	accountAdminMu    *sync.Mutex // shared with collection credential commits
+	accountTransferMu sync.Mutex  // bounds concurrent password derivation work
 	responsesMu       sync.Mutex
 	responseHistory   map[string]*storedResponse
 	responseBytes     int64
@@ -303,6 +307,10 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]*storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
+	h.accountAdminMu = cfg.AccountAdminLock
+	if h.accountAdminMu == nil {
+		h.accountAdminMu = &sync.Mutex{}
+	}
 	policy := cfg.ResponseHistory
 	if policy == (responsehistory.Policy{}) {
 		policy = responsehistory.Default()
@@ -393,6 +401,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/config", h.withFrontend(h.adminConfig))
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
 	h.registerPromptGuard()
+	h.registerCollection()
 	// 分组 + 密钥管理（多密钥体系）。分组存储未启用时端点回 503。
 	h.mux.HandleFunc("GET /admin/groups", h.withFrontend(h.adminGroups))
 	h.mux.HandleFunc("POST /admin/groups", h.withFrontend(h.adminGroups))
@@ -2823,6 +2832,15 @@ func (h *Handler) runCheckin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) refreshCredits(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Collection != nil {
+		j, err := h.cfg.Collection.Submit(collection.Request{Resources: []string{"balance"}, Source: "manual"})
+		if err != nil {
+			writeJSON(w, 503, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 202, map[string]any{"ok": true, "job_id": j.ID, "job": j, "message": "积分采集已排队，可在采集中心查看进度"})
+		return
+	}
 	if h.cfg.CreditRefreshNow == nil {
 		writeJSON(w, 503, map[string]string{"error": "积分刷新服务不可用"})
 		return
@@ -3032,6 +3050,10 @@ func (h *Handler) persistAccount(cred accountCredential, region string) (map[str
 	// A newly added account may expose a different regional model catalogue.
 	// Force the next /models request to fetch with the expanded pool.
 	invalidateDynamicModelsCache()
+	if h.cfg.Collection != nil {
+		h.cfg.Collection.Forget(cred.UID)
+		_, _ = h.cfg.Collection.Submit(collection.Request{UIDs: []string{cred.UID}, Resources: []string{"balance", "credential", "models", "tasks"}, Source: "action"})
+	}
 
 	response := map[string]any{"ok": true, "uid": cred.UID, "nickname": cred.Nickname, "region": region}
 	if responseExisted {
@@ -3594,6 +3616,9 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	h.cfg.Pool.Flush()
 	// 分组归属一并清理（分组存储启用时）；失败不阻塞删除——残留的
+	if h.cfg.Collection != nil {
+		h.cfg.Collection.Forget(uid)
+	}
 	// 归属记录只影响分组计数展示，下次该 uid 重加时会被覆盖。
 	if h.cfg.Groups != nil {
 		h.cfg.Groups.RemoveAccount(uid)
@@ -3704,18 +3729,28 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Groups != nil {
 		accountGroups = h.cfg.Groups.SnapshotAccountGroups()
 	}
+	accounts := h.cfg.Pool.List()
+	balances := map[string]collection.Snapshot{}
+	if h.cfg.Collection != nil {
+		for _, a := range accounts {
+			snap := h.cfg.Collection.Snapshot(a.UID, "balance")
+			snap.Data = nil
+			balances[a.UID] = snap
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":        h.cfg.Pool.List(),
-		"account_groups":  accountGroups,
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"in_flight_full":  inFlightFull,
-		"concurrency":     h.cfg.Pool.CapacityForModel(upstream.NormalizeModelID(r.URL.Query().Get("model"))),
-		"sticky_sessions": sticky,
-		"redis_mode":      redisMode,
-		"metrics":         h.metricsSnapshot(),
+		"accounts":           accounts,
+		"collection_balance": balances,
+		"account_groups":     accountGroups,
+		"total":              total,
+		"healthy":            healthy,
+		"cooling":            cooling,
+		"disabled":           disabled,
+		"in_flight_full":     inFlightFull,
+		"concurrency":        h.cfg.Pool.CapacityForModel(upstream.NormalizeModelID(r.URL.Query().Get("model"))),
+		"sticky_sessions":    sticky,
+		"redis_mode":         redisMode,
+		"metrics":            h.metricsSnapshot(),
 	})
 }
 
@@ -3890,6 +3925,21 @@ func invalidateDynamicModelsCache() {
 
 // models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Collection != nil {
+		infos := h.collectedModels(h.allowSet(scopeFromRequest(r)))
+		out := []map[string]any{}
+		for _, mi := range infos {
+			if mi.ContextWindow == 0 {
+				mi.ContextWindow = 131072
+			}
+			out = append(out, map[string]any{"id": mi.ID, "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": mi.ContextWindow, "max_output_tokens": mi.MaxTokens})
+		}
+		if len(out) == 0 {
+			out = staticModels
+		}
+		writeJSON(w, 200, map[string]any{"object": "list", "data": out})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   h.modelList(),
@@ -3922,6 +3972,12 @@ func (h *Handler) modelList() []map[string]any {
 // fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
 // 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
+	if h.cfg.Collection != nil {
+		return h.collectedModels(nil)
+	}
+	if h.cfg.CollectionRequired {
+		return nil
+	}
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
 		out := dynamicModelsCache.ids

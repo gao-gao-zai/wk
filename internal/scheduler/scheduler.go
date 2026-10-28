@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/collection"
 	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
@@ -22,14 +23,16 @@ import (
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即五类任务都启用
 // （hours 回落默认），与引入开关前的行为一致（老调用方/老测试无需改动）。
 type Config struct {
-	Pool           *pool.Pool
-	Upstream       *upstream.Client
-	CheckinHours   []int // 默认 [9, 21]
-	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
-	ActivityHours  []int // 默认 [10]：对话活跃上报（点亮连登 + 解锁领养）
-	KeepaliveHours []int // 默认 [22]
-	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
-	RequestCredits metricsstore.Backend
+	Collection         *collection.Manager
+	CollectionRequired bool
+	Pool               *pool.Pool
+	Upstream           *upstream.Client
+	CheckinHours       []int // 默认 [9, 21]
+	TravelHours        []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
+	ActivityHours      []int // 默认 [10]：对话活跃上报（点亮连登 + 解锁领养）
+	KeepaliveHours     []int // 默认 [22]
+	BlackcatHours      []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
+	RequestCredits     metricsstore.Backend
 
 	// *Disabled 显式关闭对应排程（config 的 schedule.*_enabled=false）。
 	CheckinDisabled   bool
@@ -281,6 +284,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // blocks an in-flight model request.
 func (s *Scheduler) RunRequestCreditRefreshNow() {
 	cfg := s.snapshot()
+	if cfg.Collection != nil {
+		return
+	} // collection owns the configurable usage timer
+	if cfg.CollectionRequired {
+		return
+	}
 	if cfg.RequestCredits == nil {
 		return
 	}
@@ -363,6 +372,13 @@ func (s *Scheduler) RunCheckinNow() {
 // daily check-in. It is safe to run asynchronously during service startup.
 func (s *Scheduler) RunCreditRefreshNow() {
 	cfg := s.snapshot()
+	if cfg.Collection != nil {
+		_, _ = cfg.Collection.Submit(collection.Request{Resources: []string{"balance"}, Source: "action"})
+		return
+	}
+	if cfg.CollectionRequired {
+		return
+	}
 	for _, st := range cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -379,6 +395,14 @@ func (s *Scheduler) RunCreditRefreshNow() {
 // 返回 error 供按账号调用方区分"签到成功但余额查询失败"。
 func (s *Scheduler) refreshAccountCredits(uid string, a *auth.Auth) error {
 	cfg := s.snapshot()
+	if cfg.Collection != nil {
+		cfg.Collection.Invalidate(uid, []string{"balance", "tasks"})
+		_, err := cfg.Collection.Submit(collection.Request{UIDs: []string{uid}, Resources: []string{"balance", "tasks"}, IncludeDisabled: true, Source: "action"})
+		return err
+	}
+	if cfg.CollectionRequired {
+		return fmt.Errorf("采集持久化存储不可用")
+	}
 	resource, err := cfg.Upstream.UserResourceDetails(a)
 	if err != nil {
 		log.Printf("user-resource %s: %v", uid, err)
@@ -456,6 +480,13 @@ func (s *Scheduler) KeepaliveAccount(uid string) AccountResult {
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
 func (s *Scheduler) RunKeepaliveNow() {
 	cfg := s.snapshot()
+	if cfg.Collection != nil {
+		_, _ = cfg.Collection.Submit(collection.Request{Resources: []string{"credential"}, Source: "scheduled"})
+		return
+	}
+	if cfg.CollectionRequired {
+		return
+	}
 	for _, st := range cfg.Pool.List() {
 		if st.Disabled {
 			continue

@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/collection"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -537,7 +538,17 @@ func (h *Handler) accountTasks(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	tasks, err := h.cfg.Upstream.ListTasks(a)
+	var tasks []upstream.Task
+	var err error
+	var snapshot *collection.Snapshot
+	if h.cfg.Collection != nil {
+		snap := h.cfg.Collection.Snapshot(uid, "tasks")
+		_ = json.Unmarshal(snap.Data, &tasks)
+		snap.Data = nil
+		snapshot = &snap
+	} else if !h.cfg.CollectionRequired {
+		tasks, err = h.cfg.Upstream.ListTasks(a)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "list tasks: " + err.Error()})
 		return
@@ -547,12 +558,13 @@ func (h *Handler) accountTasks(w http.ResponseWriter, r *http.Request) {
 	for _, act := range growthActions {
 		autoable[act.TaskCode] = true
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": tasks, "auto_actions": autoable})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": tasks, "auto_actions": autoable, "snapshot": snapshot})
 }
 
 // accountTaskAccept 接受任务（报名；幂等）。
 func (h *Handler) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
+	defer h.collectAfterAction(uid)
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
@@ -576,6 +588,7 @@ func (h *Handler) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 // 批量提交分片（保守每批 20 个），批间节流防风控。
 func (h *Handler) accountTaskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
+	defer h.collectAfterAction(uid)
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
@@ -623,6 +636,7 @@ func (h *Handler) accountTaskAcceptAll(w http.ResponseWriter, r *http.Request) {
 // accountTaskClaim 领取任务奖励（未达标时上游返回业务错误，原样透出给前端提示）。
 func (h *Handler) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
+	defer h.collectAfterAction(uid)
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
@@ -651,6 +665,7 @@ func (h *Handler) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 // accountTaskAuto 一键完成单个任务：执行对应动作 → 回读进度 → 达标自动领奖。
 func (h *Handler) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
+	defer h.collectAfterAction(uid)
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
@@ -846,6 +861,7 @@ func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request)
 // 动作开始前调用一次）。返回 (明细, 列表拉取是否成功)。
 func (h *Handler) runGrowthAllCollect(a *auth.Auth, onStart func(code, desc string)) ([]growthJobItem, bool) {
 	uid := a.Snapshot().UID
+	defer h.collectAfterAction(uid)
 	tasks, err := h.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		return nil, false

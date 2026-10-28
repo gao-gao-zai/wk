@@ -21,6 +21,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -60,7 +61,10 @@ type Task struct {
 // 响应形如 data.tasks[]，元素字段随任务类型变化（progress 可能是 {current,target} 或平铺），
 // 这里做宽松解析：两种形状都尝试。
 func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
-	data, err := c.growthJSON(a, http.MethodGet, tasksListPath, nil)
+	return c.ListTasksContext(context.Background(), a)
+}
+func (c *Client) ListTasksContext(ctx context.Context, a *auth.Auth) ([]Task, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodGet, tasksListPath, nil)
 	if err != nil {
 		return nil, err
 	}
