@@ -2,13 +2,20 @@ package promptguard
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
 
-var errStop = errors.New("diagnostic stopped")
+var (
+	errBudget      = errors.New("diagnostic budget exhausted")
+	errChanged     = errors.New("diagnostic configuration changed")
+	errPersistence = errors.New("diagnostic persistence failed")
+	errProbe       = errors.New("diagnostic probe inconclusive")
+)
 
 func (m *Manager) Start(id, kind string, automatic bool) (Job, error) {
 	if kind != "locate" && kind != "verify" {
@@ -34,6 +41,9 @@ func (m *Manager) Start(id, kind string, automatic bool) (Job, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	job := Job{Kind: kind, Status: "running", Automatic: automatic, Budget: m.state.Config.Settings.ProbeBudget, Revision: m.state.Config.Revision, Started: time.Now().UTC(), Trace: []Trace{}}
+	if kind == "verify" {
+		job.Budget = 2
+	}
 	if m.active {
 		job.Status = "queued"
 	}
@@ -111,6 +121,7 @@ func (m *Manager) next() {
 
 func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 	status, note := "inconclusive", "诊断未获得确定结果"
+	endReason := "probe_inconclusive"
 	candidate := ""
 	minimal := false
 	verified := false
@@ -121,15 +132,22 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 		if c := m.state.Cases[item.ID]; c != nil {
 			if ctx.Err() != nil {
 				status = "cancelled"
-				note = "诊断已取消或超过 10 分钟时限"
+				endReason, note = "cancelled", "诊断已取消，后续检查未执行"
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					endReason, note = "timeout", "诊断超过 10 分钟时限，后续检查未执行"
+				}
 			}
 			c.Job.Status = status
 			c.Job.Note = note
+			c.Job.EndReason = endReason
+			c.Job.CurrentStep = ""
 			now := time.Now().UTC()
 			c.Job.Finished = &now
 			if candidate != "" {
 				c.Candidate = candidate
 				c.CandidateMinimal = minimal
+				c.CandidateRevision = item.Job.Revision
+				c.CandidateLocatedAt = &now
 			}
 			if verified && ctx.Err() == nil && c.Job.Revision == m.state.Config.Revision && !c.LastSeen.After(c.Job.Started) {
 				c.Resolved = true
@@ -137,6 +155,7 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 			} else if verified {
 				c.Resolved = false
 				c.Job.Status = "inconclusive"
+				c.Job.EndReason = "config_or_case_changed"
 				c.Job.Note = "提示词通过，但规则或记录已变化，请重新验证"
 			}
 			_ = m.saveLocked()
@@ -145,6 +164,23 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 		m.next()
 	}()
 	calls := 0
+	type cachedResult struct {
+		result     ProbeResult
+		traceIndex int
+	}
+	cache := map[[32]byte]cachedResult{}
+	stopNote := func(err error, result ProbeResult) {
+		switch {
+		case errors.Is(err, errBudget):
+			endReason, note = "budget_exhausted", "请求预算已用尽；尚未完成的检查不会继续发送"
+		case errors.Is(err, errChanged):
+			endReason, note = "config_changed", "规则或诊断配置已变化，本次检查已停止，请重新启动"
+		case errors.Is(err, errPersistence):
+			endReason, note = "persistence_failed", "诊断结果无法保存，已停止后续检查，请检查存储状态"
+		default:
+			endReason, note = "probe_inconclusive", "检查未完成："+probeReason(result)
+		}
+	}
 	baseline := item.Outbound
 	m.mu.Lock()
 	prepare := m.prepare
@@ -153,6 +189,7 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 		var e error
 		baseline, e = prepare(item)
 		if e != nil {
+			endReason = "preparation_failed"
 			note = "当前系统提示词转换失败，请检查替换规则"
 			return
 		}
@@ -161,6 +198,7 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 		e = m.saveLocked()
 		m.mu.Unlock()
 		if e != nil {
+			endReason = "persistence_failed"
 			note = "无法保存本次诊断的完整系统提示词"
 			return
 		}
@@ -170,10 +208,30 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 		stale := m.state.Config.Revision != item.Job.Revision
 		m.mu.Unlock()
 		if stale {
-			return ProbeResult{}, errStop
+			return ProbeResult{}, errChanged
 		}
-		if ctx.Err() != nil || calls >= item.Job.Budget {
-			return ProbeResult{}, errStop
+		if ctx.Err() != nil {
+			return ProbeResult{}, ctx.Err()
+		}
+		encoded, _ := json.Marshal([]any{msgs, rewrite})
+		key := sha256.Sum256(encoded)
+		if hit, ok := cache[key]; ok {
+			r := hit.result
+			attempted := false
+			r.RequestAttempted = &attempted
+			m.mu.Lock()
+			c := m.state.Cases[item.ID]
+			c.Job.CacheHits++
+			c.Job.Trace = append(c.Job.Trace, Trace{Step: step, Characters: utf8.RuneCountInString(Text(msgs)), CachedFrom: hit.traceIndex, ProbeResult: r})
+			err := m.saveLocked()
+			m.mu.Unlock()
+			if err != nil {
+				return r, errPersistence
+			}
+			return r, nil
+		}
+		if calls >= item.Job.Budget {
+			return ProbeResult{}, errBudget
 		}
 		if calls > 0 {
 			timer := time.NewTimer(300 * time.Millisecond)
@@ -181,49 +239,75 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 			case <-timer.C:
 			case <-ctx.Done():
 				timer.Stop()
-				return ProbeResult{}, errStop
+				return ProbeResult{}, ctx.Err()
 			}
 		}
 		calls++
+		m.mu.Lock()
+		m.state.Cases[item.ID].Job.CurrentStep = step
+		e := m.saveLocked()
+		m.mu.Unlock()
+		if e != nil {
+			return ProbeResult{}, errPersistence
+		}
+		started := time.Now()
 		r := safeReason(probe(ctx, Clone(msgs), rewrite))
 		m.mu.Lock()
 		c := m.state.Cases[item.ID]
 		c.Job.Calls = calls
-		c.Job.Trace = append(c.Job.Trace, Trace{Step: step, Characters: utf8.RuneCountInString(Text(msgs)), ProbeResult: r})
-		e := m.saveLocked()
+		c.Job.CurrentStep = ""
+		c.Job.Trace = append(c.Job.Trace, Trace{Step: step, Characters: utf8.RuneCountInString(Text(msgs)), DurationMS: time.Since(started).Milliseconds(), ProbeResult: r})
+		if r.Outcome != "inconclusive" {
+			cache[key] = cachedResult{result: r, traceIndex: len(c.Job.Trace)}
+		}
+		e = m.saveLocked()
 		m.mu.Unlock()
 		if e != nil {
-			return r, errStop
+			return r, errPersistence
 		}
 		if r.Outcome == "inconclusive" {
-			return r, errStop
+			return r, errProbe
 		}
 		return r, nil
 	}
 	control := []Message{{Role: "system", Content: "You are a helpful assistant."}}
 	if r, e := test("control", control, false); e != nil || r.Outcome != "pass" {
-		note = "对照请求未通过，可能为账号、网络或模型问题，不能归因于提示词"
+		stopNote(e, r)
+		if e == nil || errors.Is(e, errProbe) {
+			endReason = "control_failed"
+			note = "对照检查未完成：" + probeReason(r) + "。后续完整提示词检查未执行，不能判断替换是否有效"
+		}
 		return
 	}
 	if item.Job.Kind == "verify" {
-		if r, e := test("verify_full", item.Original, true); e == nil {
+		if r, e := test("verify_full", item.Original, true); e != nil {
+			stopNote(e, r)
+		} else {
 			if r.Outcome == "pass" {
 				status = "passed"
 				note = "当前替换后的完整系统提示词已通过上游验证"
 				verified = true
+				endReason = "verified"
 			} else {
 				status = "blocked"
 				note = "完整系统提示词仍触发 11128，请继续设置替换规则"
+				endReason = "still_blocked"
 			}
 		}
 		return
 	}
 	if r, e := test("reproduce_full", baseline, false); e != nil || r.Outcome != "blocked" {
-		note = "当前完整系统提示词未稳定复现 11128，暂不能定位；可验证当前替换"
+		if e != nil {
+			stopNote(e, r)
+		} else {
+			endReason = "not_reproduced"
+			note = "当前完整系统提示词未复现 11128，本次未进行分段定位；可验证当前替换"
+		}
 		return
 	}
 	chunks, render := splitMessages(baseline)
 	if len(chunks) == 0 {
+		endReason = "no_text"
 		note = "系统提示词没有可定位的文本"
 		return
 	}
@@ -253,7 +337,8 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 				r, e := test("bisect", render(selection), false)
 				if e != nil {
 					candidate = selectedText(chunks, current)
-					note = "请求预算用尽或请求不确定；保留当前可复现片段，尚未证明最小"
+					stopNote(e, r)
+					note += "；保留本次已复现片段，尚未完成最小化检查"
 					return
 				}
 				if r.Outcome == "blocked" {
@@ -278,7 +363,35 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 	candidate = selectedText(chunks, current)
 	minimal = true
 	status = "located"
+	endReason = "located"
 	note = "已定位可复现的句子或句子组合；请设置替换后验证完整提示词"
+}
+
+func probeReason(r ProbeResult) string {
+	switch r.Reason {
+	case "account_busy_or_unavailable":
+		return "原账号忙碌或不可用，等待 3 秒仍未取得执行槽位，未发送上游请求"
+	case "account_needs_refresh":
+		return "原账号凭据需要刷新，未发送上游请求"
+	case "upstream_unavailable":
+		return "诊断上游未配置，未发送上游请求"
+	case "invalid_prompt":
+		return "系统提示词无法转换，未发送上游请求"
+	case "transport_error":
+		return "连接上游失败，未获得有效 HTTP 响应"
+	case "request_timeout":
+		return "上游请求超时，未获得完整结果"
+	case "rate_limit":
+		return "上游限流，请稍后重试"
+	case "upstream_auth_error":
+		return "上游认证或权限检查失败"
+	case "incomplete_or_invalid_stream":
+		return "上游响应流不完整或包含错误，不能作为通过依据"
+	case "11128":
+		return "中性对照也触发 11128，无法将问题归因于原始提示词"
+	default:
+		return "未获得确定的上游检查结果，请查看步骤详情"
+	}
 }
 
 type chunk struct {

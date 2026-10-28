@@ -44,39 +44,48 @@ type ProbeResult struct {
 	Outcome string `json:"outcome"` // pass, blocked, inconclusive
 	HTTP    int    `json:"http"`
 	Reason  string `json:"reason,omitempty"` // fixed, non-sensitive classification
+	// nil denotes an older record whose request-attempt state was not recorded.
+	RequestAttempted *bool `json:"request_attempted,omitempty"`
 }
 type Trace struct {
 	Step       string `json:"step"`
 	Characters int    `json:"characters"`
+	DurationMS int64  `json:"duration_ms,omitempty"`
+	CachedFrom int    `json:"cached_from,omitempty"` // one-based trace index
 	ProbeResult
 }
 type Job struct {
-	Kind      string     `json:"kind"`
-	Status    string     `json:"status"`
-	Automatic bool       `json:"automatic"`
-	Calls     int        `json:"calls"`
-	Budget    int        `json:"budget"`
-	Revision  uint64     `json:"revision"`
-	Started   time.Time  `json:"started"`
-	Finished  *time.Time `json:"finished,omitempty"`
-	Note      string     `json:"note"`
-	Trace     []Trace    `json:"trace"`
+	Kind        string     `json:"kind"`
+	Status      string     `json:"status"`
+	Automatic   bool       `json:"automatic"`
+	Calls       int        `json:"calls"`
+	Budget      int        `json:"budget"`
+	CacheHits   int        `json:"cache_hits,omitempty"`
+	CurrentStep string     `json:"current_step,omitempty"`
+	EndReason   string     `json:"end_reason,omitempty"`
+	Revision    uint64     `json:"revision"`
+	Started     time.Time  `json:"started"`
+	Finished    *time.Time `json:"finished,omitempty"`
+	Note        string     `json:"note"`
+	Trace       []Trace    `json:"trace"`
 }
 type Case struct {
-	ID               string    `json:"id"`
-	Model            string    `json:"model"`
-	UID              string    `json:"uid"`
-	Original         []Message `json:"original,omitempty"`
-	Outbound         []Message `json:"outbound,omitempty"`
-	Diagnostic       []Message `json:"diagnostic,omitempty"`
-	FirstSeen        time.Time `json:"first_seen"`
-	LastSeen         time.Time `json:"last_seen"`
-	Occurrences      int       `json:"occurrences"`
-	Candidate        string    `json:"candidate,omitempty"`
-	CandidateMinimal bool      `json:"candidate_minimal"`
-	VerifiedRevision uint64    `json:"verified_revision"`
-	Resolved         bool      `json:"resolved"`
-	Job              *Job      `json:"job,omitempty"`
+	ID                 string     `json:"id"`
+	Model              string     `json:"model"`
+	UID                string     `json:"uid"`
+	Original           []Message  `json:"original,omitempty"`
+	Outbound           []Message  `json:"outbound,omitempty"`
+	Diagnostic         []Message  `json:"diagnostic,omitempty"`
+	FirstSeen          time.Time  `json:"first_seen"`
+	LastSeen           time.Time  `json:"last_seen"`
+	Occurrences        int        `json:"occurrences"`
+	Candidate          string     `json:"candidate,omitempty"`
+	CandidateMinimal   bool       `json:"candidate_minimal"`
+	CandidateRevision  uint64     `json:"candidate_revision,omitempty"`
+	CandidateLocatedAt *time.Time `json:"candidate_located_at,omitempty"`
+	VerifiedRevision   uint64     `json:"verified_revision"`
+	Resolved           bool       `json:"resolved"`
+	Job                *Job       `json:"job,omitempty"`
 }
 type diskState struct {
 	Config Config           `json:"config"`
