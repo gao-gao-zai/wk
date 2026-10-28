@@ -3,26 +3,22 @@ package server
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log"
 	"net/http"
 	"strings"
-	"time"
 
 	"workbuddy2api/internal/promptguard"
-	"workbuddy2api/internal/upstream"
 )
 
-func (h *Handler) capturePrompt(model, uid string, original []byte, outbound map[string]any) {
+func (h *Handler) capturePrompt(model, uid string, original []byte, outbound map[string]any, scope requestScope, allow map[string]bool) {
 	if h.cfg.PromptGuard == nil {
 		return
 	}
 	var doc map[string]any
 	_ = json.Unmarshal(original, &doc)
-	if _, err := h.cfg.PromptGuard.Capture(model, uid, promptguard.Extract(doc), promptguard.Extract(outbound)); err != nil {
+	if _, err := h.cfg.PromptGuard.CaptureScoped(model, uid, promptguard.Extract(doc), promptguard.Extract(outbound), capturedPromptScope(scope, allow)); err != nil {
 		log.Printf("prompt guard: capture failed (see administrator storage status)")
 	}
 }
@@ -71,7 +67,7 @@ func (h *Handler) registerPromptGuard() {
 			h.cfg.Upstream.RewriteSystem = m.Apply
 			h.cfg.Upstream.LegacyPromptRulesManaged = m.LegacyMigrated()
 		}
-		m.SetProbeFactory(h.promptProbe)
+		m.SetSessionFactory(h.promptSession)
 		m.SetPreparer(func(item promptguard.Case) ([]promptguard.Message, error) {
 			if h.cfg.Upstream == nil {
 				return item.Outbound, nil
@@ -153,7 +149,26 @@ func (h *Handler) promptGuardAPI(w http.ResponseWriter, r *http.Request) {
 		if len(parts) == 2 && r.Method == http.MethodPost {
 			switch parts[1] {
 			case "locate", "verify":
-				job, err := m.Start(id, parts[1], false)
+				var options struct {
+					AccountScope *struct {
+						Kind  string `json:"kind"`
+						Group string `json:"group,omitempty"`
+					} `json:"account_scope,omitempty"`
+				}
+				if r.Body != nil && r.ContentLength != 0 && !decode(&options) {
+					return
+				}
+				var job promptguard.Job
+				var err error
+				if options.AccountScope != nil {
+					var scope promptguard.AccountScope
+					scope, err = h.manualPromptScope(options.AccountScope.Kind, options.AccountScope.Group)
+					if err == nil {
+						job, err = m.StartWithAccountScope(id, parts[1], scope)
+					}
+				} else {
+					job, err = m.Start(id, parts[1], false)
+				}
 				if err != nil {
 					writeJSON(w, 409, map[string]any{"error": err.Error()})
 					return
@@ -197,80 +212,6 @@ func probeDocument(model string, messages []promptguard.Message) map[string]any 
 	}
 	msgs = append(msgs, map[string]any{"role": "user", "content": "Reply with OK."})
 	return map[string]any{"model": model, "stream": true, "max_tokens": 32, "messages": msgs}
-}
-
-// A diagnostic job pins one account, uses its normal proxy, and never refreshes
-// credentials, rotates on failure, changes health or records its own probes.
-func (h *Handler) promptProbe(item promptguard.Case) promptguard.Probe {
-	pinned := item.UID
-	return func(parent context.Context, messages []promptguard.Message, rewrite bool) (result promptguard.ProbeResult) {
-		attempted := false
-		defer func() { result.RequestAttempted = &attempted }()
-		unknown := func(httpStatus int, reason string) promptguard.ProbeResult {
-			return promptguard.ProbeResult{Outcome: "inconclusive", HTTP: httpStatus, Reason: reason}
-		}
-		if h.cfg.Pool == nil || h.cfg.Upstream == nil {
-			return unknown(0, "upstream_unavailable")
-		}
-		acct := h.cfg.Pool.PickAndAcquireByUIDForModel(pinned, item.Model)
-		// Capture happens before the original request releases its account lease.
-		// Wait briefly for that slot; never move a group's prompt to another account.
-		waitCtx, stopWait := context.WithTimeout(parent, 3*time.Second)
-		for acct == nil && waitCtx.Err() == nil {
-			timer := time.NewTimer(100 * time.Millisecond)
-			select {
-			case <-waitCtx.Done():
-				timer.Stop()
-			case <-timer.C:
-				acct = h.cfg.Pool.PickAndAcquireByUIDForModel(pinned, item.Model)
-			}
-		}
-		stopWait()
-		if acct == nil {
-			return unknown(0, "account_busy_or_unavailable")
-		}
-		defer h.cfg.Pool.Release(acct.UID)
-		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
-			return unknown(0, "account_needs_refresh")
-		}
-		ctx, cancel := context.WithTimeout(upstream.DiagnosticContext(parent), 45*time.Second)
-		defer cancel()
-		doc := probeDocument(item.Model, messages)
-		var body []byte
-		var err error
-		if rewrite {
-			body, err = h.cfg.Upstream.PrepareChatBody(doc)
-		} else {
-			body, err = json.Marshal(doc)
-		}
-		if err != nil {
-			return unknown(0, "invalid_prompt")
-		}
-		attempted = true
-		rc, status, raw, _, err := h.cfg.Upstream.ChatStreamPreparedWithPolicy(ctx, acct, body, upstream.StreamPolicy{Total: 45 * time.Second, Idle: 20 * time.Second})
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return unknown(status, "request_timeout")
-			}
-			return unknown(status, "transport_error")
-		}
-		if rc != nil {
-			defer rc.Close()
-		}
-		if promptguard.IsBlocked(status, raw) {
-			return promptguard.ProbeResult{Outcome: "blocked", HTTP: status, Reason: "11128"}
-		}
-		if status != 200 || rc == nil {
-			if status == 429 {
-				return unknown(status, "rate_limit")
-			}
-			if status == 401 || status == 403 {
-				return unknown(status, "upstream_auth_error")
-			}
-			return unknown(status, "upstream_error")
-		}
-		return classifyPromptStream(rc)
-	}
 }
 
 func classifyPromptStream(rc io.Reader) promptguard.ProbeResult {

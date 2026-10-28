@@ -5279,7 +5279,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if status >= 400 {
 			if h.cfg.PromptGuard != nil && promptguard.IsBlocked(status, respBody) {
-				h.capturePrompt(routeModel, acct.UID, body, bodyDoc)
+				h.capturePrompt(routeModel, acct.UID, body, bodyDoc, scopeFromRequest(r), scopeAllow)
 			}
 			st.status = status
 			bodyText := string(respBody)
@@ -5313,7 +5313,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if h.cfg.PromptGuard != nil && rc != nil {
-			rc = &promptErrorReader{ReadCloser: rc, blocked: func() { h.capturePrompt(routeModel, acct.UID, body, bodyDoc) }}
+			rc = &promptErrorReader{ReadCloser: rc, blocked: func() { h.capturePrompt(routeModel, acct.UID, body, bodyDoc, scopeFromRequest(r), scopeAllow) }}
 		}
 		if stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。

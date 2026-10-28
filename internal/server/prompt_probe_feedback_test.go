@@ -17,8 +17,12 @@ func TestPromptProbeRecordsLocalFailureWithoutRequestAttempt(t *testing.T) {
 	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up, APIKey: "fixture"})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	result := h.promptProbe(promptguard.Case{UID: "missing", Model: "glm-5.3-flash"})(ctx, []promptguard.Message{{Role: "system", Content: "fixture"}}, false)
-	if result.Reason != "account_busy_or_unavailable" || result.HTTP != 0 || result.RequestAttempted == nil || *result.RequestAttempted {
+	session := h.promptSession(ctx, promptguard.Case{UID: "missing", Model: "glm-5.3-flash"})
+	if session.Close != nil {
+		defer session.Close()
+	}
+	result := session.Probe(ctx, []promptguard.Message{{Role: "system", Content: "fixture"}}, false)
+	if result.Reason != "no_available_account" || result.HTTP != 0 || result.RequestAttempted == nil || *result.RequestAttempted {
 		t.Fatalf("local precondition reported as request: %+v", result)
 	}
 }
@@ -42,7 +46,9 @@ func TestPromptProbeRecordsHTTPAndSafeErrorClassification(t *testing.T) {
 			up.HTTP = fake.Client()
 			up.ChatBaseCN = fake.URL
 			h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "fixture", ExpiresAt: 9999999999}), Upstream: up, APIKey: "fixture"})
-			result := h.promptProbe(promptguard.Case{UID: "u1", Model: "glm-5.3-flash"})(context.Background(), []promptguard.Message{{Role: "system", Content: "fixture"}}, false)
+			session := h.promptSession(context.Background(), promptguard.Case{UID: "u1", Model: "glm-5.3-flash"})
+			defer session.Close()
+			result := session.Probe(context.Background(), []promptguard.Message{{Role: "system", Content: "fixture"}}, false)
 			if result.RequestAttempted == nil || !*result.RequestAttempted || result.HTTP != tc.status || result.Reason != tc.reason {
 				t.Fatalf("request result: %+v", result)
 			}
