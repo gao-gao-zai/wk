@@ -39,8 +39,10 @@ func (a *AutoEnroller) ProviderMode() string {
 func (a *AutoEnroller) ApplySMSUpdate(replacement *haozhuma.Client, mode *string, persist func() error) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if replacement != nil && (a.running || a.fetchLease || len(a.held) > 0) {
-		return ErrBusyAuth
+	if replacement != nil || a.clientPreparing {
+		if err := a.smsBusyLocked(); err != nil {
+			return err
+		}
 	}
 	target := a.hzm
 	if replacement != nil {

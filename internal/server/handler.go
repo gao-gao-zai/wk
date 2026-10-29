@@ -676,14 +676,9 @@ func (h *Handler) SetUIDWatcher(w *UIDWatcher) {
 	if w != nil {
 		w.configured = func() bool { return platformReady(h.currentSMSSettings(), "haozhuma") }
 		w.prepare = func(ctx context.Context) error {
-			if w.en.Status().Running {
-				return errors.New("加号任务正在运行")
-			}
-			c, err := h.buildTaskSMS(ctx, "haozhuma")
-			if err != nil {
-				return err
-			}
-			return w.en.ApplySMSUpdate(c, nil, func() error { return nil })
+			return w.en.prepareMonitorClient(ctx, func(ctx context.Context) (*haozhuma.Client, error) {
+				return h.buildTaskSMS(ctx, "haozhuma")
+			})
 		}
 	}
 }
