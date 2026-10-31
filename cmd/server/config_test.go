@@ -510,3 +510,24 @@ func TestMaxRequestBodyMB(t *testing.T) {
 		}
 	}
 }
+
+func TestAnthropicAPISwitchConfiguration(t *testing.T) {
+	if !Default().Features.AnthropicStrictDowngrade {
+		t.Fatal("strict downgrade should default to allowed")
+	}
+	t.Setenv("WB2A_ANTHROPIC_STRICT_DOWNGRADE", "false")
+	if Default().Features.AnthropicAPI {
+		t.Fatal("Anthropic endpoint should default to disabled")
+	}
+	t.Setenv("WB2A_ANTHROPIC_API", "true")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Features.AnthropicAPI {
+		t.Fatal("environment switch did not enable Anthropic API")
+	}
+	if cfg.Features.AnthropicStrictDowngrade {
+		t.Fatal("environment switch did not disable strict downgrade")
+	}
+}

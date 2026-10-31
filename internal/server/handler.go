@@ -179,6 +179,9 @@ type Config struct {
 	// 保持"端点开"——大量单测直接构造 Config{}，默认关会全部打挂。
 	// main 从 features.responses_api 反转后传入。
 	DisableResponses bool
+	AnthropicAPI     bool
+	// Zero value permits the default strict-tool downgrade policy.
+	RejectAnthropicStrict bool
 	// SetSanitizeFingerprints / SetCodexCompat / SetDSHCompat 把 WebUI 保存的特性开关
 	// 推到 upstream Client（运行时即时生效）。可选：nil 时仅更新 handler 本地副本。
 	SetSanitizeFingerprints func(bool)
@@ -228,12 +231,14 @@ type Handler struct {
 	// featuresMu 保护运行时可变的特性开关与费率（WebUI 保存即时生效，
 	// 同时落盘 config.json 供重启后保持）。读侧在请求热路径，写侧仅管理
 	// 端点，锁竞争可忽略。
-	featuresMu   sync.RWMutex
-	h5Mu         sync.RWMutex
-	h5UpdateMu   sync.Mutex
-	passthrough  bool
-	responsesOff bool
-	creditPolicy CreditPolicy
+	featuresMu               sync.RWMutex
+	h5Mu                     sync.RWMutex
+	h5UpdateMu               sync.Mutex
+	passthrough              bool
+	responsesOff             bool
+	anthropicAPI             bool
+	anthropicStrictDowngrade bool
+	creditPolicy             CreditPolicy
 	// maxRequestBody 请求体大小上限（字节）。WebUI「请求体大小限制」卡片
 	// 保存后即时生效（下一个请求按新上限判定）。与特性开关共用 featuresMu：
 	// 读侧在每条 chat/responses 请求的入口，纯内存读，锁开销可忽略。
@@ -347,6 +352,8 @@ func NewHandler(cfg Config) *Handler {
 	// 时（单测直接构造 Handler）只更新本地副本。
 	h.passthrough = cfg.Passthrough
 	h.responsesOff = cfg.DisableResponses
+	h.anthropicAPI = cfg.AnthropicAPI
+	h.anthropicStrictDowngrade = !cfg.RejectAnthropicStrict
 	h.creditPolicy = cfg.CreditPolicy
 	// 请求体上限同样拷贝一份运行时副本：cfg 未注入（老部署/单测零值）时
 	// 零值 Config 使用默认 8 MB。
@@ -382,6 +389,7 @@ func NewHandler(cfg Config) *Handler {
 	h.sanitizeHooks.setCodex = cfg.SetCodexCompat
 	h.sanitizeHooks.setDSH = cfg.SetDSHCompat
 	h.featuresMu.Unlock()
+	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.anthropicMessages))
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
@@ -1150,6 +1158,8 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 			CodexCompat                   bool `json:"codex_compat"`
 			DSHCompat                     bool `json:"dsh_compat"`
 			ResponsesAPI                  bool `json:"responses_api"`
+			AnthropicAPI                  bool `json:"anthropic_api"`
+			AnthropicStrictDowngrade      bool `json:"anthropic_strict_downgrade"`
 		} `json:"features"`
 		Billing struct {
 			InputCreditsPer1KTokens       float64 `json:"input_credits_per_1k_tokens"`
@@ -1237,6 +1247,10 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	// 回显运行时的实际限制，包含环境变量和旧配置键的兼容结果。
 	c.MaxRequestBodyMB = h.currentMaxRequestBody() / 1_000_000
+	h.featuresMu.RLock()
+	c.Features.AnthropicAPI = h.anthropicAPI
+	c.Features.AnthropicStrictDowngrade = h.anthropicStrictDowngrade
+	h.featuresMu.RUnlock()
 	if h.legacyPromptMigrated() {
 		c.Features.CodexCompat = false
 		c.Features.DSHCompat = false
@@ -1412,6 +1426,8 @@ type featuresPatch struct {
 	CodexCompat                   *bool `json:"codex_compat"`
 	DSHCompat                     *bool `json:"dsh_compat"`
 	ResponsesAPI                  *bool `json:"responses_api"`
+	AnthropicAPI                  *bool `json:"anthropic_api"`
+	AnthropicStrictDowngrade      *bool `json:"anthropic_strict_downgrade"`
 }
 
 type billingPatch struct {
@@ -1812,6 +1828,12 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Features.ResponsesAPI != nil {
 			features["responses_api"] = *req.Features.ResponsesAPI
+		}
+		if req.Features.AnthropicAPI != nil {
+			features["anthropic_api"] = *req.Features.AnthropicAPI
+		}
+		if req.Features.AnthropicStrictDowngrade != nil {
+			features["anthropic_strict_downgrade"] = *req.Features.AnthropicStrictDowngrade
 		}
 		doc["features"] = features
 	}
@@ -2713,6 +2735,14 @@ func (h *Handler) applyRuntimeFeatures(features *featuresPatch, billing *billing
 		if features.ResponsesAPI != nil {
 			h.responsesOff = !*features.ResponsesAPI
 			updated["responses_api"] = *features.ResponsesAPI
+		}
+		if features.AnthropicAPI != nil {
+			h.anthropicAPI = *features.AnthropicAPI
+			updated["anthropic_api"] = *features.AnthropicAPI
+		}
+		if features.AnthropicStrictDowngrade != nil {
+			h.anthropicStrictDowngrade = *features.AnthropicStrictDowngrade
+			updated["anthropic_strict_downgrade"] = *features.AnthropicStrictDowngrade
 		}
 		if features.SanitizeBlacklistFingerprints != nil {
 			if h.sanitizeHooks.setSanitize != nil {
