@@ -8,6 +8,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/lifecycle"
 )
 
 // Config reqproxy 模块配置（config.json 的 reqproxy 块）。
@@ -42,11 +44,12 @@ type Event struct {
 
 // Manager 模块门面。
 type Manager struct {
-	cfg    Config
-	store  *Store
-	pool   *Pool
-	kernel *Kernel
-	health *Health
+	initialized chan struct{}
+	cfg         Config
+	store       *Store
+	pool        *Pool
+	kernel      *Kernel
+	health      *Health
 
 	// 事件环形缓冲
 	evMu   sync.Mutex
@@ -81,13 +84,14 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		cfg:      cfg,
-		store:    store,
-		kernel:   kernel,
-		subStop:  make(chan struct{}),
-		subDone:  make(chan struct{}),
-		scanStop: make(chan struct{}),
-		scanDone: make(chan struct{}),
+		initialized: make(chan struct{}),
+		cfg:         cfg,
+		store:       store,
+		kernel:      kernel,
+		subStop:     make(chan struct{}),
+		subDone:     make(chan struct{}),
+		scanStop:    make(chan struct{}),
+		scanDone:    make(chan struct{}),
 	}
 	m.pool = NewPool(store, cfg.PortMin, cfg.PortMax)
 	if cfg.UnhealthyCooldown > 0 {
@@ -131,7 +135,8 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 	// 顺序：refresh（节点入池）→ restoreSlots（内核接回）→ prewarm。
 	// 注意：先拷出订阅 ID 再刷新——RefreshSubscription 内部要拿 Store.mu，
 	// 不能在 View 回调（已持锁）里调用（自死锁，线上抓过）。
-	go func() {
+	lifecycle.Go(func() {
+		defer close(m.initialized)
 		var subIDs []string
 		m.store.View(func(st *State) {
 			for _, sub := range st.Subscriptions {
@@ -153,7 +158,7 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 		// 等 main 注入 acctSrc（SetAccounts 在 NewManager 之后调用）
 		time.Sleep(2 * time.Second)
 		m.PrewarmIfDue()
-	}()
+	})
 	return m, nil
 }
 
@@ -207,8 +212,13 @@ func (m *Manager) autoTTFBScanLoop() {
 		case <-m.scanStop:
 			return
 		}
+		done, admitted := lifecycle.Default.Enter()
+		if !admitted {
+			continue
+		}
 		cursor, acctIdx, roundDone, roundOK, roundFail, roundSkip =
 			m.scanOneTick(rules, cursor, acctIdx, roundDone, roundOK, roundFail, roundSkip)
+		done()
 	}
 }
 
@@ -584,7 +594,14 @@ func (m *Manager) subscriptionLoop() {
 			})
 			for _, id := range due {
 				id := id
-				go m.RefreshSubscription(id) // 各订阅独立刷新，不互相阻塞
+				go func() {
+					done, admitted := lifecycle.Default.Enter()
+					if !admitted {
+						return
+					}
+					defer done()
+					_ = m.RefreshSubscription(id)
+				}() // 各订阅独立刷新，不互相阻塞
 			}
 		case <-m.subStop:
 			return

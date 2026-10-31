@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/lifecycle"
 )
 
 // growthRunner 成长任务执行池。
@@ -57,7 +58,7 @@ func (g *growthRunner) enqueue(aj accountJobType) bool {
 	g.queue = append(g.queue, aj)
 	if !g.running {
 		g.running = true
-		go g.drain()
+		lifecycle.Go(g.drain)
 	}
 	return true
 }

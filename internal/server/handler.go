@@ -32,6 +32,7 @@ import (
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/haozhumah5"
+	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/promptguard"
 	"workbuddy2api/internal/reqproxy"
@@ -890,9 +891,9 @@ func (h *Handler) frontendSession(r *http.Request) bool {
 	}
 	h.sessionsMu.Lock()
 	defer h.sessionsMu.Unlock()
-	expires, ok := h.sessions[c.Value]
+	expires, ok := h.sessions[sessionDigest(c.Value)]
 	if !ok || time.Now().After(expires) {
-		delete(h.sessions, c.Value)
+		delete(h.sessions, sessionDigest(c.Value))
 		return false
 	}
 	return true
@@ -950,7 +951,7 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 	}
 	token := hex.EncodeToString(b)
 	h.sessionsMu.Lock()
-	h.sessions[token] = time.Now().Add(24 * time.Hour)
+	h.sessions[sessionDigest(token)] = time.Now().Add(24 * time.Hour)
 	h.sessionsMu.Unlock()
 	// Secure：仅在请求确实走 HTTPS 时设置。无条件设置会让纯 HTTP 的本地部署
 	// 完全无法登录（浏览器直接丢弃 cookie）。TLS 可能终止在反向代理上，所以
@@ -2840,7 +2841,7 @@ func (h *Handler) runCheckin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 503, map[string]string{"error": "签到服务不可用"})
 		return
 	}
-	go h.cfg.CheckinNow()
+	lifecycle.Go(h.cfg.CheckinNow)
 	writeJSON(w, 202, map[string]any{"ok": true, "message": "签到任务已启动"})
 }
 
@@ -2858,7 +2859,7 @@ func (h *Handler) refreshCredits(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 503, map[string]string{"error": "积分刷新服务不可用"})
 		return
 	}
-	go h.cfg.CreditRefreshNow()
+	lifecycle.Go(h.cfg.CreditRefreshNow)
 	writeJSON(w, 202, map[string]any{"ok": true, "message": "上游积分刷新已启动"})
 }
 

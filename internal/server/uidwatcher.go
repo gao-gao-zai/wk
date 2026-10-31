@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/haozhumah5"
+	"workbuddy2api/internal/lifecycle"
 )
 
 // ---- 配置（config.json autoenroll.watch，用户可编辑） ----
@@ -623,6 +624,11 @@ func (w *UIDWatcher) AddBudget(add float64, set *float64) (float64, error) {
 // 在 Run 的 goroutine 里串行执行，天然无并发问题（state 读写仍走锁，
 // 因为 AddBudget/Status 会并发进来）。
 func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
+	done, err := lifecycle.Default.EnterContext(ctx)
+	if err != nil {
+		return
+	}
+	defer done()
 	w.mu.Lock()
 	generation := w.configGeneration
 	w.mu.Unlock()

@@ -32,6 +32,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/collection"
+	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -928,7 +929,7 @@ func (h *Handler) runTravel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "旅行排程未启用"})
 		return
 	}
-	go h.cfg.TravelNow()
+	lifecycle.Go(h.cfg.TravelNow)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "旅行巡检已启动"})
 }
 
@@ -947,7 +948,7 @@ func (h *Handler) runSchool(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "开学季排程未启用"})
 		return
 	}
-	go h.cfg.SchoolNow()
+	lifecycle.Go(h.cfg.SchoolNow)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "开学季活动闭环已启动"})
 }
 

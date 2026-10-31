@@ -17,6 +17,7 @@ import (
 
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
+	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/smslogin"
 )
 
@@ -676,7 +677,7 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	ctx = haozhuma.WithMode(ctx, opts.ProviderMode)
 	a.cancel = cancel
 	a.mu.Unlock()
-	go func() {
+	lifecycle.Go(func() {
 		defer func() {
 			cancel()
 			// 收尾兜底释放：必须在 running 仍为 true 时做完。新的任务此时还
@@ -703,7 +704,7 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 			a.logf("完成：成功 %d / 尝试 %d（目标 %d，并发 %d，每号轮询 %d 次）",
 				ok, attempts, n, workers, pollCount)
 		}
-	}()
+	})
 	return nil
 }
 
@@ -1394,7 +1395,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 	if drained := a.hzm.TakeDrainedUIDs(); len(drained) > 0 {
 		a.logf("对接码 %v 已用完/失效，自动移出轮换池（池剩 %d 个）", drained, len(a.hzm.UIDs()))
 		if cb := a.uidsDrainedCallback(); cb != nil {
-			go cb(drained) // 异步：H5 慢，不挡取号流水线
+			lifecycle.Go(func() { cb(drained) }) // 异步：H5 慢，不挡取号流水线
 		}
 	}
 	// 配置里钉死的对接码被上游删掉了：已经自动退回平台分配，但要让你知道
@@ -1513,7 +1514,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 			// 自动化（约 +1950 积分）。回调内自带 per-account 锁与节流，这里
 			// 只负责触发。开关在 handler 侧（schedule.autoenroll_growth_tasks）。
 			if cb := a.enrolledCallback(); cb != nil {
-				go cb(creds.UID)
+				lifecycle.Go(func() { cb(creds.UID) })
 			}
 			note := finish(false)
 			a.logf("号 %s 加号成功 uid=%s…（%s）", phone, shortUID(creds.UID), note)

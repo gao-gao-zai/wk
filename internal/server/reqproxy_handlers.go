@@ -16,6 +16,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/groups"
+	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/reqproxy"
 )
 
@@ -90,7 +91,7 @@ func (h *Handler) reqproxyConfigPut(w http.ResponseWriter, r *http.Request) {
 	// 开关 false→true：立即预热（不等下一轮测速；未测速节点静态筛选
 	// 通过即可分配，坏押注由首轮测速后的 fixup 修正）。
 	if !wasEnabled && req.Enabled != nil && *req.Enabled {
-		go h.cfg.ReqProxy.PrewarmIfDue()
+		lifecycle.Go(h.cfg.ReqProxy.PrewarmIfDue)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

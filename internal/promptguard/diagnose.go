@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"workbuddy2api/internal/lifecycle"
 )
 
 var (
@@ -22,6 +24,11 @@ func (m *Manager) Start(id, kind string, automatic bool) (Job, error) {
 }
 
 func (m *Manager) start(id, kind string, automatic bool, override *AccountScope) (Job, error) {
+	done, admitted := lifecycle.Default.Enter()
+	if !admitted {
+		return Job{}, errors.New("服务正在排空")
+	}
+	defer done()
 	if kind != "locate" && kind != "verify" {
 		return Job{}, errors.New("未知诊断操作")
 	}
@@ -83,7 +90,7 @@ func (m *Manager) start(id, kind string, automatic bool, override *AccountScope)
 	factory := m.factory
 	sessions := m.sessionFactory
 	m.wg.Add(1)
-	go func() { defer m.wg.Done(); defer cancel(); m.launch(ctx, item, factory, sessions) }()
+	lifecycle.Go(func() { defer m.wg.Done(); defer cancel(); m.launch(ctx, item, factory, sessions) })
 	return copyJSON(job), nil
 }
 func (m *Manager) Cancel(id string) error {
@@ -136,7 +143,7 @@ func (m *Manager) next() {
 	factory := m.factory
 	sessions := m.sessionFactory
 	m.wg.Add(1)
-	go func() { defer m.wg.Done(); defer cancel(); m.launch(ctx, copied, factory, sessions) }()
+	lifecycle.Go(func() { defer m.wg.Done(); defer cancel(); m.launch(ctx, copied, factory, sessions) })
 }
 
 func (m *Manager) run(ctx context.Context, item Case, probe Probe, release func()) {

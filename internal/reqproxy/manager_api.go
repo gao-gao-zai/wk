@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"workbuddy2api/internal/lifecycle"
 )
 
 // NewSubscription 构造带新 ID 的订阅。
@@ -224,7 +226,7 @@ func (m *Manager) RunHealthOnce() string {
 		return ""
 	}
 	id := StartJob("health-run", "全量测速")
-	go func() {
+	lifecycle.Go(func() {
 		ok, fail := m.health.RunOnce()
 		note := fmt.Sprintf("测速完成：%d 成功 / %d 失败", ok, fail)
 		errText := ""
@@ -232,7 +234,7 @@ func (m *Manager) RunHealthOnce() string {
 			errText = note
 		}
 		FinishJob(id, note, errText)
-	}()
+	})
 	return id
 }
 
@@ -242,10 +244,10 @@ func (m *Manager) RebalanceNow() (string, int) {
 		return "", 0
 	}
 	id := StartJob("rebalance", "负载再平衡")
-	go func() {
+	lifecycle.Go(func() {
 		n := m.Rebalance()
 		FinishJob(id, fmt.Sprintf("迁移 %d 个账号", n), "")
-	}()
+	})
 	return id, 0
 }
 
@@ -255,10 +257,10 @@ func (m *Manager) PrewarmNow() string {
 		return ""
 	}
 	id := StartJob("prewarm", "账号预热")
-	go func() {
+	lifecycle.Go(func() {
 		bound, failed := m.PrewarmAll()
 		FinishJob(id, fmt.Sprintf("新建 %d 个槽位，%d 个账号暂无合格节点", bound, failed), "")
-	}()
+	})
 	return id
 }
 
@@ -269,7 +271,7 @@ func (m *Manager) CompactNow() string {
 		return ""
 	}
 	id := StartJob("compact", "整合槽位")
-	go func() {
+	lifecycle.Go(func() {
 		merged, removed, _, removeOps := m.pool.CompactSlots()
 		// 同节点合并不会产生 add（槽位已在内核）；remove 释放端口
 		for _, op := range removeOps {
@@ -280,7 +282,7 @@ func (m *Manager) CompactNow() string {
 			}
 		}
 		FinishJob(id, fmt.Sprintf("合并 %d 个账号，删除 %d 个冗余槽位", merged, removed), "")
-	}()
+	})
 	return id
 }
 
@@ -292,10 +294,10 @@ func (m *Manager) ReassignNow() string {
 		return ""
 	}
 	id := StartJob("reassign", "重新分配槽位")
-	go func() {
+	lifecycle.Go(func() {
 		n, errText := m.reassignAll()
 		FinishJob(id, fmt.Sprintf("重分配 %d 个账号", n), errText)
-	}()
+	})
 	return id
 }
 
@@ -357,13 +359,13 @@ func (m *Manager) RefreshSubscriptionJob(subID string) string {
 		return ""
 	}
 	id := StartJob("sub-refresh", "订阅刷新")
-	go func() {
+	lifecycle.Go(func() {
 		if err := m.RefreshSubscription(subID); err != nil {
 			FinishJob(id, "", err.Error())
 		} else {
 			FinishJob(id, "订阅刷新完成", "")
 		}
-	}()
+	})
 	return id
 }
 
@@ -394,7 +396,7 @@ func (m *Manager) RunTTFB(group, model string, concurrency int, timeout time.Dur
 		return "", nil
 	}
 	id := StartJob("ttfb-run", "真实首字测速")
-	go func() {
+	lifecycle.Go(func() {
 		ok, fail, err := m.ttfb.Run(group, model, concurrency, timeout)
 		if err != nil {
 			FinishJob(id, "", err.Error())
@@ -406,7 +408,7 @@ func (m *Manager) RunTTFB(group, model string, concurrency int, timeout time.Dur
 			errText = note
 		}
 		FinishJob(id, note, errText)
-	}()
+	})
 	return id, nil
 }
 

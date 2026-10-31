@@ -4,8 +4,11 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/json"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	// 注册 pprof handler 到 http.DefaultServeMux（上面 ListenAndServe 用的是
 	// nil handler = DefaultServeMux）。主服务 handler 是显式传入的 h，不受影响。
@@ -15,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +28,7 @@ import (
 	"workbuddy2api/internal/collectionservice"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
+	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/promptguard"
@@ -213,6 +218,10 @@ func (m metricsAdapter) SnapshotMetrics() map[string]any {
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
+	preflight := flag.Bool("preflight", false, "validate configuration without starting services or writing state")
+	release := flag.String("release", "", "immutable release identifier")
+	controlPath := flag.String("control", "", "private Unix lifecycle control socket")
+	stateLock := flag.String("state-lock", "", "shared local exclusive lock path")
 	flag.Parse()
 
 	cfg, err := Load(*cfgPath)
@@ -232,6 +241,23 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
+	if *controlPath != "" && (*release == "" || *stateLock == "") {
+		log.Fatal("-control requires -release and -state-lock")
+	}
+	if *preflight {
+		log.Print("preflight configuration valid; no storage, scheduler or upstream initialized")
+		return
+	}
+	if *stateLock != "" {
+		unlock, err := lifecycle.Lock(*stateLock)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer unlock()
+	}
+	var foreground lifecycle.Gate
+	var serving atomic.Bool
+	handoffPath := filepath.Join(filepath.Dir(cfg.StateFile), "upgrade-handoff.enc")
 	// 配置文件可写性探测：控制台保存（管理设置 → 保存）会回写 config.json，
 	// 挂载成 :ro 时每次保存都静默失败，直到有人点保存才暴露。启动时探一次，
 	// 把问题变成日志里的一行。只告警不阻断——只读部署（纯 env + 外部编排
@@ -315,7 +341,7 @@ func main() {
 	defer responseStore.Close()
 
 	p := pool.New(cfg.StateFile)
-	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
+	// Final flush is registered after the state database close defer.
 
 	// statestore：池状态 + 增长台账的数据库后端（PG → SQLite → nil 降级链，
 	// 见 openStateStore）。nil 时 pool/台账走 JSON 文件模式（零回归）。
@@ -328,6 +354,7 @@ func main() {
 		p.SetStatePersister(stateDB)
 	}
 
+	defer p.Flush()
 	p.SetStore(store)
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比 DB/本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
@@ -348,6 +375,14 @@ func main() {
 		salt, err := decodeSessionSalt(cfg.SessionSticky.Salt)
 		if err != nil {
 			log.Fatalf("%v", err)
+		}
+		if len(salt) == 0 && *controlPath != "" {
+			secret := cfg.APIKey
+			if secret == "" {
+				secret = cfg.FrontendPassword
+			}
+			stable := sha256.Sum256([]byte("wb2api/session-salt/v1\x00" + secret))
+			salt = stable[:]
 		}
 		if len(salt) == 0 {
 			// 会话粘性没有盐也能工作，但键可被离线预计算（知道账号列表即可反推
@@ -545,7 +580,7 @@ func main() {
 				checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled)
 		},
 		TravelNow:   sch.RunTravelNow,
-		ActivityNow: func() { go sch.RunActivityNow(context.Background()) },
+		ActivityNow: func() { lifecycle.Go(func() { sch.RunActivityNow(context.Background()) }) },
 		SchoolNow:   sch.RunSchoolNow,
 		ScheduleEnabled: struct{ AutoenrollGrowthTasks bool }{
 			AutoenrollGrowthTasks: cfg.ScheduleEnabled.AutoenrollGrowthTasks,
@@ -630,8 +665,20 @@ func main() {
 		}
 	}
 
+	if *controlPath != "" {
+		bindings, err := h.LoadHandoff(handoffPath)
+		if err != nil {
+			log.Fatalf("load upgrade handoff: %v", err)
+		}
+		if sessRouter != nil && len(bindings) > 0 {
+			if err := sessRouter.Import(bindings); err != nil {
+				log.Fatalf("load route handoff: %v", err)
+			}
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	go trafficTracker.Run(ctx)
+	trafficDone := make(chan struct{})
+	go func() { defer close(trafficDone); trafficTracker.Run(ctx) }()
 	defer stop()
 	// 补释放上次进程非正常结束时遗留的号码。放在开始服务之前：容器重启是
 	// SIGKILL，收尾代码不会执行，号会一直占着豪猪的取号额度，导致之后每次
@@ -662,7 +709,8 @@ func main() {
 	} else {
 		log.Printf("collection disabled: durable state store unavailable")
 	}
-	go sch.Run(ctx)
+	schedulerDone := make(chan struct{})
+	go func() { defer close(schedulerDone); sch.Run(ctx) }()
 
 	// 对接码监控值班循环（常驻模型：Start 幂等拉起，enabled 由配置控制
 	// tick 是否派活——WebUI 开关切换即时生效，无需重启进程）。
@@ -682,9 +730,27 @@ func main() {
 		}()
 	}
 
+	ready := func() bool {
+		paused, _ := foreground.Status()
+		return serving.Load() && !paused && (reqProxyMgr == nil || reqProxyMgr.Ready())
+	}
+	guarded := foreground.Middleware(h)
+	publicHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-WorkBuddy-Release", *release)
+		if r.Method == "GET" && (r.URL.Path == "/livez" || r.URL.Path == "/readyz") {
+			ok := r.URL.Path == "/livez" || ready()
+			w.Header().Set("Content-Type", "application/json")
+			if !ok {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ready": ok, "release": *release})
+			return
+		}
+		guarded.ServeHTTP(w, r)
+	})
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           h,
+		Handler:           publicHandler,
 		ReadHeaderTimeout: 30 * time.Second,
 		// Bound header memory usage for internet-facing deployments. Request
 		// bodies are limited by the handlers before they reach the upstream.
@@ -693,27 +759,90 @@ func main() {
 		// active streaming responses.
 		IdleTimeout: 120 * time.Second,
 	}
+	if *controlPath != "" {
+		ctl, err := lifecycle.ListenControl(*controlPath, lifecycle.Control(*release, &foreground, ready, func() error {
+			if err := p.FlushChecked(); err != nil {
+				return err
+			}
+			if collectionManager != nil {
+				if err := collectionManager.FlushChecked(); err != nil {
+					return err
+				}
+			}
+			if promptManager != nil {
+				if err := promptManager.FlushChecked(); err != nil {
+					return err
+				}
+			}
+			if reqProxyMgr != nil {
+				if err := reqProxyMgr.FlushChecked(); err != nil {
+					return err
+				}
+			}
+			flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := trafficTracker.Flush(flushCtx); err != nil {
+				return err
+			}
+			var bindings []byte
+			if sessRouter != nil {
+				var err error
+				bindings, err = sessRouter.Export()
+				if err != nil {
+					return err
+				}
+			}
+			if err := h.SaveHandoff(handoffPath, bindings); err != nil {
+				return err
+			}
+			serving.Store(false)
+			return nil
+		}, stop))
+		if err != nil {
+			log.Fatalf("lifecycle socket: %v", err)
+		}
+		defer ctl.Close()
+	}
 	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		defer close(shutdownDone)
+		serving.Store(false)
+		// Stop admission first; keep every request dependency alive until its final
+		// history/metrics write. No fixed five-second deadline truncates SSE.
+		foreground.Pause()
+		if err := srv.Shutdown(context.Background()); err != nil {
+			log.Printf("HTTP shutdown: %v", err)
+		}
+		lifecycle.Default.Pause()
+		if w := h.UIDWatcher(); w != nil {
+			w.Stop()
+		}
+		<-schedulerDone
+		<-trafficDone
+		// Already admitted async work is allowed to finish. Complex long-running
+		// tasks may delay shutdown; planned upgrades abort earlier at the gateway.
+		_ = lifecycle.Default.Wait(context.Background())
 		if collectionManager != nil {
 			collectionManager.Close()
 		}
-		p.Flush() // 信号触发：先落盘再做优雅停机
 		if promptManager != nil {
 			promptManager.Close()
 		}
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := p.FlushChecked(); err != nil {
+			log.Printf("final pool flush: %v", err)
+		}
 	}()
-
 	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
 	// 重启恢复：上次进程死在批跑半路（部署/崩溃）时自动续跑剩余账号。
 	// 动作幂等（已完成的秒级跳过），用户无需手动重新点「一键完成」。
 	h.ResumeGrowthJobsAfterRestart()
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	serving.Store(true)
+	if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
 	if ctx.Err() != nil {
