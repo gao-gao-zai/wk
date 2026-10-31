@@ -108,7 +108,7 @@ curl http://localhost:7863/v1/messages \
   -d '{"model":"glm-5.2","max_tokens":1024,"messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
-支持文本、URL/Base64 图片、客户端工具定义和调用、工具结果、常见工具选择及流式和非流式响应。流式工具参数会在完成后按工具分别输出，以保证并行调用不串块。`thinking` 预算和 `output_config.effort` 近似映射到 `reasoning_effort`，具体效果由模型决定；不生成 Anthropic 签名 thinking 块，历史 thinking 块不会转发。`cache_control` 不映射为上游缓存断点；`top_k` 不转发。Anthropic 服务端工具、结构化输出格式、文档和其他未支持的内容块会返回 400，而不会伪装成原生支持；不提供 `/v1/messages/count_tokens`。计费和缓存统计依赖上游提供的 usage，缺失时不会凭空估算。停止序列触发情况及部分上游专有语义无法完整还原。
+支持文本、URL/Base64 图片、客户端工具定义和调用、工具结果、常见工具选择及流式和非流式响应。流式工具参数会在完成后按工具分别输出，以保证并行调用不串块。`thinking` 预算和 `output_config.effort` 近似映射到 `reasoning_effort`，具体效果由模型决定；不生成 Anthropic 签名 thinking 块，历史 thinking 块不会转发。`cache_control` 不映射为上游缓存断点；`top_k` 不转发。Anthropic 服务端工具、结构化输出格式、文档和其他未支持的内容块会返回 400，而不会伪装成原生支持；不提供 `/v1/messages/count_tokens`。`strict: true` 工具默认允许静默降级为普通工具（不保证 schema 强约束）；设置 `features.anthropic_strict_downgrade=false`、`WB2A_ANTHROPIC_STRICT_DOWNGRADE=false` 或关闭控制台「Anthropic strict 静默降级」后，带该约束的请求返回 400。该开关保存后即时生效。流式转换每 10 秒发送 ping，避免推理或缓冲工具参数期间空闲超时；保留请求追踪及防缓冲响应头。计费和缓存统计依赖上游提供的 usage，缺失时不会凭空估算。停止序列触发情况及部分上游专有语义无法完整还原。
 
 ## 配置说明
 

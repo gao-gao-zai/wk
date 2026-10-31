@@ -110,7 +110,8 @@ type Config struct {
 		// （Responses 带会话历史存储，比 chat 多一块状态）。
 		ResponsesAPI bool `json:"responses_api"`
 		// AnthropicAPI enables the Anthropic Messages compatibility endpoint.
-		AnthropicAPI bool `json:"anthropic_api"`
+		AnthropicAPI             bool `json:"anthropic_api"`
+		AnthropicStrictDowngrade bool `json:"anthropic_strict_downgrade"`
 	} `json:"features"`
 
 	Billing struct {
@@ -304,6 +305,7 @@ func Default() *Config {
 	c.Features.CodexCompat = false
 	c.Features.DSHCompat = false
 	c.Features.ResponsesAPI = true
+	c.Features.AnthropicStrictDowngrade = true
 	// 请求体上限默认 8 MB（与历史硬编码一致）。0 = 默认，见 normalize。
 	c.MaxRequestBodyMB = 8
 	c.ResponseHistory = responsehistory.Default()
@@ -500,6 +502,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_ANTHROPIC_API"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.AnthropicAPI = b
+		}
+	}
+	if v := os.Getenv("WB2A_ANTHROPIC_STRICT_DOWNGRADE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.AnthropicStrictDowngrade = b
 		}
 	}
 	limitEnv := os.Getenv("WB2A_MAX_REQUEST_BODY_MB")

@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"workbuddy2api/internal/upstream"
 )
@@ -58,7 +60,10 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		anthropicError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	chat, stream, model, err := anthropicToChat(body)
+	h.featuresMu.RLock()
+	allowStrictDowngrade := h.anthropicStrictDowngrade
+	h.featuresMu.RUnlock()
+	chat, stream, model, err := anthropicToChatWithPolicy(body, allowStrictDowngrade)
 	if err != nil {
 		anthropicError(w, 400, "invalid_request_error", err.Error())
 		return
@@ -72,6 +77,7 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if !stream {
 		rec := httptest.NewRecorder()
 		h.chatCompletions(rec, req)
+		copyAnthropicHeaders(w.Header(), rec.Header())
 		if rec.Code < 200 || rec.Code >= 300 {
 			anthropicChatError(w, rec.Code, rec.Body.Bytes())
 			return
@@ -90,8 +96,35 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sw := newAnthropicStream(w, model)
+	stopHeartbeat := sw.heartbeat(r.Context(), 10*time.Second)
+	defer stopHeartbeat()
 	h.chatCompletions(sw, req)
+	stopHeartbeat()
 	sw.finish()
+}
+
+// Preserve tracing and proxy headers without copying Chat's content type.
+func copyAnthropicHeaders(dst, src http.Header) {
+	for key, values := range src {
+		switch http.CanonicalHeaderKey(key) {
+		case "Content-Type", "Content-Length", "X-Workbuddy-Passthrough":
+			continue
+		}
+		dst[key] = append([]string(nil), values...)
+	}
+}
+
+func decodeAnthropicJSON(data []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("expected one JSON value")
+	}
+	return nil
 }
 func anthropicChatError(w http.ResponseWriter, status int, data []byte) {
 	var v struct {
@@ -123,18 +156,21 @@ func anthropicChatError(w http.ResponseWriter, status int, data []byte) {
 }
 
 func anthropicToChat(data []byte) ([]byte, bool, string, error) {
+	return anthropicToChatWithPolicy(data, true)
+}
+func anthropicToChatWithPolicy(data []byte, allowStrictDowngrade bool) ([]byte, bool, string, error) {
 	var in map[string]any
-	if json.Unmarshal(data, &in) != nil || in == nil {
+	if decodeAnthropicJSON(data, &in) != nil || in == nil {
 		return nil, false, "", fmt.Errorf("request body must be a JSON object")
 	}
 	model, ok := in["model"].(string)
 	if !ok || model == "" {
 		return nil, false, "", fmt.Errorf("model is required")
 	}
-	n, ok := numberInt(in["max_tokens"])
-	if value, valid := in["max_tokens"].(float64); !valid || value != float64(n) {
-		ok = false
-	}
+	value, ok := numberFloat(in["max_tokens"])
+	_, isNumber := in["max_tokens"].(json.Number)
+	n := int(value)
+	ok = ok && isNumber && value == float64(n)
 	if !ok || n <= 0 {
 		return nil, false, "", fmt.Errorf("max_tokens must be a positive integer")
 	}
@@ -217,6 +253,9 @@ func anthropicToChat(data []byte) ([]byte, bool, string, error) {
 			typ, _ := t["type"].(string)
 			if typ != "" && typ != "custom" {
 				return nil, false, "", fmt.Errorf("server tool %q is not supported", typ)
+			}
+			if strict, _ := t["strict"].(bool); strict && !allowStrictDowngrade {
+				return nil, false, "", fmt.Errorf("strict tool use is not supported; anthropic_strict_downgrade is disabled")
 			}
 			name, _ := t["name"].(string)
 			schema, ok := t["input_schema"].(map[string]any)
@@ -408,16 +447,40 @@ func anthropicStop(s string, hasTools bool) string {
 	}
 }
 func anthropicUsage(u map[string]any) map[string]any {
-	input, _ := numberInt(u["prompt_tokens"])
-	output, _ := numberInt(u["completion_tokens"])
+	count := func(m map[string]any, keys ...string) int {
+		n := 0
+		for _, key := range keys {
+			if v, ok := numberInt(m[key]); ok && v > n {
+				n = v
+			}
+		}
+		return n
+	}
+	input := count(u, "prompt_tokens", "input_tokens")
+	output := count(u, "completion_tokens", "output_tokens")
 	result := map[string]any{"input_tokens": input, "output_tokens": output}
-	// OpenAI cached tokens are a subset of prompt_tokens; do not double count.
-	if details, ok := u["prompt_tokens_details"].(map[string]any); ok {
-		if cached, ok := numberInt(details["cached_tokens"]); ok && cached >= 0 && cached <= input {
-			result["input_tokens"] = input - cached
-			result["cache_read_input_tokens"] = cached
+	// Match the Chat chain's total-input and cache aliases. Cache counters are
+	// subsets of total input; never count them again as uncached input.
+	cached := count(u, "prompt_cache_hit_tokens", "cache_read_input_tokens")
+	created := count(u, "cache_creation_input_tokens")
+	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
+		details, _ := u[key].(map[string]any)
+		if v := count(details, "cached_tokens"); v > cached {
+			cached = v
+		}
+		if v := count(details, "cache_creation_input_tokens", "cache_write_tokens"); v > created {
+			created = v
 		}
 	}
+	if cached > input {
+		cached = input
+	}
+	if created > input-cached {
+		created = input - cached
+	}
+	result["input_tokens"] = input - cached - created
+	result["cache_read_input_tokens"] = cached
+	result["cache_creation_input_tokens"] = created
 	return result
 }
 func anthropicResponse(chat map[string]any, model string) (map[string]any, error) {
@@ -445,7 +508,7 @@ func anthropicResponse(chat map[string]any, model string) (map[string]any, error
 			fn, _ := c["function"].(map[string]any)
 			args, _ := fn["arguments"].(string)
 			var input map[string]any
-			if json.Unmarshal([]byte(args), &input) != nil || input == nil {
+			if decodeAnthropicJSON([]byte(args), &input) != nil || input == nil {
 				return nil, fmt.Errorf("invalid tool call arguments")
 			}
 			blocks = append(blocks, map[string]any{"type": "tool_use", "id": c["id"], "name": fn["name"], "input": input})
@@ -467,6 +530,8 @@ type anthropicCall struct {
 	args     strings.Builder
 }
 type anthropicStream struct {
+	mu                              sync.Mutex
+	heartbeatErr                    error
 	dst                             http.ResponseWriter
 	header                          http.Header
 	status                          int
@@ -485,6 +550,11 @@ func newAnthropicStream(w http.ResponseWriter, model string) *anthropicStream {
 func (s *anthropicStream) Header() http.Header  { return s.header }
 func (s *anthropicStream) WriteHeader(code int) { s.status = code }
 func (s *anthropicStream) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flush()
+}
+func (s *anthropicStream) flush() {
 	if f, ok := s.dst.(http.Flusher); ok && s.started {
 		f.Flush()
 	}
@@ -497,7 +567,7 @@ func (s *anthropicStream) emit(typ string, value map[string]any) error {
 	}
 	_, err = fmt.Fprintf(s.dst, "event: %s\ndata: %s\n\n", typ, b)
 	if err == nil {
-		s.Flush()
+		s.flush()
 	}
 	return err
 }
@@ -506,14 +576,21 @@ func (s *anthropicStream) start() error {
 		return nil
 	}
 	s.started = true
+	copyAnthropicHeaders(s.dst.Header(), s.header)
 	if s.id == "" {
 		s.id = newResponseID()
 	}
 	s.dst.Header().Set("Content-Type", "text/event-stream")
 	s.dst.Header().Set("Cache-Control", "no-cache")
+	s.dst.Header().Set("X-Accel-Buffering", "no")
 	return s.emit("message_start", map[string]any{"message": map[string]any{"id": s.id, "type": "message", "role": "assistant", "model": s.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
 }
 func (s *anthropicStream) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.heartbeatErr != nil {
+		return 0, s.heartbeatErr
+	}
 	if s.status >= 400 {
 		return s.errorBody.Write(p)
 	}
@@ -617,7 +694,10 @@ func (s *anthropicStream) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 func (s *anthropicStream) finish() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.status >= 400 {
+		copyAnthropicHeaders(s.dst.Header(), s.header)
 		anthropicChatError(s.dst, s.status, s.errorBody.Bytes())
 		return
 	}
@@ -658,4 +738,33 @@ func (s *anthropicStream) finish() {
 	}
 	_ = s.emit("message_delta", map[string]any{"delta": map[string]any{"stop_reason": anthropicStop(s.reason, len(s.calls) > 0), "stop_sequence": nil}, "usage": anthropicUsage(s.usage)})
 	_ = s.emit("message_stop", map[string]any{})
+}
+
+// Ping while reasoning or buffered tool arguments produce no visible blocks.
+// Serialize writes with conversion and join the goroutine before finishing.
+func (s *anthropicStream) heartbeat(ctx context.Context, interval time.Duration) func() {
+	stop, exited := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(exited)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				s.mu.Lock()
+				if s.started && !s.done && !s.failed {
+					if err := s.emit("ping", map[string]any{}); err != nil {
+						s.heartbeatErr, s.failed = err, true
+					}
+				}
+				s.mu.Unlock()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(stop) }); <-exited }
 }
