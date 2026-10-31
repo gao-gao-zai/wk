@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/haozhumah5"
+	"workbuddy2api/internal/lifecycle"
 )
 
 // ---- 配置（config.json autoenroll.watch，用户可编辑） ----
@@ -623,6 +624,11 @@ func (w *UIDWatcher) AddBudget(add float64, set *float64) (float64, error) {
 // 在 Run 的 goroutine 里串行执行，天然无并发问题（state 读写仍走锁，
 // 因为 AddBudget/Status 会并发进来）。
 func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
+	done, err := lifecycle.Default.EnterContext(ctx)
+	if err != nil {
+		return
+	}
+	defer done()
 	w.mu.Lock()
 	generation := w.configGeneration
 	w.mu.Unlock()
@@ -636,6 +642,7 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 			w.setPaused("豪猪接码暂不可用：" + err.Error())
 			return
 		}
+		w.clearPreparationPause()
 	}
 	if w.en == nil || !w.en.HasHaozhuma() {
 		w.setPaused("豪猪接码未配置；E码云自动加号不受影响")
@@ -1127,6 +1134,19 @@ func (w *UIDWatcher) clearTransientPause() {
 	w.mu.Lock()
 	w.state.PausedReason = ""
 	w.mu.Unlock()
+}
+
+func (w *UIDWatcher) clearPreparationPause() {
+	w.mu.Lock()
+	changed := strings.HasPrefix(w.state.PausedReason, "豪猪接码暂不可用：")
+	if changed {
+		w.state.PausedReason = ""
+	}
+	w.mu.Unlock()
+	if changed {
+		w.log("接码准备已恢复，继续监控")
+		w.persist()
+	}
 }
 
 // persist 状态落盘（原子写，与 config 同链路）。调用点都在 mu 释放后。

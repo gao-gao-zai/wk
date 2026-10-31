@@ -1,0 +1,7 @@
+# Build handoff-gateway on the tdog host; this image only packages the artifact.
+FROM alpine:3.20
+RUN adduser -D -u 10001 app
+USER app
+WORKDIR /app
+COPY handoff-gateway /app/handoff-gateway
+ENTRYPOINT ["/app/handoff-gateway"]

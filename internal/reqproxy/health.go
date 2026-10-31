@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/lifecycle"
 )
 
 func mustParseURL(raw string) *url.URL {
@@ -137,6 +139,11 @@ func (h *Health) Stop() {
 // 节点开同名 probe 槽位（tag 冲突 → 内核报错 → 探测全挂），且先结束的
 // 轮次会把任务标完成，动画停了而后一轮还在跑。
 func (h *Health) RunOnce() (ok, fail int) {
+	done, admitted := lifecycle.Default.Enter()
+	if !admitted {
+		return 0, 0
+	}
+	defer done()
 	h.roundMu.Lock()
 	defer h.roundMu.Unlock()
 	nodes := h.pool.NodesSnapshot()

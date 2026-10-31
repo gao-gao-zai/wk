@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -121,11 +122,81 @@ func fetchPatchPresent(p *smsPatch) bool {
 	return s.Sid != nil || s.Author != nil || s.UID != nil || s.UIDs != nil || s.ISP != nil
 }
 
+// Keep errors.Is(ErrBusyAuth) compatibility while reporting the actual blocker.
+type smsBusyReason struct{ reason string }
+
+func (e *smsBusyReason) Error() string { return e.reason }
+func (e *smsBusyReason) Unwrap() error { return ErrBusyAuth }
+
+// smsBusyLocked requires a.mu. A failed release is not a running task.
+func (a *AutoEnroller) smsBusyLocked() error {
+	switch {
+	case a.running:
+		return ErrBusyAuth
+	case a.clientPreparing:
+		return &smsBusyReason{"正在清理遗留号码并准备接码客户端，请稍后再试"}
+	case a.fetchLease:
+		return &smsBusyReason{"监控正在使用取号参数，请等待本轮收尾后再试"}
+	case len(a.held) > 0:
+		return &smsBusyReason{fmt.Sprintf("仍有 %d 个遗留号码未释放，清理完成前不可更换接码配置", len(a.held))}
+	default:
+		return nil
+	}
+}
+
+// prepareMonitorClient must reclaim with the original client and its phone routes
+// before replacing it. The preparation lease also fences manual tasks and edits.
+func (a *AutoEnroller) prepareMonitorClient(ctx context.Context, build func(context.Context) (*haozhuma.Client, error)) error {
+	a.mu.Lock()
+	if a.running || a.fetchLease || a.clientPreparing {
+		err := a.smsBusyLocked()
+		a.mu.Unlock()
+		return err
+	}
+	if len(a.held) > 0 && a.hzm == nil {
+		a.mu.Unlock()
+		return errors.New("遗留号码缺少原接码客户端，无法安全清理，请检查原接码账号")
+	}
+	a.clientPreparing = true
+	a.mu.Unlock()
+	defer func() { a.mu.Lock(); a.clientPreparing = false; a.mu.Unlock() }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if phones := a.heldPhones(); len(phones) > 0 {
+		a.logf("监控启动前重试清理 %d 个遗留号码", len(phones))
+		a.reclaimContext(ctx, phones, true)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if left := a.Status().Held; left > 0 {
+			return fmt.Errorf("仍有 %d 个遗留号码未释放，监控将在下一轮自动重试清理；持续失败请在豪猪后台核对占用号码", left)
+		}
+	}
+	c, err := build(ctx)
+	if err != nil {
+		return err
+	}
+	if c == nil {
+		return errors.New("接码客户端未配置")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	a.hzm = c
+	if project := c.Project(); project != "" {
+		a.sid = project
+	}
+	return nil
+}
+
 func (a *AutoEnroller) applyFetchConfig(s haozhuma.Settings, persist func() error) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.running || a.fetchLease || len(a.held) > 0 {
-		return ErrBusyAuth
+	if err := a.smsBusyLocked(); err != nil {
+		return err
 	}
 	if err := persist(); err != nil {
 		return err
@@ -145,8 +216,11 @@ func (a *AutoEnroller) applyFetchConfig(s haozhuma.Settings, persist func() erro
 func (a *AutoEnroller) borrowMonitorFetch(sid, uid string) (func(), error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.running || a.fetchLease || a.hzm == nil || len(a.held) > 0 {
-		return nil, ErrBusyAuth
+	if err := a.smsBusyLocked(); err != nil {
+		return nil, err
+	}
+	if a.hzm == nil {
+		return nil, errors.New("豪猪接码客户端未配置")
 	}
 	c := a.hzm
 	oldSid, oldUID, oldUIDs := a.sid, c.UID(), c.UIDs()
@@ -200,7 +274,7 @@ func (h *Handler) monitorEnabledPatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "watch": h.cfg.UIDWatcher.Status()})
 }
 func (h *Handler) syncUIDSelection(ctx context.Context, before, after []string) []string {
-	h5 := h.cfg.HaozhumaH5
+	h5 := h.H5Client()
 	mine, err := h5.MyUIDs(ctx, "")
 	if err != nil {
 		return []string{"读取豪猪账户失败：" + err.Error()}

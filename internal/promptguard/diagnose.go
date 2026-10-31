@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"workbuddy2api/internal/lifecycle"
 )
 
 var (
@@ -18,6 +20,15 @@ var (
 )
 
 func (m *Manager) Start(id, kind string, automatic bool) (Job, error) {
+	return m.start(id, kind, automatic, nil)
+}
+
+func (m *Manager) start(id, kind string, automatic bool, override *AccountScope) (Job, error) {
+	done, admitted := lifecycle.Default.Enter()
+	if !admitted {
+		return Job{}, errors.New("服务正在排空")
+	}
+	defer done()
 	if kind != "locate" && kind != "verify" {
 		return Job{}, errors.New("未知诊断操作")
 	}
@@ -27,13 +38,16 @@ func (m *Manager) Start(id, kind string, automatic bool) (Job, error) {
 	if c == nil {
 		return Job{}, errors.New("记录不存在")
 	}
+	if override != nil && c.AccountScope != nil {
+		return Job{}, errors.New("已有原请求范围的记录不能扩大诊断选号范围")
+	}
 	if m.closed || m.active && !automatic {
 		return Job{}, errors.New("已有诊断正在运行，请稍后重试")
 	}
 	if c.Job != nil && (c.Job.Status == "running" || c.Job.Status == "queued") {
 		return Job{}, errors.New("该记录已在诊断队列中")
 	}
-	if m.factory == nil {
+	if m.factory == nil && m.sessionFactory == nil {
 		return Job{}, errors.New("诊断上游未配置")
 	}
 	if automatic && !m.state.Config.Settings.AutoLocate {
@@ -41,6 +55,13 @@ func (m *Manager) Start(id, kind string, automatic bool) (Job, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	job := Job{Kind: kind, Status: "running", Automatic: automatic, Budget: m.state.Config.Settings.ProbeBudget, Revision: m.state.Config.Revision, Started: time.Now().UTC(), Trace: []Trace{}}
+	job.AccountScope = copyJSON(c.AccountScope)
+	if m.sessionFactory != nil {
+		job.CurrentStep = "select_account"
+	}
+	if override != nil {
+		job.AccountScope = copyJSON(override)
+	}
 	if kind == "verify" {
 		job.Budget = 2
 	}
@@ -67,8 +88,9 @@ func (m *Manager) Start(id, kind string, automatic bool) (Job, error) {
 	m.cancel[id] = cancel
 	item := copyJSON(*c)
 	factory := m.factory
+	sessions := m.sessionFactory
 	m.wg.Add(1)
-	go func() { defer m.wg.Done(); defer cancel(); m.run(ctx, item, factory(item)) }()
+	lifecycle.Go(func() { defer m.wg.Done(); defer cancel(); m.launch(ctx, item, factory, sessions) })
 	return copyJSON(job), nil
 }
 func (m *Manager) Cancel(id string) error {
@@ -103,9 +125,13 @@ func (m *Manager) next() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	item.Job.Status = "running"
+	if m.sessionFactory != nil {
+		item.Job.CurrentStep = "select_account"
+	}
 	item.Job.Started = time.Now().UTC()
 	item.Job.Revision = m.state.Config.Revision
 	item.Job.Budget = m.state.Config.Settings.ProbeBudget
+	item.Job.AccountScope = copyJSON(item.AccountScope)
 	if m.saveLocked() != nil {
 		item.Job.Status = "interrupted"
 		cancel()
@@ -115,17 +141,21 @@ func (m *Manager) next() {
 	m.cancel[item.ID] = cancel
 	copied := copyJSON(*item)
 	factory := m.factory
+	sessions := m.sessionFactory
 	m.wg.Add(1)
-	go func() { defer m.wg.Done(); defer cancel(); m.run(ctx, copied, factory(copied)) }()
+	lifecycle.Go(func() { defer m.wg.Done(); defer cancel(); m.launch(ctx, copied, factory, sessions) })
 }
 
-func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
+func (m *Manager) run(ctx context.Context, item Case, probe Probe, release func()) {
 	status, note := "inconclusive", "诊断未获得确定结果"
 	endReason := "probe_inconclusive"
 	candidate := ""
 	minimal := false
 	verified := false
 	defer func() {
+		if release != nil {
+			release()
+		}
 		m.mu.Lock()
 		m.active = false
 		delete(m.cancel, item.ID)
@@ -369,6 +399,14 @@ func (m *Manager) run(ctx context.Context, item Case, probe Probe) {
 
 func probeReason(r ProbeResult) string {
 	switch r.Reason {
+	case "no_available_account":
+		return "原请求允许范围内没有可用账号，未发送上游请求"
+	case "selected_account_unavailable":
+		return "本次选定账号已不可用，未中途换号"
+	case "account_scope_changed":
+		return "本次选定账号已不在原请求允许范围，已停止诊断"
+	case "selection_persistence_failed":
+		return "无法保存本次选号信息，未发送上游请求"
 	case "account_busy_or_unavailable":
 		return "原账号忙碌或不可用，等待 3 秒仍未取得执行槽位，未发送上游请求"
 	case "account_needs_refresh":

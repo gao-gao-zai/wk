@@ -11,11 +11,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/lifecycle"
 )
 
 const historyLimit = 100
 
 type work struct {
+	upgradeDone func()
 	target      Target
 	subscribers map[string]*Item
 	running     bool
@@ -189,6 +192,11 @@ func (m *Manager) count(j *Job) {
 	}
 }
 func (m *Manager) Submit(req Request) (Job, error) {
+	done, admitted := lifecycle.Default.Enter()
+	if !admitted {
+		return Job{}, fmt.Errorf("服务正在排空")
+	}
+	defer done()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -280,7 +288,7 @@ func (m *Manager) Submit(req Request) (Job, error) {
 		w := m.works[key]
 		if w == nil || w.version != m.versions[key] {
 			previous := w
-			w = &work{previous: previous, target: i.Target, subscribers: map[string]*Item{}, manual: req.Source == "manual", allow: req.IncludeDisabled, version: m.versions[key]}
+			w = &work{upgradeDone: lifecycle.Default.Track(), previous: previous, target: i.Target, subscribers: map[string]*Item{}, manual: req.Source == "manual", allow: req.IncludeDisabled, version: m.versions[key]}
 			m.works[key] = w
 			m.queue = append(m.queue, w)
 		}
@@ -518,6 +526,13 @@ func (m *Manager) Close() {
 	}
 	m.mu.Unlock()
 	m.wg.Wait()
+	m.mu.Lock()
+	for _, w := range m.queue {
+		if w.upgradeDone != nil {
+			w.upgradeDone()
+		}
+	}
+	m.mu.Unlock()
 }
 func (m *Manager) loop() {
 	defer m.wg.Done()
@@ -548,6 +563,9 @@ func (m *Manager) loop() {
 			w := m.queue[index]
 			m.queue = append(m.queue[:index], m.queue[index+1:]...)
 			if len(w.subscribers) == 0 {
+				if w.upgradeDone != nil {
+					w.upgradeDone()
+				}
 				w.finished = true
 				if m.works[w.target.key()] == w {
 					delete(m.works, w.target.key())
@@ -610,6 +628,9 @@ func (m *Manager) update(w *work, state string, attempt int, f *Failure) {
 	_ = m.save(rows, nil)
 }
 func (m *Manager) execute(w *work) {
+	if w.upgradeDone != nil {
+		defer w.upgradeDone()
+	}
 	defer m.wg.Done()
 	var data json.RawMessage
 	var err error

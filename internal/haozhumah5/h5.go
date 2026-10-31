@@ -67,11 +67,16 @@ type Client struct {
 	HTTP    *http.Client
 	Timeout time.Duration
 
-	mu        sync.Mutex
-	session   string    // Web token；空 = 未配置
-	expired   bool      // 上次请求判定会话失效（不清空 session，重贴时覆盖）
-	lastSeen  time.Time // 上次成功调用时间（回显/诊断用）
-	lastError string    // 上次调用错误文案（回显/诊断用）
+	mu           sync.Mutex
+	session      string    // Web token；空 = 未配置
+	expired      bool      // 上次请求判定会话失效（不清空 session，重贴时覆盖）
+	lastSeen     time.Time // 上次成功调用时间（回显/诊断用）
+	lastError    string    // 上次调用错误文案（回显/诊断用）
+	persisted    bool
+	storageError string
+	// The store is fixed at construction; saves are serialized separately from reads.
+	tokenStore *tokenStore
+	saveMu     sync.Mutex
 
 	// 缓存：key 形如 "30:腾讯" / "8:70da814e38b466b6"。
 	cacheMu sync.Mutex
@@ -98,6 +103,7 @@ func New(session string) *Client {
 func (c *Client) Session(session string) {
 	c.mu.Lock()
 	c.session = strings.TrimSpace(session)
+	c.persisted = false
 	c.expired = false // 新会话先按有效对待，首次调用再验证
 	c.lastError = ""
 	c.mu.Unlock()
@@ -109,21 +115,31 @@ func (c *Client) Session(session string) {
 // SessionInfo 回显会话状态（不回显值本身）。has=true 且 expired=true
 // 表示"存了但已失效"。
 type SessionInfo struct {
-	Has       bool      `json:"has"`
-	Expired   bool      `json:"expired"`
-	LastSeen  time.Time `json:"last_seen"`
-	LastError string    `json:"last_error"`
+	Has          bool      `json:"has"`
+	Expired      bool      `json:"expired"`
+	LastSeen     time.Time `json:"last_seen"`
+	LastError    string    `json:"last_error"`
+	Storage      string    `json:"storage"`
+	Persisted    bool      `json:"persisted"`
+	StorageError string    `json:"storage_error,omitempty"`
 }
 
 // Info 返回会话状态摘要。
 func (c *Client) Info() SessionInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	storage := "memory"
+	if c.tokenStore != nil {
+		storage = "encrypted_file"
+	}
 	return SessionInfo{
-		Has:       c.session != "",
-		Expired:   c.expired,
-		LastSeen:  c.lastSeen,
-		LastError: c.lastError,
+		Has:          c.session != "",
+		Expired:      c.expired,
+		LastSeen:     c.lastSeen,
+		LastError:    c.lastError,
+		Storage:      storage,
+		Persisted:    c.persisted,
+		StorageError: c.storageError,
 	}
 }
 

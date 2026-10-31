@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { smsPlatformPatch } from './smsPlatforms.js';
+import { smsPlatformPatch, webTokenStatus } from './smsPlatforms.js';
 
 const settings = { provider: 'ecode', saved_platforms: { haozhuma: true, ecode: true } };
 const draft = { provider: 'haozhuma', keyword: '腾讯科技', base: 'https://example.test', card: '全部', province: '浙江', sid: '52283', token: '', fallback: '' };
@@ -27,4 +27,24 @@ test('disabling fallback preserves saved credentials and permits clearing its ke
   assert.equal(patch.fallback_enabled, false);
   assert.equal(Object.hasOwn(patch, 'fallback'), false);
   assert.throws(() => smsPlatformPatch(settings, { ...draft, keyword: '' }, true), /短信关键词/);
+});
+
+test('Web token status distinguishes encrypted persistence, memory and expiry', () => {
+  const saved = webTokenStatus({ has: true, storage: 'encrypted_file', persisted: true });
+  assert.equal(saved.type, 'success');
+  assert.match(saved.title, /已加密保存/);
+  assert.match(saved.description, /重启后自动恢复/);
+  assert.match(saved.saveLabel, /保存/);
+  assert.match(saved.clearDescription, /重启后不会恢复/);
+  assert.match(webTokenStatus({ has: true, storage: 'encrypted_file' }).title, /仅本次生效/);
+  assert.match(webTokenStatus({ has: true }).description, /未启用令牌持久化/);
+  assert.match(webTokenStatus({ has: true, persisted: true, expired: true }).title, /已失效/);
+});
+
+test('Web token save failure never claims a new token was saved', () => {
+  const failed = webTokenStatus({ has: true, storage: 'encrypted_file', persisted: true, storage_error: '保存失败' });
+  assert.equal(failed.type, 'warning');
+  assert.match(failed.description, /当前令牌仍保留/);
+  assert.match(failed.description, /保存失败/);
+  assert.match(webTokenStatus({ storage: 'encrypted_file' }).description, /加密保存在服务端/);
 });

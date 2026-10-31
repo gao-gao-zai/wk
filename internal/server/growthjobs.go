@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/lifecycle"
 )
 
 // growthJob 一个异步任务的实时状态。字段按"前端渲染进度条需要什么"设计：
@@ -319,10 +320,10 @@ func (h *Handler) ResumeGrowthJobsAfterRestart() {
 	// 是唯一同步点；入队方滞后写会与 drain 的 clear 竞争复活已删标记）。
 	h.writeGrowthJobMark(mark.Pending)
 	// 延迟几秒再入队：让服务先把监听/健康检查立起来，部署脚本不误判启动失败。
-	go func() {
+	lifecycle.Go(func() {
 		time.Sleep(5 * time.Second)
 		if n := h.growthSubmitAll(job, accounts); n == 0 {
 			h.clearGrowthJobMark()
 		}
-	}()
+	})
 }

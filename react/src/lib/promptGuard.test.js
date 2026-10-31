@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { candidateView, httpDescription, jobView, requestAttempted, verificationStages } from './promptGuard.js';
+import { accountScopeLabel, candidateView, httpDescription, jobView, requestAttempted, selectionView, verificationStages } from './promptGuard.js';
 
 const screenshotJob = { kind: 'verify', status: 'inconclusive', calls: 1, budget: 64, started: '2026-10-28T14:25:55Z', trace: [{ step: 'control', characters: 28, outcome: 'inconclusive', http: 0, reason: 'account_busy_or_unavailable' }] };
 
@@ -55,4 +55,20 @@ test('candidate needs matching task time and revision to be current', () => {
 
 test('cancelled check keeps the cancellation explanation', () => {
   assert.equal(jobView({ ...screenshotJob, status: 'cancelled', note: '用户已取消' }).description, '用户已取消');
+});
+
+test('selection explains the actual account, allowed scope and pinned slot', () => {
+  const view=selectionView({selection:{uid:'chosen',nickname:'诊断号',scope_kind:'group',group:'vip',scope_count:3,available_count:1,reason:'weighted_available',wait_ms:5}});
+  assert.equal(view.uid,'chosen');assert.equal(view.title,'诊断号');assert.match(view.scope,/vip/);assert.match(view.description,/保留一个并发槽位/);assert.equal(view.availableCount,1);
+});
+
+test('legacy records never imply permission to use the whole pool',()=>{
+  assert.match(accountScopeLabel(null),/仅限原拦截账号/);
+  assert.match(selectionView({selection:{scope_kind:'legacy',uid:'original',reason:'legacy_original_only'}}).description,/仅使用原账号/);
+  assert.match(accountScopeLabel({kind:'group',group:'vip'}),/vip/);
+});
+
+test('selection failure remains a local zero-request failure',()=>{
+  const row={step:'control',http:0,outcome:'inconclusive',reason:'no_available_account',request_attempted:false};
+  const view=jobView({...screenshotJob,trace:[row]});assert.equal(view.requests,0);assert.match(view.headline,/允许范围内没有可用账号/);
 });

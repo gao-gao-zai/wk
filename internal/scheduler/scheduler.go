@@ -13,6 +13,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/collection"
+	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
@@ -241,6 +242,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 // runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
 // ctx 取消时由各任务内部的可取消等待快速收尾。
 func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+	done, err := lifecycle.Default.EnterContext(ctx)
+	if err != nil {
+		return
+	}
+	defer done()
 	var wg sync.WaitGroup
 	for _, k := range kinds {
 		wg.Add(1)
@@ -283,6 +289,11 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // authoritative web billing meter. It is intentionally asynchronous and never
 // blocks an in-flight model request.
 func (s *Scheduler) RunRequestCreditRefreshNow() {
+	done, admitted := lifecycle.Default.Enter()
+	if !admitted {
+		return
+	}
+	defer done()
 	cfg := s.snapshot()
 	if cfg.Collection != nil {
 		return

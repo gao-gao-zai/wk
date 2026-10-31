@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Alert, App, Button, Card, Descriptions, Drawer, Empty, Form, Input, InputNumber, Modal, Select, Space, Statistic, Switch, Table, Tabs, Tag, Typography } from 'antd';
 import { ArrowDownOutlined, ArrowUpOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import './PromptGuard.css';
-import { candidateView, diagnosticStates, httpDescription, jobView, probeExplanation, requestAttempted, stageNames, verificationStages } from '../lib/promptGuard';
+import { accountScopeLabel, candidateView, diagnosticStates, httpDescription, jobView, probeExplanation, requestAttempted, selectionView, stageNames, verificationStages } from '../lib/promptGuard';
 
 const { Text, Paragraph } = Typography;
 const root = '/admin/prompt-guard/';
@@ -33,6 +33,7 @@ function PromptText({ title, messages }) {
 function DiagnosticJob({ item }) {
   const job = item.job;
   const view = jobView(job);
+  const selection=selectionView(job);
   const stale = job.status === 'passed' && !item.resolved;
   const columns = [
     { title: '检查步骤', dataIndex: 'step', width: 160, render: (v, row, i) => <div><Text strong>{i + 1}. {stageNames[v] || v}</Text><div><Text type="secondary">{row.characters} 字符</Text></div></div> },
@@ -42,6 +43,7 @@ function DiagnosticJob({ item }) {
   ];
   return <Card size="small" className="pg-job" title={<div className="pg-job-heading"><Text strong>{job.kind === 'verify' ? '本次完整提示词替换验证' : '本次二分定位'}</Text><Tag color={stale ? 'orange' : view.type === 'success' ? 'green' : view.active ? 'blue' : 'orange'}>{stale ? '历史验证已失效' : states[job.status] || job.status}</Tag></div>}>
     <Alert type={stale ? 'warning' : view.type} showIcon message={stale ? '旧验证结果已失效，需要重新验证' : view.headline} description={stale ? '规则已变化或该提示词再次被拦截，本次记录仍待处理。' : view.description} />
+    <section className="pg-account-selection" aria-label="本次诊断账号"><Text strong>{selection.title}</Text>{selection.uid && <div><Text type="secondary">账号 UID：</Text><Text code copyable>{selection.uid}</Text></div>}{selection.scope && <div><Tag>{selection.scope}</Tag><Text type="secondary">范围内 {selection.scopeCount} 个账号，选号时可用 {selection.availableCount} 个{selection.waitMS!=null?`，选号耗时 ${(selection.waitMS/1000).toFixed(2)} 秒`:''}</Text></div>}<Paragraph type="secondary">{selection.description}</Paragraph></section>
     <div className="pg-job-metrics"><div><Text type="secondary">上游请求尝试</Text><strong>{view.requestLabel}</strong></div><div><Text type="secondary">已执行检查</Text><strong>{view.checks} 步</strong></div><div><Text type="secondary">复用重复结果</Text><strong>{view.cached} 次</strong></div></div>
     <Text type="secondary">本次最多 {view.budget} 次请求，上限不是必须发送的数量；对照失败时会停止后续检查。复用结果不消耗额外请求预算。</Text>
     <div className="pg-stages" role="list" aria-label="诊断阶段">{verificationStages(job).map((stage, i) => <div className="pg-stage" role="listitem" key={stage.step}><div><Text strong>{i + 1}. {stage.name}</Text><Tag color={stage.outcome === 'pass' ? 'green' : stage.outcome === 'blocked' ? 'red' : 'default'}>{stage.state}</Tag></div><Text type="secondary">{stage.explanation}</Text></div>)}</div>
@@ -97,15 +99,19 @@ export default function PromptGuardPage({ api }) {
     if (await saveConfig({ rules })) setEditor(null);
   };
   const move = async (index, direction) => { const rules = [...config.rules]; [rules[index], rules[index + direction]] = [rules[index + direction], rules[index]]; await saveConfig({ rules }); };
-  const launch = kind => modal.confirm({
+  const launch = async kind => {
+    let override=null;
+    let groups=[];
+    if(!detail?.account_scope) { try {const result=await api('/admin/groups');groups=result.groups || [];} catch {} }
+    return modal.confirm({
     title: kind === 'locate' ? '开始二分定位？' : '验证替换后的完整系统提示词？',
-    content: <div><Paragraph>将使用本记录原账号，向模型 {detail?.model} 发送真实请求，可能产生用量。</Paragraph><Paragraph>{kind === 'locate' ? `最多 ${config?.settings.probe_budget} 次，先验证对照与按当前规则转换的完整系统提示词，再检查句子及句子组合。同一任务内重复片段复用已确定的结果。` : '最多 2 次：先检查中性对照，对照通过后才验证经当前替换处理的完整系统提示词。'}</Paragraph><Paragraph>原账号忙碌、不可用或对照失败时会停止，不会自动换号。请求上限不是必须发送的数量。</Paragraph><Paragraph>只使用已保存的系统提示词和固定的“Reply with OK.”用户消息。历史业务对话不参与测试。可随时取消。</Paragraph></div>,
+    content: <div><Paragraph>将向模型 {detail?.model} 发送真实请求，可能产生用量。</Paragraph><Paragraph>选号范围：{accountScopeLabel(detail?.account_scope)}。启动时选择可用账号，本次任务固定使用，结束或取消时释放槽位。</Paragraph>{!detail?.account_scope && <div className="pg-scope-choice"><Alert type="warning" showIcon message="旧记录没有保存原请求分组" description="默认仅使用原账号。管理员可明确选择本次允许的分组；选择全池表示授权本次诊断使用全池账号。" /><Select aria-label="本次诊断选号范围" defaultValue="legacy" style={{width:'100%',margin:'12px 0'}} options={[{value:'legacy',label:'仅原账号（保守默认）'},...groups.map(g=>({value:`group:${g.name}`,label:`分组：${g.name}`})),{value:'all',label:'管理员全池（明确授权本次使用）'}]} onChange={value=>{override=value==='legacy'?null:value==='all'?{kind:'all'}:{kind:'group',group:value.slice(6)};}} /></div>}<Paragraph>{kind === 'locate' ? `最多 ${config?.settings.probe_budget} 次，先验证对照与按当前规则转换的完整系统提示词，再检查句子及句子组合。同一任务内重复片段复用已确定的结果。` : '最多 2 次：先检查中性对照，对照通过后才验证经当前替换处理的完整系统提示词。'}</Paragraph><Paragraph>范围内没有可用账号、所选账号失效或对照失败时会停止，不会中途换号。请求上限不是必须发送的数量。</Paragraph><Paragraph>只使用已保存的系统提示词和固定的“Reply with OK.”用户消息。历史业务对话不参与测试。可随时取消。</Paragraph></div>,
     okText: '确认发送', cancelText: '取消',
     onOk: async () => {
-      try { await api(`${root}cases/${detailId}/${kind}`, { method: 'POST' }); setDetail(await api(`${root}cases/${detailId}`)); changed(); message.success('诊断已启动'); }
+      try { await api(`${root}cases/${detailId}/${kind}`, { method: 'POST',...(override?json({account_scope:override}):{}) }); setDetail(await api(`${root}cases/${detailId}`)); changed(); message.success('诊断已启动'); }
       catch (e) { message.error(e.message); throw e; }
     },
-  });
+  }); };
   const cancel = async () => { try { await api(`${root}cases/${detailId}/cancel`, { method: 'POST' }); message.success('已请求取消'); await load(); } catch (e) { message.error(e.message); } };
   const remove = row => modal.confirm({ title: '删除这条拦截记录？', content: '将删除保存的完整系统提示词和诊断结果；后续新的 11128 仍会记录。', okText: '删除', okButtonProps: { danger: true }, cancelText: '取消', onOk: async () => { await api(`${root}cases/${row.id}`, { method: 'DELETE' }); if (row.id === detailId) setDetailId(null); await load(); changed(); } });
   const rulesColumns = [
@@ -125,7 +131,7 @@ export default function PromptGuardPage({ api }) {
     <Card title="系统提示词管理" extra={<Button icon={<ReloadOutlined />} onClick={load}>刷新</Button>}>
       <Tabs activeKey={tab} onChange={setTab} items={[
         { key: 'cases', label: `拦截记录${pending ? ` · ${pending} 待处理` : ''}`, children: <>
-          <Alert type="info" showIcon message="相同拦截会合并，不会反复自动诊断" description="同一模型、原始和出站系统提示词（含角色、内容块和顺序）完全一致时合并计数，不区分账号。动态时间、文本或替换结果变化会保留为不同记录。" />
+          <Alert type="info" showIcon message="相同拦截会合并，不会反复自动诊断" description="同一模型、原请求选号范围、原始和出站系统提示词（含角色、内容块和顺序）一致时合并计数，不区分账号。不同分组或动态文本变化会保留为不同记录。" />
           <div className="pg-toolbar"><Text type="secondary">仅记录上游 code=11128；每行是一份去重后的完整提示词记录。</Text><Select aria-label="筛选拦截记录" value={filter} onChange={setFilter} options={[{ value: 'pending', label: '待处理' }, { value: 'all', label: '全部记录' }, { value: 'resolved', label: '已验证通过' }]} /></div>
           <Table rowKey="id" dataSource={cases.filter(c => filter === 'all' || (filter === 'resolved' ? c.resolved : !c.resolved))} pagination={{ pageSize: 10 }} scroll={{ x: 850 }} locale={{ emptyText: '暂无对应的 11128 拦截记录' }} columns={[
             { title: '模型 / 记录', dataIndex: 'model', render: (v, r) => <div><Text strong>{v}</Text><div><Text type="secondary">{r.id.slice(0, 12)}</Text></div></div> },
@@ -152,7 +158,7 @@ export default function PromptGuardPage({ api }) {
     </Card>
     <Drawer title="拦截详情与诊断" open={!!detailId} width="min(940px, 100vw)" onClose={() => setDetailId(null)} destroyOnHidden>
       {!detail ? <Empty description="正在加载记录" /> : <Space direction="vertical" size={18} style={{ width: '100%' }}>
-        <Descriptions size="small" column={2} items={[{ key: 'model', label: '模型', children: detail.model }, { key: 'status', label: '状态', children: detail.resolved ? '完整提示词已验证通过' : '待处理' }, { key: 'count', label: '拦截次数', children: detail.occurrences }, { key: 'seen', label: '最近拦截', children: time(detail.last_seen) }]} />
+        <Descriptions size="small" column={2} items={[{ key: 'model', label: '模型', children: detail.model }, { key: 'status', label: '状态', children: detail.resolved ? '完整提示词已验证通过' : '待处理' }, { key: 'count', label: '拦截次数', children: detail.occurrences }, { key: 'seen', label: '最近拦截', children: time(detail.last_seen) },{key:'scope',label:'原请求范围',children:accountScopeLabel(detail.account_scope)}]} />
         <Space wrap><Button type="primary" disabled={detailActive || active > 0} onClick={() => launch('locate')}>{detail.job ? '重新二分定位' : '开始二分定位'}</Button><Button disabled={detailActive || active > 0} onClick={() => launch('verify')}>验证当前替换</Button><Button onClick={async () => { try { const v = await api(`${root}cases/${detailId}/preview`, { method: 'POST' }); setPreview(v.messages); } catch (e) { message.error(e.message); } }}>本地替换预览</Button>{detailActive && <Button danger onClick={cancel}>取消诊断</Button>}</Space>
         <Alert type="info" showIcon message="验证包含完整系统提示词，但不包含历史用户对话和工具调用；通过只代表本次模型与账号下的这次检测。" />
         {detail.job && <DiagnosticJob item={detail} />}

@@ -17,6 +17,7 @@ import (
 
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
+	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/smslogin"
 )
 
@@ -36,6 +37,7 @@ type AutoEnroller struct {
 	runProvider, runSource                string
 	runReceived, runNoSMS, runOtherErrors int
 	manualStop, fetchLease                bool
+	clientPreparing                       bool
 
 	sms *smslogin.Manager
 	hzm *haozhuma.Client
@@ -408,7 +410,7 @@ func (a *AutoEnroller) Status() AutoEnrollStatus {
 	}
 	return AutoEnrollStatus{
 		SupplierCounts: counts, MessagesReceived: a.runBillable,
-		Want: a.runWant, Provider: a.runProvider, Source: a.runSource, Groups: append([]string(nil), a.runGroups...), Received: a.runReceived, NoSMS: a.runNoSMS, OtherErrors: a.runOtherErrors, ManualStop: a.manualStop, ConfigBusy: a.fetchLease,
+		Want: a.runWant, Provider: a.runProvider, Source: a.runSource, Groups: append([]string(nil), a.runGroups...), Received: a.runReceived, NoSMS: a.runNoSMS, OtherErrors: a.runOtherErrors, ManualStop: a.manualStop, ConfigBusy: a.fetchLease || a.clientPreparing,
 		Running:     a.running,
 		Attempts:    a.attempts,
 		OK:          a.ok,
@@ -496,8 +498,8 @@ func (a *AutoEnroller) ReplaceClient(c *haozhuma.Client) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.running {
-		return ErrBusyAuth
+	if err := a.smsBusyLocked(); err != nil {
+		return err
 	}
 	a.hzm = c
 	return nil
@@ -597,9 +599,19 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 		limit = maxAttemptsLimit
 	}
 	a.mu.Lock()
-	if a.running || (a.fetchLease && opts.Source != "monitor") || (opts.Client != nil && len(a.held) > 0) {
+	if a.clientPreparing {
+		err := a.smsBusyLocked()
+		a.mu.Unlock()
+		return err
+	}
+	if a.running || (a.fetchLease && opts.Source != "monitor") {
 		a.mu.Unlock()
 		return errors.New("自动加号已在进行中")
+	}
+	if opts.Client != nil && len(a.held) > 0 {
+		err := a.smsBusyLocked()
+		a.mu.Unlock()
+		return err
 	}
 	target := a.hzm
 	if opts.Client != nil {
@@ -665,7 +677,7 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	ctx = haozhuma.WithMode(ctx, opts.ProviderMode)
 	a.cancel = cancel
 	a.mu.Unlock()
-	go func() {
+	lifecycle.Go(func() {
 		defer func() {
 			cancel()
 			// 收尾兜底释放：必须在 running 仍为 true 时做完。新的任务此时还
@@ -692,7 +704,7 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 			a.logf("完成：成功 %d / 尝试 %d（目标 %d，并发 %d，每号轮询 %d 次）",
 				ok, attempts, n, workers, pollCount)
 		}
-	}()
+	})
 	return nil
 }
 
@@ -1023,6 +1035,10 @@ func (a *AutoEnroller) persistLedgerLocked() {
 //
 // report 为 true 时用 a.logf（会进控制台日志），否则用标准 log（启动阶段）。
 func (a *AutoEnroller) reclaim(phones []string, report bool) int {
+	return a.reclaimContext(context.Background(), phones, report)
+}
+
+func (a *AutoEnroller) reclaimContext(ctx context.Context, phones []string, report bool) int {
 	say := func(format string, args ...any) {
 		if report {
 			a.logf(format, args...)
@@ -1030,21 +1046,27 @@ func (a *AutoEnroller) reclaim(phones []string, report bool) int {
 		}
 		log.Printf("[auto-enroll] "+format, args...)
 	}
-	bg := context.Background()
+	c := a.CurrentSMSClient()
 	// 释放用当前 sid：账本里可能是切换前旧项目取的号，用新 sid 释放会报
 	// "手机号不存在"→ goneUpstream 视为归还（豪猪侧到期自动回收，无泄漏）。
 	sid := a.currentSid()
 	var done int
 	var stuck []string
-	for _, phone := range phones {
-		rerr := a.hzm.Release(bg, sid, phone)
+	for i, phone := range phones {
+		if ctx.Err() != nil {
+			stuck = append(stuck, phones[i:]...)
+			break
+		}
+		rerr := c.Release(ctx, sid, phone)
 		switch {
 		case rerr == nil:
+			c.ForgetPhone(phone)
 			done++
 		case goneUpstream(rerr):
 			// 豪猪说这个号根本不在它那儿（"手机号不存在"）——等于已经不占了，
 			// 再重试也没有意义，算归还。
 			say("遗留号 %s 已不在豪猪（%v），视为已归还", maskPhone(phone), rerr)
+			c.ForgetPhone(phone)
 			done++
 		default:
 			say("遗留号释放失败 %s: %v（保留在账本，稍后重试）", maskPhone(phone), rerr)
@@ -1228,14 +1250,17 @@ func (a *AutoEnroller) ReleaseAllHeld(ctx context.Context) (bool, int, error) {
 		a.mu.Unlock()
 		return false, 0, errors.New("E码云未提供平台释放接口，号码回收以供应商规则为准")
 	}
-	if a.running {
+	if a.running || a.fetchLease || a.clientPreparing {
 		a.mu.Unlock()
 		return false, 0, ErrBusy
 	}
 	heldBefore := len(a.held)
+	c := a.hzm
+	a.clientPreparing = true
 	a.mu.Unlock()
+	defer func() { a.mu.Lock(); a.clientPreparing = false; a.mu.Unlock() }()
 
-	if err := a.hzm.ReleaseAll(ctx); err != nil {
+	if err := c.ReleaseAll(ctx); err != nil {
 		return false, heldBefore, err
 	}
 	// 平台侧已全量释放：账本整体清空，released 补记本批。
@@ -1370,7 +1395,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 	if drained := a.hzm.TakeDrainedUIDs(); len(drained) > 0 {
 		a.logf("对接码 %v 已用完/失效，自动移出轮换池（池剩 %d 个）", drained, len(a.hzm.UIDs()))
 		if cb := a.uidsDrainedCallback(); cb != nil {
-			go cb(drained) // 异步：H5 慢，不挡取号流水线
+			lifecycle.Go(func() { cb(drained) }) // 异步：H5 慢，不挡取号流水线
 		}
 	}
 	// 配置里钉死的对接码被上游删掉了：已经自动退回平台分配，但要让你知道
@@ -1489,7 +1514,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 			// 自动化（约 +1950 积分）。回调内自带 per-account 锁与节流，这里
 			// 只负责触发。开关在 handler 侧（schedule.autoenroll_growth_tasks）。
 			if cb := a.enrolledCallback(); cb != nil {
-				go cb(creds.UID)
+				lifecycle.Go(func() { cb(creds.UID) })
 			}
 			note := finish(false)
 			a.logf("号 %s 加号成功 uid=%s…（%s）", phone, shortUID(creds.UID), note)

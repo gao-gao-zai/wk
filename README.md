@@ -2,6 +2,81 @@
 
 ## 快速开始
 
+### 无缝业务升级（Linux 单主机）
+
+新增 `handoff-gateway` 稳定入口和业务生命周期协议。升级时入口暂存新请求，等待旧聊天/SSE 与已接收的后台任务结束，提交状态后退出旧版本，再启动新版本释放队列。排空超预算会恢复旧版本接单；不强杀已有流、不重放可能已经生成的请求。
+
+这是**短时排队的单写交接**。请求必须在客户端、NewAPI、各层反代与 gateway 的共同等待预算内完成；队满或等待到期返回 503。无限长流、数据库重大迁移、宿主机/gateway 自身升级和崩溃恢复不承诺无中断。首次接入入口及首次从不支持本协议的旧版本迁移，需单独安排。
+
+构建与测试按工作区要求在 SSH `tdog` 宿主机执行，先检查连通性，加载 `/srv/build-server/env/workbuddy2api.sh`，使用隔离源码目录。运行镜像只打包宿主机产物：应用用 `Dockerfile.local`，稳定入口用 `Dockerfile.gateway`。不使用主 Dockerfile 的容器内编译路径。
+
+宿主机构建命令（在 tdog 项目环境内）：
+
+```bash
+go test -p=2 ./...
+go build -o "$ARTIFACT_DIR/wb2api" ./cmd/server
+go build -o "$ARTIFACT_DIR/handoff-gateway" ./cmd/handoff-gateway
+python3 scripts/test-seamless-upgrade.py "$ARTIFACT_DIR/wb2api" "$ARTIFACT_DIR/handoff-gateway"
+python3 scripts/test-upgrade-controller.py
+```
+
+部署前准备：
+
+- 所有业务流量改为经过 gateway，业务端口仅回环/私有网络可达。参考拓扑：原 TLS 入口 → `127.0.0.1:7863` gateway → A `127.0.0.1:7864` / B `127.0.0.1:7865`。Linux 容器可使用 host 网络并显式绑定回环；保留原部署全部必要挂载。
+- 在宿主机创建服务专用本地运行目录，例如 `/run/wb2api-upgrade`，权限 0700、属主与进程 UID 一致；所有版本映射同一目录。不可用 NFS。控制 socket 权限 0600，禁止映射为公网管理接口。
+- 保留相同 config、auths、data、数据库、管理员凭证和显式 session salt。未配置 salt 时，升级模式从稳定管理员凭证按独立用途派生，不新增明文秘密文件。
+- A、B 使用不同 release ID、业务端口、控制 socket，共用同一个 `-state-lock`。业务启动前即获取文件锁，第二个写入者会拒绝启动。部署工具只能在确认旧进程退出后启动 B。
+- 对已准备的 A/B 容器使用 `restart=no`，避免宿主机重启时旧版本自行抢到写锁；发布完成后，由外部服务管理器只启动发布日志确认的活动版本。不要让两个版本同时自动重启。
+
+业务启动参数示例（配置通过既有挂载/secret 提供，参数不含秘密）：
+
+```bash
+# A 与 B 的独立启动参数；WB2A_LISTEN 分别设为 127.0.0.1:7864 / :7865
+wb2api -config /app/config.json -release release-a \
+  -control /run/wb2api-upgrade/a.sock -state-lock /run/wb2api-upgrade/writer.lock
+wb2api -config /app/config.json -release release-b \
+  -control /run/wb2api-upgrade/b.sock -state-lock /run/wb2api-upgrade/writer.lock
+
+# 先单独完成初次入口接入，后续业务升级不重启此进程
+handoff-gateway -listen 127.0.0.1:7863 -target http://127.0.0.1:7864 \
+  -release release-a -control /run/wb2api-upgrade/gateway.sock \
+  -state /opt/wb2api-upgrade/gateway.state \
+  -wait 90s -pending 128 -queued-bytes 64000000 -body-bytes 8000000
+```
+
+gateway 默认不信任转发头。只有本机受控 TLS 入口能访问 gateway 时，才加 `-trust-ingress` 保留其真实 IP/HTTPS 信息；业务端仍需显式信任 gateway 地址。gateway 将活动版本、目标地址和 hold 状态写入 `-state` 文件，重启读取已提交状态；若发布中退出，会保持 hold 供恢复检查，不自行猜测版本。省略 `-state` 时使用控制 socket 旁的 `.state`；生产应准备同 UID、0700 的持久目录（如 `/opt/wb2api-upgrade`），避免 `/run` 随宿主机重启被清空。锁、状态文件和发布日志不能在交接期间清除。队列不预读/落盘请求体；未知长度按最大请求体预留预算，额外计入每项 32 KiB 头部预算。`-body-bytes` 与应用请求体限制同步；大请求/慢客户端仍受各层超时与资源限制约束。
+
+业务新增只读 `GET /livez`（存活）、`GET /readyz`（接单就绪），响应带 release ID；不触发上游请求。原 `/healthz` 继续表示账号健康。业务响应新增 `X-WorkBuddy-Release`。
+
+只读候选检查：以 B 镜像另外创建一个**停止状态的预检容器**，与 B 相同环境、配置和挂载位置，挂载可设只读，入口参数改成 `-config /app/config.json -preflight`。预检只验证配置，不初始化生产存储、迁移、代理或后台任务；通过不代表真实业务已经就绪。
+
+准备好 A（运行）、B（停止）、预检容器（停止）后，在 Linux 宿主机执行：
+
+```bash
+python3 scripts/seamless-upgrade.py \
+  --old-container wb-a --new-container wb-b --check-container wb-b-preflight \
+  --old-release release-a --new-release release-b \
+  --old-control /run/wb2api-upgrade/a.sock --new-control /run/wb2api-upgrade/b.sock \
+  --gateway-control /run/wb2api-upgrade/gateway.sock \
+  --new-target http://127.0.0.1:7865 \
+  --drain-seconds 20 --start-seconds 20 \
+  --journal /opt/wb2api-upgrade/release-a-to-b.json
+```
+
+脚本先检查镜像、挂载、角色和 release，再预检、hold、排空、最终提交、等待真实退出、启动候选并核对实际目标的 `/readyz`，最后 switch/resume。发布日志原子写阶段，不包含凭证。`gateway wait` 至少覆盖排空 + 启动 + 15 秒提交/退出余量；生产客户端链路也必须允许该等待。
+
+会话账号绑定、控制台 Cookie 摘要和解锁限流状态通过 `data/upgrade-handoff.enc` 做 AES-GCM 交接；保持原管理员凭证才能读取。Responses 历史继续使用原 SQL 存储。前缀预测缓存暂不交接，升级后重建；不保证上游 KV 命中率。后台任务采用**等全部已接收工作结束**的策略，不引入跨进程任务重放，长批任务可能使本次升级撤销。
+
+失败与回滚：
+
+- `aborted_old_serving`：排空预算不足或可撤销阶段出错，旧版本恢复接单。重新发布使用新 journal。
+- `recovery_required`：可能已提交 stop、旧进程已退出，或 B 启动/切流失败。脚本不盲目重跑、不强杀、不恢复整库。先通过两个业务控制 socket、gateway `/status` 和容器 State 确认实际阶段；日志存在时脚本拒绝重跑。
+- stop 回执丢失也视为状态未知。确认旧进程仍运行且未进入停止后，才能调用其 `/resume?release=...`，再恢复 gateway `/resume?expected=...`；已退出就不能只改入口指针。
+- B 已开始业务后的兼容回滚使用同一协议，交换 A/B 角色，并准备 A 镜像的预检容器及新 journal。保留 B 新写入的数据。格式/迁移不向后兼容时另走维护流程。
+- 控制命令通过私有 Unix HTTP socket 发出：gateway 支持 `/hold`、`/switch`、`/resume`（`expected` 参数）；业务支持 `/pause`、`/quiesce`、`/resume`、`/stop`（`release` 参数）。`quiesce` 要求前台已经排空，`stop` 要求前台后台均归零且最终持久化成功。均不是公网 API。
+
+发布期间不删除旧镜像和备份，不顺手升级 PostgreSQL。旧页面可能仍引用前一版静态资源，发布制品应保留上一版带 hash 的资源；管理 API 不兼容变更需单独处理。
+
 控制台新增「采集中心」，统一执行积分余额、请求用量、凭证有效期、模型权限和成长任务状态的在线采集。账号管理中可以按单账号、已选账号、当前筛选结果或全池发起，任务离开页面后继续执行。刷新列表只读取本地状态；`/v1/models` 从按账号隔离的模型快照汇总，首次成功采集前回退静态模型表。
 
 默认并发 4、每秒最多 4 次上游请求；在采集中心可调整并立即生效。默认自动周期：积分 15 分钟、用量/凭证 5 分钟、模型 1 小时、任务 30 分钟；可关闭启动及定时采集。自动采集跳过禁用账号，管理员可显式选择「包含禁用账号（仅查询，不启用）」。凭证临近到期或查询遇到 401 时才续期，禁用账号不自动续期。在线聊天鉴权恢复保留独立路径。
@@ -692,6 +767,10 @@ MIT
 
 监控费用以收到短信的号码次数乘触发时单价估算，包括后续注册或落盘失败的已收码尝试，不作为供应商账单。每批尝试上限受剩余预估预算约束；只有正常查询最终无短信、且无本地/接口故障和人工停止的批次才会将对接码标记为暂时不可用。
 
+监控准备下一轮前，会使用原接码客户端及号码所属项目重试清理本服务账本中的遗留号码，再切换到新一轮的客户端。清理期间禁止插入新任务或更换接码配置；释放仍失败时保留账本，显示遗留数量，并按监控间隔自动重试。该过程不会调用账户全量释放接口。恢复后自动清除对应暂停原因，无需反复开关监控。
+
 ### 豪猪新版 Web 登录令牌
 
-豪猪增强功能使用新版 Web API（api.veeto.cn/v1）。在「平台配置 → 豪猪增强功能」粘贴 qs_web_token，验证通过后本次服务运行期间生效。输入框旁有控制台代码和开发者工具手动读取两种教程；令牌与接码 API Token 独立，不回显、不写配置文件或日志。服务重启后重新粘贴，也可在运行环境中注入 HAOZHUMA_WEB_TOKEN；不要将实际令牌写进仓库文件。旧 PHPSESSID 不再用于新版接口。令牌失效后重新登录豪猪获取，不假定固定有效期，也不调用 /ping 续期。
+豪猪增强功能使用新版 Web API（api.veeto.cn/v1）。在「平台配置 → 豪猪增强功能」粘贴 qs_web_token，验证通过后立即生效，并以 AES-GCM 加密保存在 `state_file` 同目录的 `haozhuma-web-token.enc`（文件权限 0600），服务重启后自动恢复。输入框旁有控制台代码和开发者工具手动读取两种教程；Web 令牌与接码 API Token 独立，不回显、不写入配置明文或日志。加密密钥与提示词存储一样，从管理员 API Key（无 API Key 时使用控制台密码）派生，并使用独立用途；备份与恢复时保留原管理员密钥及该加密文件。读取/解密失败会停用增强会话并在界面提示，可检查原密钥或重新保存，不会静默启用其它令牌。保存或清空失败均保留原运行时令牌。
+
+尚无已保存值时，仍可用环境变量 `HAOZHUMA_WEB_TOKEN` 提供本次运行的初始值；界面保存的值优先，显式清空也会持久化，重启后不再恢复环境变量中的旧值。无持久数据路径或稳定管理员密钥的实例只支持内存模式，界面会明确提示；令牌不写入浏览器存储。已在旧进程内存中的令牌需在升级后重新粘贴保存一次。旧 PHPSESSID 不再用于新版接口。令牌失效后重新登录豪猪获取，不假定固定有效期，也不调用 /ping 续期；加密保存不会延长上游令牌有效期。

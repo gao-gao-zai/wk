@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -22,7 +23,7 @@ func (h *Handler) recoverUnauthorized(a *auth.Auth) {
 	if !started {
 		return
 	}
-	go func() {
+	lifecycle.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), authRecoveryTimeout)
 		defer cancel()
 		err := h.cfg.Upstream.RefreshTokenContext(ctx, a)
@@ -49,5 +50,5 @@ func (h *Handler) recoverUnauthorized(a *auth.Auth) {
 			return
 		}
 		log.Printf("auth recovery uid=%s: refreshed; quarantine retained until retry window", a.UID)
-	}()
+	})
 }

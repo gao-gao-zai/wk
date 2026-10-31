@@ -55,37 +55,40 @@ type Trace struct {
 	ProbeResult
 }
 type Job struct {
-	Kind        string     `json:"kind"`
-	Status      string     `json:"status"`
-	Automatic   bool       `json:"automatic"`
-	Calls       int        `json:"calls"`
-	Budget      int        `json:"budget"`
-	CacheHits   int        `json:"cache_hits,omitempty"`
-	CurrentStep string     `json:"current_step,omitempty"`
-	EndReason   string     `json:"end_reason,omitempty"`
-	Revision    uint64     `json:"revision"`
-	Started     time.Time  `json:"started"`
-	Finished    *time.Time `json:"finished,omitempty"`
-	Note        string     `json:"note"`
-	Trace       []Trace    `json:"trace"`
+	Kind         string            `json:"kind"`
+	Status       string            `json:"status"`
+	Automatic    bool              `json:"automatic"`
+	Calls        int               `json:"calls"`
+	Budget       int               `json:"budget"`
+	CacheHits    int               `json:"cache_hits,omitempty"`
+	CurrentStep  string            `json:"current_step,omitempty"`
+	EndReason    string            `json:"end_reason,omitempty"`
+	Revision     uint64            `json:"revision"`
+	Started      time.Time         `json:"started"`
+	Finished     *time.Time        `json:"finished,omitempty"`
+	Note         string            `json:"note"`
+	Trace        []Trace           `json:"trace"`
+	AccountScope *AccountScope     `json:"account_scope,omitempty"`
+	Selection    *AccountSelection `json:"selection,omitempty"`
 }
 type Case struct {
-	ID                 string     `json:"id"`
-	Model              string     `json:"model"`
-	UID                string     `json:"uid"`
-	Original           []Message  `json:"original,omitempty"`
-	Outbound           []Message  `json:"outbound,omitempty"`
-	Diagnostic         []Message  `json:"diagnostic,omitempty"`
-	FirstSeen          time.Time  `json:"first_seen"`
-	LastSeen           time.Time  `json:"last_seen"`
-	Occurrences        int        `json:"occurrences"`
-	Candidate          string     `json:"candidate,omitempty"`
-	CandidateMinimal   bool       `json:"candidate_minimal"`
-	CandidateRevision  uint64     `json:"candidate_revision,omitempty"`
-	CandidateLocatedAt *time.Time `json:"candidate_located_at,omitempty"`
-	VerifiedRevision   uint64     `json:"verified_revision"`
-	Resolved           bool       `json:"resolved"`
-	Job                *Job       `json:"job,omitempty"`
+	ID                 string        `json:"id"`
+	Model              string        `json:"model"`
+	UID                string        `json:"uid"`
+	AccountScope       *AccountScope `json:"account_scope,omitempty"`
+	Original           []Message     `json:"original,omitempty"`
+	Outbound           []Message     `json:"outbound,omitempty"`
+	Diagnostic         []Message     `json:"diagnostic,omitempty"`
+	FirstSeen          time.Time     `json:"first_seen"`
+	LastSeen           time.Time     `json:"last_seen"`
+	Occurrences        int           `json:"occurrences"`
+	Candidate          string        `json:"candidate,omitempty"`
+	CandidateMinimal   bool          `json:"candidate_minimal"`
+	CandidateRevision  uint64        `json:"candidate_revision,omitempty"`
+	CandidateLocatedAt *time.Time    `json:"candidate_located_at,omitempty"`
+	VerifiedRevision   uint64        `json:"verified_revision"`
+	Resolved           bool          `json:"resolved"`
+	Job                *Job          `json:"job,omitempty"`
 }
 type diskState struct {
 	Config Config           `json:"config"`
@@ -105,18 +108,19 @@ type Probe func(context.Context, []Message, bool) ProbeResult
 type ProbeFactory func(Case) Probe
 
 type Manager struct {
-	mu           sync.Mutex
-	state        diskState
-	path         string
-	aead         cipher.AEAD
-	factory      ProbeFactory
-	prepare      func(Case) ([]Message, error)
-	cancel       map[string]context.CancelFunc
-	active       bool
-	closed       bool
-	wg           sync.WaitGroup
-	storageError string
-	stop         chan struct{}
+	mu             sync.Mutex
+	state          diskState
+	path           string
+	aead           cipher.AEAD
+	factory        ProbeFactory
+	sessionFactory SessionFactory
+	prepare        func(Case) ([]Message, error)
+	cancel         map[string]context.CancelFunc
+	active         bool
+	closed         bool
+	wg             sync.WaitGroup
+	storageError   string
+	stop           chan struct{}
 }
 
 func Open(path, secret string) (*Manager, error) {
@@ -176,7 +180,12 @@ func Open(path, secret string) (*Manager, error) {
 	}()
 	return m, nil
 }
-func (m *Manager) SetProbeFactory(f ProbeFactory) { m.mu.Lock(); defer m.mu.Unlock(); m.factory = f }
+func (m *Manager) SetProbeFactory(f ProbeFactory) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.factory = f
+	m.sessionFactory = nil
+}
 func (m *Manager) SetPreparer(f func(Case) ([]Message, error)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -312,9 +321,19 @@ func (m *Manager) List() []Case {
 		v.Outbound = nil
 		v.Diagnostic = nil
 		v.Candidate = ""
+		if v.AccountScope != nil {
+			scope := *v.AccountScope
+			scope.Accounts = nil
+			v.AccountScope = &scope
+		}
 		if v.Job != nil {
 			job := *v.Job
 			job.Trace = nil
+			if job.AccountScope != nil {
+				scope := *job.AccountScope
+				scope.Accounts = nil
+				job.AccountScope = &scope
+			}
 			v.Job = &job
 		}
 		out = append(out, v)
@@ -346,7 +365,23 @@ func (m *Manager) Delete(id string) error {
 	return nil
 }
 func (m *Manager) Capture(model, uid string, original, outbound []Message) (string, error) {
+	return m.capture(model, uid, original, outbound, nil)
+}
+
+func (m *Manager) CaptureScoped(model, uid string, original, outbound []Message, scope AccountScope) (string, error) {
+	normalized, err := normalizedScope(scope)
+	if err != nil {
+		return "", err
+	}
+	return m.capture(model, uid, original, outbound, &normalized)
+}
+
+func (m *Manager) capture(model, uid string, original, outbound []Message, scope *AccountScope) (string, error) {
 	b, _ := json.Marshal([]any{model, original, outbound})
+	if scope != nil {
+		// Group identity participates in dedup; member snapshots may change.
+		b, _ = json.Marshal([]any{model, original, outbound, scope.Kind, scope.Group})
+	}
 	hash := sha256.Sum256(b)
 	id := hex.EncodeToString(hash[:16])
 	m.mu.Lock()
@@ -365,10 +400,12 @@ func (m *Manager) Capture(model, uid string, original, outbound []Message) (stri
 	if exists {
 		c.Occurrences++
 		c.UID = uid
+		c.AccountScope = copyJSON(scope)
 		c.LastSeen = now
 		c.Resolved = false
 	} else {
 		c = &Case{ID: id, Model: model, UID: uid, Original: Clone(original), Outbound: Clone(outbound), FirstSeen: now, LastSeen: now, Occurrences: 1}
+		c.AccountScope = copyJSON(scope)
 		m.state.Cases[id] = c
 	}
 	m.pruneLocked()
