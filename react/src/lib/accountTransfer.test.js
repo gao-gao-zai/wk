@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ACCOUNT_CREDENTIAL_MAX_BYTES, ACCOUNT_IMPORT_MAX_BYTES, accountImportDeviceLabel, accountImportResultType, buildAccountImportRequest,
-  createAccountImportFileLoader, identifyAccountImport, normalizeAccountImportOptions, validTransferPassword,
+  createAccountImportFileLoader, identifyAccountImport, normalizeAccountImportOptions, runMultiAccountImport, validTransferPassword,
 } from './accountTransfer.js';
 
 const official = uid => ({ auth: { accessToken: 'fake-access-token', refreshToken: 'fake-refresh-token', expiresAt: 1900000000000 }, account: { uid, nickname: 'Test account' } });
@@ -135,6 +135,101 @@ test('nickname overrides require a single-account document and validate Unicode 
   // Selecting one UID from a multi-account encrypted document does not permit a nickname override.
   assert.throws(() => buildAccountImportRequest(identifyAccountImport(bundle), password, ['u1'], { nickname: 'name' }));
   assert.deepEqual(normalizeAccountImportOptions({ nickname: '   ' }, false), { group_mode: 'source' });
+});
+
+test('multiple credential files load together and reject duplicate or mixed files', async () => {
+  const loader = createAccountImportFileLoader();
+  const result = await loader.loadMany([file('one.json', official('u1')), file('two.json', official('u2'))]);
+  assert.equal(result.source.kind, 'credentials');
+  assert.equal(result.source.sources.length, 2);
+  assert.match((await loader.loadMany([file('a', official('u1')), file('b', official('u1'))])).error, /重复/);
+  assert.match((await loader.loadMany([file('a', official('u1')), file('bundle', bundle)])).error, /单独选择/);
+  assert.equal((await loader.loadMany([file('a', official('u1'))])).source.kind, 'credential');
+});
+
+test('multiple imports preview each credential and stop after uncertain write', async () => {
+  const sources = (await createAccountImportFileLoader().loadMany([file('a', official('u1')), file('b', official('u2')), file('c', official('u3'))])).source.sources;
+  const calls = [];
+  const post = async (path, body) => {
+    const uid = JSON.parse(body.credential_json).account.uid;
+    calls.push([path, uid]);
+    if (path.endsWith('/preview')) return { accounts: [{ uid, exists: uid === 'u2' }] };
+    if (uid === 'u2') throw new Error('network error');
+    return { results: [{ uid, ok: true }] };
+  };
+  const preview = await runMultiAccountImport(post, sources, { group_mode: 'source' });
+  assert.deepEqual(preview.accounts.map(row => row.uid), ['u1', 'u2', 'u3']);
+  const result = await runMultiAccountImport(post, sources, { group_mode: 'source' }, ['u1', 'u2', 'u3']);
+  assert.equal(result.success, 1);
+  assert.equal(result.stop, true);
+  assert.match(result.results[2].detail, /未提交/);
+  assert.deepEqual(calls.slice(3).map(call => call[1]), ['u1', 'u2']);
+});
+
+test('multi-file import stops dispatching after page unmount while preserving the in-flight request', async () => {
+  const sources = (await createAccountImportFileLoader().loadMany([file('a', official('u1')), file('b', official('u2'))])).source.sources;
+  const waiting = deferred();
+  const calls = [];
+  let cancelled = false;
+  const running = runMultiAccountImport(async (path, body) => {
+    calls.push(body.uids[0]);
+    await waiting.promise;
+    return { results: [{ uid: body.uids[0], ok: true }] };
+  }, sources, { group_mode: 'source' }, ['u1', 'u2'], () => cancelled);
+  cancelled = true;
+  waiting.resolve();
+  const result = await running;
+  assert.deepEqual(calls, ['u1']);
+  assert.equal(result.success, 1);
+  assert.equal(result.stop, true);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.results.map(row => [row.uid, !!row.cancelled]), [['u1', false], ['u2', true]]);
+});
+
+test('progress counts completed requests and cancelled preview cannot look complete', async () => {
+  const sources = (await createAccountImportFileLoader().loadMany([file('a', official('u1')), file('b', official('u2'))])).source.sources;
+  const events = [];
+  let stop = false;
+  const result = await runMultiAccountImport(async () => {
+    stop = true;
+    return { accounts: [{ uid: 'u1' }] };
+  }, sources, { group_mode: 'source' }, undefined, () => stop, event => events.push(event));
+  assert.deepEqual(events, [{ completed: 0, total: 2 }, { completed: 1, total: 2 }]);
+  assert.equal(result.stop, true);
+  assert.equal(result.count, 1);
+});
+
+test('multi-file preview stops on global errors but continues for individual credential errors', async () => {
+  const sources = (await createAccountImportFileLoader().loadMany([file('a', official('u1')), file('b', official('u2'))])).source.sources;
+  for (const status of [undefined, 401, 403, 429, 500, 502, 503, 504]) {
+    let calls = 0;
+    await assert.rejects(runMultiAccountImport(async () => {
+      calls++;
+      throw Object.assign(new Error('global failure'), { status });
+    }, sources, { group_mode: 'source' }), /global failure/);
+    assert.equal(calls, 1);
+  }
+  let calls = 0;
+  const preview = await runMultiAccountImport(async () => {
+    calls++;
+    throw Object.assign(new Error('invalid credential'), { status: 400 });
+  }, sources, { group_mode: 'source' });
+  assert.equal(calls, 2);
+  assert.deepEqual(preview.accounts.map(row => row.issue), ['invalid credential', 'invalid credential']);
+});
+
+test('invalid nickname types do not enter failed preview rows', async () => {
+  const invalid = official('u1');
+  invalid.account.nickname = { unexpected: 'object' };
+  const sources = (await createAccountImportFileLoader().loadMany([file('a', invalid), file('b', official('u2'))])).source.sources;
+  const preview = await runMultiAccountImport(async (path, body) => {
+    const uid = JSON.parse(body.credential_json).account.uid;
+    if (uid === 'u1') throw Object.assign(new Error('invalid credential'), { status: 400 });
+    return { accounts: [{ uid, nickname: 'valid', exists: false }] };
+  }, sources, { group_mode: 'source' });
+  assert.equal(preview.accounts[0].nickname, '');
+  assert.equal(preview.accounts[0].issue, 'invalid credential');
+  assert.equal(preview.accounts[1].nickname, 'valid');
 });
 
 test('device preview shows the planned platform decision and never device identity', () => {

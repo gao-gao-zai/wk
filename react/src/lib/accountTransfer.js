@@ -77,6 +77,23 @@ export function createAccountImportFileLoader() {
   let revision = 0;
   return {
     invalidate() { revision++; },
+    async loadMany(files) {
+      const current = ++revision;
+      const list = Array.from(files);
+      if (!list.length || list.length > 1000) return { source: null, fileName: '', error: '请选择 1–1000 个账号文件' };
+      const loaded = [];
+      for (const file of list) {
+        const result = await createAccountImportFileLoader().load(file);
+        if (current !== revision) return null;
+        if (result.error) return { source: null, fileName: file.name, error: `${file.name}：${result.error}` };
+        loaded.push(result.source);
+      }
+      if (loaded.length === 1) return { source: loaded[0], fileName: list[0].name, error: '' };
+      if (loaded.some(source => source.kind !== 'credential')) return { source: null, fileName: '', error: '多文件导入仅支持官方凭据；加密迁移文件请单独选择' };
+      const uids = loaded.map(source => source.credential.account.uid.trim());
+      if (new Set(uids).size !== uids.length) return { source: null, fileName: '', error: '所选文件包含重复账号 UID，请检查后重新选择' };
+      return { source: { kind: 'credentials', sources: loaded }, fileName: `已选择 ${list.length} 个账号文件`, error: '' };
+    },
     async load(file) {
       const current = ++revision;
       let result;
@@ -98,6 +115,53 @@ export function createAccountImportFileLoader() {
       return current === revision ? result : null;
     },
   };
+}
+
+// Each official credential uses the existing single-account endpoint. Stop on
+// uncertain writes so the remaining accounts are never silently replayed.
+export async function runMultiAccountImport(post, sources, options, selected, cancelled = () => false, onProgress = () => {}) {
+  const preview = selected === undefined;
+  const wanted = new Set(selected || []);
+  const targets = preview ? sources : sources.filter(source => wanted.has(source.credential.account.uid));
+  const rows = [];
+  let stopped = false;
+  let completed = 0;
+  onProgress({ completed, total: targets.length });
+  for (const source of targets) {
+    const uid = source.credential.account.uid;
+    if (cancelled() || stopped) {
+      stopped = true;
+      if (!preview) rows.push({ uid, ok: false, cancelled: true, detail: '未提交，请重新预览' });
+      continue;
+    }
+    try {
+      const body = await post(preview ? '/admin/accounts/import/preview' : '/admin/accounts/import',
+        buildAccountImportRequest(source, '', preview ? undefined : [uid], options, false));
+      if (preview) {
+        if (!Array.isArray(body.accounts) || body.accounts.length !== 1 || body.accounts[0].uid !== uid) throw new Error('预览回执无效');
+        rows.push(body.accounts[0]);
+      } else {
+        if (!Array.isArray(body.results) || body.results.length !== 1 || body.results[0].uid !== uid) throw new Error('导入回执不完整，状态可能已变化');
+        rows.push(body.results[0]);
+        if (body.stop || body.results[0].pending) stopped = true;
+      }
+    } catch (error) {
+      if (preview) {
+        if (!error.status || error.status >= 500 || [401, 403, 429].includes(error.status)) throw error;
+        const nickname = source.credential.account.nickname;
+        rows.push({ uid, nickname: typeof nickname === 'string' ? nickname : '', issue: error.message || '预览失败' });
+      } else {
+        rows.push({ uid, ok: false, detail: `${error.message || '导入请求失败'}；请刷新账号列表核对状态` });
+        stopped = true;
+      }
+    }
+    completed++;
+    onProgress({ completed, total: targets.length });
+  }
+  if (preview) return { accounts: rows, count: rows.length, stop: stopped };
+  const success = rows.filter(row => row.ok).length;
+  const skipped = rows.filter(row => row.skipped).length;
+  return { ok: success === rows.length && !stopped, success, skipped, stop: stopped, results: rows };
 }
 
 export function accountImportResultType(result) {

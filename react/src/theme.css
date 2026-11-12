@@ -260,6 +260,14 @@ button, input, textarea, select { font: inherit; }
 .account-table-card .ant-card-head { flex-wrap: wrap; gap: 12px; }
 .account-table-card .ant-card-head-wrapper { flex-wrap: wrap; gap: 12px; padding-block: 12px; }
 .account-import-table { max-width: 100%; }
+.account-transfer-progress { padding: 18px 20px 14px; border: 1px solid #dce6f8; border-radius: 14px; background: linear-gradient(135deg, #f6f9ff, #f5f3ff); }
+.account-transfer-progress-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.account-transfer-progress-header strong { color: #263c68; font-size: 15px; }
+.account-transfer-progress-caption { margin-top: 4px; color: #687994; font-size: 12px; }
+.account-transfer-progress-count { color: #365fbc; font-size: 22px; font-weight: 650; white-space: nowrap; line-height: 1.2; }
+.account-transfer-progress-count span { color: #8190a8; font-size: 14px; font-weight: 500; }
+.account-transfer-progress .ant-progress { margin: 12px 0 4px; }
+.account-transfer-progress-footer { display: flex; justify-content: space-between; gap: 12px; color: #687994; font-size: 12px; }
 .ant-dropdown .ant-checkbox-group { max-width: 220px; display: flex; flex-direction: column; gap: 8px; }
 @media (max-width: 900px) { .account-summary { grid-template-columns: repeat(2,minmax(0,1fr)); } .account-summary-balance { grid-column: 1 / -1; } }
 @media (max-width: 640px) {
