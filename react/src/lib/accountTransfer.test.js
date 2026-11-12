@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ACCOUNT_CREDENTIAL_MAX_BYTES, ACCOUNT_IMPORT_MAX_BYTES, accountImportDeviceLabel, accountImportResultType, buildAccountImportRequest,
-  createAccountImportFileLoader, identifyAccountImport, normalizeAccountImportOptions, runMultiAccountImport, validTransferPassword,
+  ACCOUNT_CREDENTIAL_MAX_BYTES, ACCOUNT_IMPORT_MAX_BYTES, accountImportDeviceLabel, accountImportGrowthLabel, accountImportResultType, buildAccountImportRequest,
+  createAccountImportFileLoader, identifyAccountImport, importGrowthJobView, normalizeAccountImportOptions, runMultiAccountImport, validTransferPassword,
 } from './accountTransfer.js';
 
 const official = uid => ({ auth: { accessToken: 'fake-access-token', refreshToken: 'fake-refresh-token', expiresAt: 1900000000000 }, account: { uid, nickname: 'Test account' } });
@@ -99,10 +99,10 @@ test('custom options remain outside credentials/bundles and preview snapshot sur
   const before = JSON.stringify(credential);
   const options = { group_mode: 'append', groups: [' vip ', 'vip', 'default'], nickname: '  New name  ' };
   const snapshot = normalizeAccountImportOptions(options, true);
-  assert.deepEqual(snapshot, { group_mode: 'append', groups: ['vip', 'default'], nickname: 'New name' });
+  assert.deepEqual(snapshot, { group_mode: 'append', groups: ['vip', 'default'], nickname: 'New name', run_growth_tasks: false });
   options.groups.push('later'); options.nickname = 'later';
   const request = buildAccountImportRequest(identifyAccountImport(credential), '', ['u1'], snapshot);
-  assert.deepEqual(request, { credential, uids: ['u1'], group_mode: 'append', groups: ['vip', 'default'], nickname: 'New name' });
+  assert.deepEqual(request, { credential, uids: ['u1'], group_mode: 'append', groups: ['vip', 'default'], nickname: 'New name', run_growth_tasks: false });
   assert.equal(JSON.stringify(credential), before);
   assert.equal('password' in request, false);
   assert.equal('bundle' in request, false);
@@ -110,7 +110,7 @@ test('custom options remain outside credentials/bundles and preview snapshot sur
   assert.equal(encrypted.bundle, bundle);
   assert.equal('credential' in encrypted, false);
   assert.equal('nickname' in bundle, false);
-  assert.deepEqual(buildAccountImportRequest(identifyAccountImport(credential), '', undefined, { group_mode: 'source', groups: ['ignored'], nickname: '  ' }), { credential, group_mode: 'source' });
+  assert.deepEqual(buildAccountImportRequest(identifyAccountImport(credential), '', undefined, { group_mode: 'source', groups: ['ignored'], nickname: '  ' }), { credential, group_mode: 'source', run_growth_tasks: false });
 });
 
 test('custom group strategies require nonempty valid targets; source strategy keeps original mapping', () => {
@@ -118,9 +118,9 @@ test('custom group strategies require nonempty valid targets; source strategy ke
     assert.throws(() => normalizeAccountImportOptions({ group_mode, groups: [] }, true));
     assert.throws(() => normalizeAccountImportOptions({ group_mode, groups: [' '] }, true));
     assert.throws(() => normalizeAccountImportOptions({ group_mode, groups: [null] }, true));
-    assert.deepEqual(normalizeAccountImportOptions({ group_mode, groups: ['one', 'one', 'two'] }, true), { group_mode, groups: ['one', 'two'] });
+    assert.deepEqual(normalizeAccountImportOptions({ group_mode, groups: ['one', 'one', 'two'] }, true), { group_mode, groups: ['one', 'two'], run_growth_tasks: false });
   }
-  assert.deepEqual(normalizeAccountImportOptions({ group_mode: 'source' }, false), { group_mode: 'source' });
+  assert.deepEqual(normalizeAccountImportOptions({ group_mode: 'source' }, false), { group_mode: 'source', run_growth_tasks: false });
   assert.throws(() => normalizeAccountImportOptions({ group_mode: 'unknown' }, true));
 });
 
@@ -134,7 +134,7 @@ test('nickname overrides require a single-account document and validate Unicode 
   assert.throws(() => normalizeAccountImportOptions({ nickname: 'name' }, false));
   // Selecting one UID from a multi-account encrypted document does not permit a nickname override.
   assert.throws(() => buildAccountImportRequest(identifyAccountImport(bundle), password, ['u1'], { nickname: 'name' }));
-  assert.deepEqual(normalizeAccountImportOptions({ nickname: '   ' }, false), { group_mode: 'source' });
+  assert.deepEqual(normalizeAccountImportOptions({ nickname: '   ' }, false), { group_mode: 'source', run_growth_tasks: false });
 });
 
 test('multiple credential files load together and reject duplicate or mixed files', async () => {
@@ -248,4 +248,76 @@ test('official file requests retain original metadata integer precision', async 
   assert.equal(request.credential_json, text);
   assert.equal('credential' in request, false);
   assert.match(JSON.stringify(request), /9007199254740993/);
+});
+
+test('growth is opt-in and the same normalized snapshot is used for preview and apply without mutating credentials', () => {
+  assert.equal(normalizeAccountImportOptions({}, true).run_growth_tasks, false);
+  const source = identifyAccountImport(official('u1'));
+  const original = JSON.stringify(source);
+  const options = { run_growth_tasks: true };
+  const snapshot = normalizeAccountImportOptions(options, true);
+  const preview = buildAccountImportRequest(source, '', undefined, snapshot);
+  options.run_growth_tasks = false;
+  const apply = buildAccountImportRequest(source, '', ['u1'], snapshot);
+  assert.equal(preview.run_growth_tasks, true);
+  assert.equal(apply.run_growth_tasks, true);
+  assert.equal(buildAccountImportRequest(source, '', undefined, normalizeAccountImportOptions(options, true)).run_growth_tasks, false);
+  assert.equal(buildAccountImportRequest(identifyAccountImport(bundle), password, ['u1'], snapshot, true).run_growth_tasks, true);
+  assert.equal(JSON.stringify(source), original);
+  assert.throws(() => normalizeAccountImportOptions({ run_growth_tasks: 'true' }, true));
+});
+
+test('multi-file execution freezes growth and groups before the first request and keeps independent job receipts', async () => {
+  const sources = (await createAccountImportFileLoader().loadMany([file('a', official('u1')), file('b', official('u2'))])).source.sources;
+  const options = { group_mode: 'append', groups: ['team'], run_growth_tasks: true };
+  const calls = [];
+  const result = await runMultiAccountImport(async (_path, body) => {
+    calls.push(body);
+    options.groups[0] = 'changed'; options.run_growth_tasks = false;
+    return { results: [{ uid: body.uids[0], ok: true, growth_job_id: `job-${body.uids[0]}`, growth_status: 'queued' }] };
+  }, sources, options, ['u1', 'u2']);
+  assert.deepEqual(calls.map(body => [body.run_growth_tasks, body.groups]), [[true, ['team']], [true, ['team']]]);
+  assert.deepEqual(result.results.map(row => row.growth_job_id), ['job-u1', 'job-u2']);
+  assert.equal(result.success, 2);
+  assert.equal(result.ok, true);
+});
+
+test('stopping a multi-file import leaves the successful growth job and marks only unsent accounts unqueued', async () => {
+  const sources = (await createAccountImportFileLoader().loadMany([file('a', official('u1')), file('b', official('u2'))])).source.sources;
+  let stop = false;
+  const result = await runMultiAccountImport(async (_path, body) => {
+    stop = true;
+    return { results: [{ uid: body.uids[0], ok: true, growth_job_id: 'job-kept', growth_status: 'queued' }] };
+  }, sources, { run_growth_tasks: true }, ['u1', 'u2'], () => stop);
+  assert.equal(result.success, 1);
+  assert.equal(result.results[0].growth_job_id, 'job-kept');
+  assert.equal(result.results[1].cancelled, true);
+  assert.equal(result.results[1].growth_job_id, undefined);
+  assert.equal(accountImportGrowthLabel(result.results[1], true), '未提交，未排队');
+});
+
+test('growth planning distinguishes disabled option, duplicates, pending/failed imports, global and enqueue failure', () => {
+  assert.equal(accountImportGrowthLabel({ region: 'cn' }, false), '未开启');
+  assert.equal(accountImportGrowthLabel({ region: 'cn', exists: true }, true), '重复账号，未排队');
+  assert.equal(accountImportGrowthLabel({ skipped: true }, true), '重复账号，未排队');
+  assert.equal(accountImportGrowthLabel({ pending: true, ok: false }, true), '导入待核对，未排队');
+  assert.equal(accountImportGrowthLabel({ issue: 'invalid' }, true), '导入未完成，未排队');
+  assert.equal(accountImportGrowthLabel({ region: 'global' }, true), '海外版不支持，未排队');
+  assert.equal(accountImportGrowthLabel({ ok: true, growth_status: 'enqueue_failed' }, true), '排队失败（导入已成功）');
+  assert.equal(accountImportGrowthLabel({ ok: true, growth_status: 'queued' }, true), '已排队，账号保持停用');
+});
+
+test('growth progress uses a whitelist, preserves zero, clamps progress and separates job errors from import success', () => {
+  const view = importGrowthJobView({ phase: 'done', total: 2, done: 3, current: 'step', unknown: 'private', accessToken: 'private',
+    results: [{ task_code: 'chat_5', ok: false, message: 'Authorization: Bearer private-secret', accessToken: 'private' }] });
+  assert.equal(view.percent, 100);
+  assert.equal(view.active, false);
+  assert.equal(view.severity, 'warning');
+  assert.match(view.label, /部分任务失败/);
+  assert.equal(JSON.stringify(view).includes('private'), false);
+  assert.equal(importGrowthJobView({ phase: 'running', total: 0, done: 0 }).percent, 0);
+  assert.equal(importGrowthJobView({ phase: 'running' }).active, true);
+  assert.equal(importGrowthJobView({ phase: 'failed', error: 'list failed' }).error, 'list failed');
+  assert.equal(importGrowthJobView({ phase: 'unexpected' }).active, false);
+  assert.equal(accountImportResultType({ ok: true, success: 1, results: [{ ok: true, growth_status: 'enqueue_failed' }] }), 'success');
 });

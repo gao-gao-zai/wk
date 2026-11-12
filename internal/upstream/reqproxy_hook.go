@@ -81,6 +81,9 @@ func WithProxyObserver(ctx context.Context, observe func(*url.URL)) context.Cont
 }
 
 func (c *Client) proxyClientForContext(ctx context.Context, a *auth.Auth) (*http.Client, error) {
+	if route := c.growthRouteFor(a); route != nil {
+		return route.client, route.check()
+	}
 	observe, _ := ctx.Value(proxyObserverKey{}).(func(*url.URL))
 	if c.DialProxy == nil {
 		if observe != nil {

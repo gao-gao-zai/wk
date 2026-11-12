@@ -1,162 +1,473 @@
-// growthrunner.go 成长任务执行池：全局单队列 + 单 worker，所有触发源共用。
-//
-// 为什么：此前手动全池（all）、手动单账号（account）、自动加号钩子、重启恢复
-// 四条路径各自起 goroutine 直跑，靠 per-account TryLock 互斥——并发时批跑会把
-// 持锁账号记为「跳过」，既丢统计又不重试。收敛为单一执行队列后：
-//
-//   - 所有触发源 enqueue(account, job)：串行消费，天然不并发、不撞锁、不撞风控
-//   - 每个账号跑完，其归属 job 的剩余计数递减，归零自动 finish——多个 job 的
-//     账号在队列里交错也正确（每个 job 独立计数）
-//   - 标记文件 = 队列实时快照（worker 每取走一个账号重写 Pending），重启恢复
-//     语义不变：恢复 = 把残留 Pending 重新入队
-//   - 单账号 job（mode=account）total = 任务项数（runGrowthAllWithJob 语义）；
-//     all job total = 账号数（accountDone 语义）。两种粒度并存，前端按 mode 渲染。
-//
-// 代价：全池 85 号从「可并行」变严格串行——但 expert 链本就含真实对话与全局
-// 节流（6s/条），并行收益极小且放大风控风险，串行是正确取舍。
+// growthrunner.go: all growth triggers share account and remote-proxy resources.
 package server
 
 import (
+	"context"
 	"log"
 	"sync"
+	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/growthlimit"
 	"workbuddy2api/internal/lifecycle"
+	"workbuddy2api/internal/upstream"
 )
 
-// growthRunner 成长任务执行池。
 type growthRunner struct {
-	mu      sync.Mutex
-	queue   []accountJobType
-	running bool
-	// inFlight 队列内去重：同一账号已在队列/执行中时不重复入队（返回 false）。
-	inFlight map[string]bool
+	budget       *growthlimit.Budget
+	mu           sync.Mutex
+	queue        []*accountJobType
+	all          []*accountJobType // queued and active, in submission order (restart snapshot)
+	restoring    []string          // recovered UIDs retained during the startup delay
+	active       map[string]*accountJobType
+	inFlight     map[string]bool
+	running      bool
+	wake         chan struct{}
+	onChange     func([]string)  // called with mu held: snapshot and disk writes are ordered
+	gate         *lifecycle.Gate // nil uses the process gate; tests may isolate admission
+	closed       bool
+	dispatchDone chan struct{}
 }
 
-// accountJobType 队列的单账号条目：uid + auth + 执行回调。run 由触发方注入
-// ——all 模式跑完 accountDone；account 模式跑 runGrowthAllWithJob。
 type accountJobType struct {
 	uid string
 	a   *auth.Auth
+	ctx context.Context
 	run func()
+	// Only whole-account pipelines may be restored from the UID-only marker.
+	// A synchronous single action must never become an all-account pipeline.
+	recoverable bool
+	// Preparation is outside the runner mutex; a private route is held until
+	// completion. A nil resource list is globally exclusive, never a wildcard.
+	prepare    func() ([]string, func(), func())
+	resources  []string
+	prepared   bool
+	release    func()
+	stopCancel func() bool
+	done       func(bool) // true if cancelled before execution
 }
 
-// enqueue 提交一个账号到执行池。返回 false = 该账号已在队列或执行中
-// （调用方据此反馈「排队中/跳过」）。job 的 total/done 由各触发方按各自
-// 粒度设置，worker 跑完一个账号后调用 job.accountDone()（all 模式）或
-// 由 runGrowthAllWithJob 自己推进（account 模式 finishItem）。
 func (g *growthRunner) enqueue(aj accountJobType) bool {
+	return g.enqueueBatch([]accountJobType{aj}, nil) == 1
+}
+
+// Admit the whole batch and set its total before any worker can observe it.
+func (g *growthRunner) enqueueBatch(jobs []accountJobType, admitted func(int)) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.inFlight == nil {
-		g.inFlight = make(map[string]bool)
+	if g.closed {
+		if admitted != nil {
+			admitted(0)
+		}
+		return 0
 	}
-	if g.inFlight[aj.uid] {
+	if g.budget == nil {
+		g.budget = growthlimit.New(growthlimit.Default)
+	}
+	if g.inFlight == nil {
+		g.inFlight = map[string]bool{}
+	}
+	if g.active == nil {
+		g.active = map[string]*accountJobType{}
+	}
+	if g.wake == nil {
+		g.wake = make(chan struct{}, 1)
+	}
+	n := 0
+	for _, entry := range jobs {
+		if entry.uid == "" || g.inFlight[entry.uid] {
+			continue
+		}
+		aj := new(accountJobType)
+		*aj = entry
+		if aj.ctx == nil {
+			aj.ctx = context.Background()
+		}
+		aj.stopCancel = context.AfterFunc(aj.ctx, func() {
+			g.mu.Lock()
+			g.signalLocked()
+			g.mu.Unlock()
+		})
+		if aj.prepare == nil {
+			aj.prepared = true
+		}
+		g.inFlight[aj.uid] = true
+		g.queue = append(g.queue, aj)
+		g.all = append(g.all, aj)
+		n++
+	}
+	if admitted != nil {
+		admitted(n)
+	}
+	g.syncLocked()
+	if n > 0 && !g.running {
+		g.running = true
+		dispatched := make(chan struct{})
+		g.dispatchDone = dispatched
+		go func() { defer close(dispatched); g.drain() }()
+	}
+	g.signalLocked()
+	return n
+}
+
+func (g *growthRunner) signalLocked() {
+	if g.wake != nil {
+		select {
+		case g.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (g *growthRunner) lifecycleGate() *lifecycle.Gate {
+	if g.gate != nil {
+		return g.gate
+	}
+	return &lifecycle.Default
+}
+
+func (g *growthRunner) canRunLocked(aj *accountJobType) bool {
+	if len(g.active) >= g.budget.Current() {
 		return false
 	}
-	g.inFlight[aj.uid] = true
-	g.queue = append(g.queue, aj)
-	if !g.running {
-		g.running = true
-		lifecycle.Go(g.drain)
+	if len(aj.resources) == 0 {
+		return len(g.active) == 0
+	}
+	for _, active := range g.active {
+		if len(active.resources) == 0 {
+			return false
+		}
+		for _, a := range active.resources {
+			for _, b := range aj.resources {
+				if a == b {
+					return false
+				}
+			}
+		}
 	}
 	return true
 }
 
-// drain 单 worker 消费循环：逐账号执行，队列空时退出（下次 enqueue 重新拉起）。
+// The dispatcher scans beyond a blocked same-IP head. Preparation is bounded
+// to one concurrent route acquisition; task execution follows the live shared budget.
 func (g *growthRunner) drain() {
 	for {
 		g.mu.Lock()
-		if len(g.queue) == 0 {
+		if g.closed {
 			g.running = false
 			g.mu.Unlock()
 			return
 		}
-		aj := g.queue[0]
-		g.queue = g.queue[1:]
 		g.mu.Unlock()
-
-		aj.run()
-
+		if paused, _ := g.lifecycleGate().Status(); paused {
+			// Queued work is durable but is not an admitted background writer.
+			// A reversible pause resumes it; shutdown does not drain the pool.
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
 		g.mu.Lock()
-		delete(g.inFlight, aj.uid)
+		if len(g.queue) == 0 && len(g.active) == 0 {
+			g.running = false
+			g.mu.Unlock()
+			return
+		}
+		chosen, prepare := -1, -1
+		for i, aj := range g.queue {
+			if aj.ctx.Err() != nil {
+				chosen = i
+				break
+			}
+			if !aj.prepared {
+				if prepare < 0 {
+					prepare = i
+				}
+				continue
+			}
+			if g.canRunLocked(aj) {
+				chosen = i
+				break
+			}
+		}
+		if chosen >= 0 {
+			done, admitted := g.lifecycleGate().Enter()
+			if !admitted {
+				g.mu.Unlock()
+				continue
+			}
+			aj := g.queue[chosen]
+			if aj.ctx.Err() != nil {
+				// Queued cancellation performs cleanup, never account admission.
+				// It must complete even while every execution permit is occupied.
+				g.queue = append(g.queue[:chosen], g.queue[chosen+1:]...)
+				delete(g.inFlight, aj.uid)
+				for i, entry := range g.all {
+					if entry == aj {
+						g.all = append(g.all[:i], g.all[i+1:]...)
+						break
+					}
+				}
+				if aj.stopCancel != nil {
+					aj.stopCancel()
+				}
+				g.mu.Unlock()
+				if aj.release != nil {
+					aj.release()
+				}
+				g.mu.Lock()
+				g.syncLocked()
+				if aj.done != nil {
+					aj.done(true)
+				}
+				g.mu.Unlock()
+				done()
+				continue
+			}
+			if !g.budget.Enter() {
+				done()
+				g.mu.Unlock()
+				continue
+			}
+			g.queue = append(g.queue[:chosen], g.queue[chosen+1:]...)
+			g.active[aj.uid] = aj
+			g.mu.Unlock()
+			go func() { defer done(); g.execute(aj) }()
+			continue
+		}
+		if prepare >= 0 && len(g.active) < g.budget.Current() {
+			aj := g.queue[prepare]
+			g.mu.Unlock()
+			resources, run, release := aj.prepare()
+			g.mu.Lock()
+			aj.resources, aj.run, aj.release, aj.prepared = resources, run, release, true
+			g.mu.Unlock()
+			continue
+		}
+		wake := g.wake
 		g.mu.Unlock()
+		<-wake
 	}
 }
 
-// pending 队列实时快照（标记文件用，顺序保留）。
+// Stop the unadmitted dispatcher without canceling already admitted actions.
+// Their existing lifecycle reservations cover final writes and lease release.
+// Queue markers are retained for restart; a reversible pause uses Gate.Resume.
+func (h *Handler) StopGrowthRunner() { h.growthRunner.stop() }
+
+func (h *Handler) setGrowthConcurrency(n int) {
+	h.initGrowthRunner()
+	g := &h.growthRunner
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_ = g.budget.Set(n) // Validated and durably persisted before this call.
+	g.signalLocked()
+}
+func (g *growthRunner) stop() {
+	g.mu.Lock()
+	g.closed = true
+	for _, aj := range g.queue {
+		if aj.stopCancel != nil {
+			aj.stopCancel()
+		}
+	}
+	g.signalLocked()
+	done := g.dispatchDone
+	g.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+func (g *growthRunner) execute(aj *accountJobType) {
+	cancelled := aj.ctx.Err() != nil
+	handled := cancelled
+	defer func() {
+		if aj.stopCancel != nil {
+			aj.stopCancel()
+		}
+		if aj.release != nil {
+			aj.release()
+		}
+		g.mu.Lock()
+		g.budget.Leave()
+		delete(g.active, aj.uid)
+		delete(g.inFlight, aj.uid)
+		// A panic must leave this account in the restart marker. The process
+		// may exit immediately after unwinding this worker.
+		if handled {
+			for i, entry := range g.all {
+				if entry == aj {
+					g.all = append(g.all[:i], g.all[i+1:]...)
+					break
+				}
+			}
+		}
+		g.syncLocked()
+		if handled && aj.done != nil {
+			aj.done(cancelled || aj.ctx.Err() != nil)
+		}
+		g.signalLocked()
+		g.mu.Unlock()
+	}()
+	if !cancelled && aj.run != nil {
+		aj.run()
+	}
+	handled = true
+}
+
+func (g *growthRunner) pendingLocked() []string {
+	pending := make([]string, 0, len(g.all))
+	for _, aj := range g.all {
+		pending = append(pending, aj.uid)
+	}
+	return pending
+}
 func (g *growthRunner) pending() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	out := make([]string, 0, len(g.queue))
-	for _, aj := range g.queue {
-		out = append(out, aj.uid)
+	return g.pendingLocked()
+}
+func (g *growthRunner) syncLocked() {
+	if g.onChange != nil {
+		pending := make([]string, 0, len(g.all))
+		seen := map[string]bool{}
+		for _, uid := range g.restoring {
+			if !seen[uid] {
+				seen[uid] = true
+				pending = append(pending, uid)
+			}
+		}
+		for _, aj := range g.all {
+			if aj.recoverable && !seen[aj.uid] {
+				seen[aj.uid] = true
+				pending = append(pending, aj.uid)
+			}
+		}
+		g.onChange(pending)
 	}
-	return out
 }
 
-// ---------------------------------------------------------------------------
-// Handler 侧封装
-// ---------------------------------------------------------------------------
+func (h *Handler) initGrowthRunner() {
+	g := &h.growthRunner
+	g.mu.Lock()
+	if g.budget == nil {
+		g.budget = h.cfg.GrowthBudget
+		if g.budget == nil {
+			g.budget = growthlimit.New(growthlimit.Default)
+		}
+	}
+	g.onChange = func(pending []string) {
+		if len(pending) == 0 {
+			h.clearGrowthJobMark()
+		} else {
+			h.writeGrowthJobMark(pending)
+		}
+	}
+	g.mu.Unlock()
+}
 
-// growthSubmitAll all 模式（手动全池/重启恢复）：全部账号入池，跑完 accountDone。
-// job 完成收尾（finish）在最后一个账号跑完时自动执行（remaining 归零）。
-func (h *Handler) growthSubmitAll(job *growthJob, accounts []*auth.Auth) int {
-	enqueued := 0
-	for _, a := range accounts {
-		uid := a.Snapshot().UID
-		aj := accountJobType{uid: uid, a: a}
-		aj.run = func() {
-			job.noteCurrent("账号 " + uid)
-			// 账号级预跳过：对账缓存（TTL 内）显示该号全部可自动任务已领
-			// → 不打上游 ListTasks，直接出结果（批跑重跑已完成号零成本）。
-			if h.growthAccountAllClaimed(uid) {
-				job.appendResult(growthJobItem{UID: uid, OK: true, Skipped: true, Message: "全部任务已领取（缓存快照），跳过"})
-				job.accountDone()
-				h.syncGrowthMark()
-				if job.accountFinished() {
-					job.finish("done", "")
-					log.Printf("growth: 全部账号一键完成 job=%s", job.ID)
-				}
+// Shared by full-pool, account, automatic enrollment, restored jobs and a
+// synchronous single task. Callbacks receive a frozen auth with a private route.
+func (h *Handler) growthAuthGuard(a *auth.Auth) func() error {
+	expected := a.Snapshot()
+	return func() error {
+		if h.cfg.Pool == nil || h.cfg.Pool.AuthByUID(expected.UID) != a || a.Snapshot() != expected {
+			return upstream.ErrGrowthAuthStale
+		}
+		return nil
+	}
+}
+
+func (h *Handler) growthAccountJob(ctx context.Context, job *growthJob, a *auth.Auth, run func(*auth.Auth), done func(bool)) accountJobType {
+	uid := a.Snapshot().UID
+	guard := h.growthAuthGuard(a)
+	fail := func(err error) {
+		job.appendResult(growthJobItem{UID: uid, OK: false, Message: err.Error()})
+		if job.Mode != "all" {
+			job.finish("failed", err.Error())
+		}
+	}
+	aj := accountJobType{uid: uid, a: a, ctx: ctx, done: done, recoverable: job.Mode != "task"}
+	aj.prepare = func() ([]string, func(), func()) {
+		plan := h.cfg.Upstream.PlanGrowthRoute(ctx, a, guard)
+		return plan.Resources, func() {
+			// Every task action observes the same legacy per-account lock.
+			// Acquire only for this account; the queue has already deduplicated.
+			if ctx.Err() != nil {
 				return
 			}
-			items, ok := h.runGrowthAllCollect(a, func(code, desc string) {
-				job.noteCurrent(uid + "｜" + code)
-			})
+			if err := guard(); err != nil {
+				fail(err)
+				return
+			}
+			route := plan.Acquire()
+			defer route.Release()
+			if route.Err != nil {
+				fail(route.Err)
+				return
+			}
+			h.growthLocks.mu.Lock()
+			if h.growthLocks.locks == nil {
+				h.growthLocks.locks = map[string]*sync.Mutex{}
+			}
+			lock := h.growthLocks.locks[uid]
+			if lock == nil {
+				lock = &sync.Mutex{}
+				h.growthLocks.locks[uid] = lock
+			}
+			h.growthLocks.mu.Unlock()
+			lock.Lock()
+			defer lock.Unlock()
+			if err := guard(); err != nil {
+				fail(err)
+				return
+			}
+			if ctx.Err() == nil {
+				run(route.Auth)
+			}
+		}, nil
+	}
+	return aj
+}
+
+func (h *Handler) growthSubmitAll(job *growthJob, accounts []*auth.Auth) int {
+	h.initGrowthRunner()
+	jobs := make([]accountJobType, 0, len(accounts))
+	for _, a := range accounts {
+		if a == nil {
+			continue
+		}
+		uid := a.Snapshot().UID
+		aj := h.growthAccountJob(context.Background(), job, a, func(frozen *auth.Auth) {
+			job.noteCurrent("账号 " + uid)
+			if h.growthAccountAllClaimed(uid) {
+				job.appendResult(growthJobItem{UID: uid, OK: true, Skipped: true, Message: "全部任务已领取（缓存快照），跳过"})
+				return
+			}
+			items, ok := h.runGrowthAllCollect(frozen, func(code, desc string) { job.noteCurrent(uid + "｜" + code) })
 			if !ok {
-				job.finishItem(growthJobItem{UID: uid, OK: false, Message: "任务列表拉取失败"})
+				job.appendResult(growthJobItem{UID: uid, OK: false, Message: "任务列表拉取失败"})
 			} else {
 				for _, item := range items {
 					item.UID = uid
 					job.appendResult(item)
 				}
 			}
+		}, func(cancelled bool) {
 			job.accountDone()
-			h.syncGrowthMark()
-			// 本 job 全部账号跑完 → 收尾（多个 job 交错时各收各的）。
 			if job.accountFinished() {
 				job.finish("done", "")
 				log.Printf("growth: 全部账号一键完成 job=%s", job.ID)
 			}
-		}
-		if h.growthRunner.enqueue(aj) {
-			enqueued++
-		}
+		})
+		jobs = append(jobs, aj)
 	}
-	job.setTotal(enqueued)
-	if enqueued == 0 {
-		// 全部账号被去重拒绝（已在其它 job 的队列里）：本 job 直接收尾，
-		// 不留 running 空壳（TTL 前一直显示"执行中"误导前端）。
+	n := h.growthRunner.enqueueBatch(jobs, job.setTotal)
+	if n == 0 {
 		job.finish("done", "全部账号已在执行队列中（与进行中的批跑重复）")
-		log.Printf("growth: 批跑 job=%s 无新账号（均已入队），直接完成", job.ID)
 	}
-	return enqueued
+	return n
 }
 
-// growthAccountAllClaimed 对账缓存快照显示该账号全部可自动任务已领奖。
-// 未命中缓存 / 有未领任务 → false（走正常流水线，内含任务级跳过）。
-// 快照只用于「跳过」决策：全已领才跳——部分完成、任何一项未领都不跳，
-// 宁可多打一次 ListTasks 也不漏跑（跳过条件从严）。
 func (h *Handler) growthAccountAllClaimed(uid string) bool {
 	ts, ok := h.ledgerReconCache.tasksForUID(uid)
 	if !ok || len(ts) == 0 {
@@ -166,36 +477,45 @@ func (h *Handler) growthAccountAllClaimed(uid string) bool {
 	for i := range growthActions {
 		auto[growthActions[i].TaskCode] = true
 	}
+	found := false
 	for _, t := range ts {
-		if auto[t.TaskCode] && !t.Claimed {
-			return false // 有可自动任务未领
+		if auto[t.TaskCode] {
+			found = true
+			if !t.Claimed {
+				return false
+			}
 		}
 	}
-	return true
+	return found
 }
 
-// growthSubmitAccount account 模式（手动单账号/自动加号）：入池跑全量流水线。
 func (h *Handler) growthSubmitAccount(job *growthJob, a *auth.Auth) bool {
-	uid := a.Snapshot().UID
-	aj := accountJobType{uid: uid, a: a}
-	aj.run = func() {
-		h.runGrowthAllWithJob(a, job)
-	}
-	return h.growthRunner.enqueue(aj)
+	h.initGrowthRunner()
+	return h.growthRunner.enqueue(h.growthAccountJob(context.Background(), job, a, func(frozen *auth.Auth) {
+		h.runGrowthAllWithJob(frozen, job)
+	}, nil))
 }
 
-// syncGrowthMark 队列快照落盘（all 模式 worker 每账号跑完调用）。
-// 队列空（全部跑完）→ 清标记；非空 → 写剩余（重启只恢复没跑的）。
-//
-// 注意：入队方（growthSubmitAll 调用侧）不做入队后补写——drain 的本调用
-// 是标记文件的唯一同步点。若入队方也写，会与 drain 的 clear/write 竞争
-// （实测：u2 瞬间跑完 clear 后，入队方的滞后 write 会复活已删的标记）。
-// 入队前的初始快照由调用方在 SubmitAll 之前写入（此时 drain 必然没跑）。
+func (h *Handler) growthSubmitTask(ctx context.Context, job *growthJob, a *auth.Auth, run func(*auth.Auth)) bool {
+	h.initGrowthRunner()
+	return h.growthRunner.enqueue(h.growthAccountJob(ctx, job, a, run, func(cancelled bool) {
+		if cancelled {
+			job.finish("cancelled", ctx.Err().Error())
+		} else {
+			job.mu.Lock()
+			running := job.phase == "running"
+			job.mu.Unlock()
+			if running {
+				job.finish("done", "")
+			}
+		}
+	}))
+}
+
+// Snapshot and disk write share the runner mutex; a late writer cannot revive
+// a completed marker or omit another worker that is still active.
 func (h *Handler) syncGrowthMark() {
-	pending := h.growthRunner.pending()
-	if len(pending) == 0 {
-		h.clearGrowthJobMark()
-		return
-	}
-	h.writeGrowthJobMark(pending)
+	h.growthRunner.mu.Lock()
+	defer h.growthRunner.mu.Unlock()
+	h.growthRunner.syncLocked()
 }

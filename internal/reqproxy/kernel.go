@@ -344,7 +344,7 @@ func outboundParts(n NodeSpec) (settings, stream map[string]any, err error) {
 		// 简化：xray wireguard outbound JSON
 		peers := []map[string]any{{
 			"publicKey": orDefault(spec["peerPublicKey"], ""),
-			"endpoint":  fmt.Sprintf("%v:%v", spec["host"], spec["port"]),
+			"endpoint":  net.JoinHostPort(fmt.Sprint(spec["host"]), fmt.Sprint(spec["port"])),
 		}}
 		settings = map[string]any{
 			"secretKey": orDefault(spec["privateKey"], ""),

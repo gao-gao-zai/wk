@@ -888,6 +888,30 @@ func (p *Pool) allocProbePort() (int, error) {
 	return port, nil
 }
 
+// Leave ordinary binding/probe capacity when growth uses shared private ports.
+func (p *Pool) allocGrowthPort() (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	used := map[int]bool{}
+	for _, slot := range p.slots {
+		used[slot.Port] = true
+	}
+	for port := range p.probePorts {
+		used[port] = true
+	}
+	capacity := p.portMax - p.portMin + 1
+	reserve := max(1, min(16, capacity/4))
+	if capacity-len(used) <= reserve {
+		return 0, fmt.Errorf("growth ports exhausted; %d ports reserved for bindings/probes", reserve)
+	}
+	port, err := p.allocPortLocked()
+	if err != nil {
+		return 0, err
+	}
+	p.probePorts[port] = true
+	return port, nil
+}
+
 // releaseProbePort 归还测速临时端口。
 func (p *Pool) releaseProbePort(port int) {
 	p.mu.Lock()

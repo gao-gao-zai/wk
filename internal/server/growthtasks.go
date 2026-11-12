@@ -21,6 +21,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,7 +44,8 @@ import (
 // taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 // （单任务 / 全量 / 全部账号批跑）同时只允许一条在跑。重复点击直接返回 409
 // "仍在执行"，而不是并发跑两遍浪费上游请求（动作虽幂等，expert 系每遍含
-// 多次真实对话）。不同账号之间不互斥。TryLock 语义，锁条目常驻（账号数有界）。
+// 多次真实对话）。不同账号的此锁独立；连接 IP 的互斥由统一执行池负责。
+// TryLock 语义，锁条目常驻（账号数有界）。
 type growthTaskLocks struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -542,10 +544,66 @@ func (h *Handler) accountTasks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": tasks, "auto_actions": autoable, "snapshot": snapshot})
 }
 
+// growthTaskHTTP preserves synchronous management responses while all mutations
+// share the runner's UID/connection-IP reservations. Callbacks never retain w.
+func (h *Handler) growthTaskHTTP(w http.ResponseWriter, r *http.Request, a *auth.Auth, desc string, run func(*auth.Auth) (int, map[string]any)) {
+	uid := a.Snapshot().UID
+	guard := h.growthAuthGuard(a)
+	// This is only a compatibility probe; the runner owns the actual lock.
+	if !h.growthLocks.tryLock(uid) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号有任务动作正在执行中，请等本轮结束后再试"})
+		return
+	}
+	h.growthLocks.unlock(uid)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	job := h.growthJobs.newJob(uid, "task")
+	type response struct {
+		status int
+		body   map[string]any
+	}
+	result := make(chan response, 1)
+	if !h.growthSubmitTask(ctx, job, a, func(scoped *auth.Auth) {
+		status, body := run(scoped)
+		if ctx.Err() == nil && guard() == nil {
+			h.collectAfterAction(uid)
+		}
+		job.setTotal(1)
+		job.finishItem(growthJobItem{UID: uid, Desc: desc, OK: status < 400 && body["ok"] != false, Skipped: body["skipped"] == true})
+		result <- response{status: status, body: body}
+	}) {
+		job.finish("failed", "该账号已在执行队列中")
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号有任务动作正在排队或执行中"})
+		return
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case resp := <-result:
+			writeJSON(w, resp.status, resp.body)
+			return
+		case <-ctx.Done():
+			writeJSON(w, http.StatusRequestTimeout, map[string]string{"error": "请求已取消，尚未开始的任务不会执行"})
+			return
+		case <-ticker.C:
+			phase, _ := job.snapshot()["phase"].(string)
+			if phase == "failed" || phase == "cancelled" || phase == "done" {
+				select {
+				case resp := <-result:
+					writeJSON(w, resp.status, resp.body)
+				default:
+					writeJSON(w, http.StatusBadGateway, map[string]string{"error": "任务未执行，请查看任务详情", "job_id": job.ID})
+				}
+				return
+			}
+		}
+	}
+}
+
 // accountTaskAccept 接受任务（报名；幂等）。
 func (h *Handler) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	defer h.collectAfterAction(uid)
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
@@ -557,67 +615,66 @@ func (h *Handler) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "task_codes required"})
 		return
 	}
-	if err := h.cfg.Upstream.AcceptTasks(a, body.TaskCodes); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "accept: " + err.Error()})
-		return
-	}
-	log.Printf("growth: 接受任务 uid=%s codes=%v", uid, body.TaskCodes)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	h.growthTaskHTTP(w, r, a, "接受任务", func(scoped *auth.Auth) (int, map[string]any) {
+		if err := h.cfg.Upstream.AcceptTasks(scoped, body.TaskCodes); err != nil {
+			return http.StatusBadGateway, map[string]any{"error": "accept: " + err.Error()}
+		}
+		log.Printf("growth: 接受任务 uid=%s codes=%v", uid, body.TaskCodes)
+		return http.StatusOK, map[string]any{"ok": true}
+	})
 }
 
 // accountTaskAcceptAll 接受该账号全部尚未接受的任务（跳过已 accepted/claimed/locked）。
 // 批量提交分片（保守每批 20 个），批间节流防风控。
 func (h *Handler) accountTaskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	defer h.collectAfterAction(uid)
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
 	}
-	tasks, err := h.cfg.Upstream.ListTasks(a)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "list tasks: " + err.Error()})
-		return
-	}
-	var codes []string
-	for _, t := range tasks {
-		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
-			continue
+	h.growthTaskHTTP(w, r, a, "接受全部可用任务", func(scoped *auth.Auth) (int, map[string]any) {
+		tasks, err := h.cfg.Upstream.ListTasks(scoped)
+		if err != nil {
+			return http.StatusBadGateway, map[string]any{"error": "list tasks: " + err.Error()}
 		}
-		codes = append(codes, t.TaskCode)
-	}
-	if len(codes) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accepted": 0, "message": "所有任务均已接受"})
-		return
-	}
-	const batch = 20
-	accepted := 0
-	var failed []string
-	for i := 0; i < len(codes); i += batch {
-		end := i + batch
-		if end > len(codes) {
-			end = len(codes)
+		var codes []string
+		for _, t := range tasks {
+			if h.growthTaskSkipReason(uid, &t) != "" || t.Claimable || t.AcceptStatus == "accepted" {
+				continue
+			}
+			codes = append(codes, t.TaskCode)
 		}
-		if err := h.cfg.Upstream.AcceptTasks(a, codes[i:end]); err != nil {
-			log.Printf("growth: 批量接受失败 uid=%s codes=%v err=%v", uid, codes[i:end], err)
-			failed = append(failed, codes[i:end]...)
-			continue
+		if len(codes) == 0 {
+			return http.StatusOK, map[string]any{"ok": true, "accepted": 0, "message": "所有可用任务均已接受或完成"}
 		}
-		accepted += end - i
-		time.Sleep(actionStepGap)
-	}
-	log.Printf("growth: 全部接受 uid=%s 接受=%d 失败=%d", uid, accepted, len(failed))
-	resp := map[string]any{"ok": true, "accepted": accepted, "failed": failed}
-	if len(failed) > 0 {
-		resp["message"] = "部分任务接受失败（上游拒绝），可重试"
-	}
-	writeJSON(w, http.StatusOK, resp)
+		const batch = 20
+		accepted := 0
+		var failed []string
+		for i := 0; i < len(codes); i += batch {
+			end := i + batch
+			if end > len(codes) {
+				end = len(codes)
+			}
+			if err := h.cfg.Upstream.AcceptTasks(scoped, codes[i:end]); err != nil {
+				log.Printf("growth: 批量接受失败 uid=%s codes=%v err=%v", uid, codes[i:end], err)
+				failed = append(failed, codes[i:end]...)
+				continue
+			}
+			accepted += end - i
+			time.Sleep(actionStepGap)
+		}
+		log.Printf("growth: 全部接受 uid=%s 接受=%d 失败=%d", uid, accepted, len(failed))
+		resp := map[string]any{"ok": true, "accepted": accepted, "failed": failed}
+		if len(failed) > 0 {
+			resp["message"] = "部分任务接受失败（上游拒绝），可重试"
+		}
+		return http.StatusOK, resp
+	})
 }
 
 // accountTaskClaim 领取任务奖励（未达标时上游返回业务错误，原样透出给前端提示）。
 func (h *Handler) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	defer h.collectAfterAction(uid)
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
@@ -629,28 +686,34 @@ func (h *Handler) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "task_code required"})
 		return
 	}
-	credit, energy, err := h.cfg.Upstream.ClaimReward(a, body.TaskCode)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "claim: " + err.Error()})
-		return
-	}
-	if credit == 0 && energy == 0 {
-		log.Printf("growth: 领取任务奖励 uid=%s code=%s（已领取过，无新增）", uid, body.TaskCode)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "already_claimed": true, "message": "该奖励此前已领取"})
-		return
-	}
-	log.Printf("growth: 领取任务奖励 uid=%s code=%s +%d分 +%d能", uid, body.TaskCode, credit, energy)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credit": credit, "energy": energy})
+	h.growthTaskHTTP(w, r, a, "领取任务奖励", func(scoped *auth.Auth) (int, map[string]any) {
+		credit, energy, err := h.cfg.Upstream.ClaimReward(scoped, body.TaskCode)
+		if err != nil {
+			return http.StatusBadGateway, map[string]any{"error": "claim: " + err.Error()}
+		}
+		if !h.cfg.Upstream.GrowthRouteValid(scoped) {
+			return http.StatusConflict, map[string]any{"error": "账号或凭据已变化，领奖结果需重新核对"}
+		}
+		creds := scoped.Snapshot()
+		h.growthLedger.record(creds.UID, creds.Nickname, body.TaskCode, credit, energy)
+		h.ledgerReconCache.markClaimed(creds.UID, body.TaskCode)
+		if credit == 0 && energy == 0 {
+			log.Printf("growth: 领取任务奖励 uid=%s code=%s（已领取过，无新增）", uid, body.TaskCode)
+			return http.StatusOK, map[string]any{"ok": true, "already_claimed": true, "message": "该奖励此前已领取"}
+		}
+		log.Printf("growth: 领取任务奖励 uid=%s code=%s +%d分 +%d能", uid, body.TaskCode, credit, energy)
+		return http.StatusOK, map[string]any{"ok": true, "credit": credit, "energy": energy}
+	})
 }
 
 // accountTaskAuto 一键完成单个任务：执行对应动作 → 回读进度 → 达标自动领奖。
 func (h *Handler) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	defer h.collectAfterAction(uid)
 	a := h.growthAccount(w, uid)
 	if a == nil {
 		return
 	}
+	guard := h.growthAuthGuard(a)
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
@@ -669,38 +732,94 @@ func (h *Handler) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号有任务动作正在执行中，请等本轮结束后再试"})
 		return
 	}
-	defer h.growthLocks.unlock(uid)
-	resp := h.runGrowthAction(a, act)
-	writeJSON(w, http.StatusOK, resp)
+	h.growthLocks.unlock(uid)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	job := h.growthJobs.newJob(uid, "task")
+	result := make(chan map[string]any, 1)
+	if !h.growthSubmitTask(ctx, job, a, func(scoped *auth.Auth) {
+		resp := h.runGrowthAction(scoped, act)
+		if ctx.Err() == nil && guard() == nil {
+			h.collectAfterAction(uid)
+		}
+		job.setTotal(1)
+		ok, _ := resp["ok"].(bool)
+		skipped, _ := resp["skipped"].(bool)
+		job.finishItem(growthJobItem{TaskCode: act.TaskCode, UID: uid, OK: ok, Skipped: skipped})
+		job.finish("done", "")
+		result <- resp
+	}) {
+		job.finish("failed", "该账号已在执行队列中")
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号有任务动作正在排队或执行中"})
+		return
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case resp := <-result:
+			writeJSON(w, http.StatusOK, resp)
+			return
+		case <-ctx.Done():
+			writeJSON(w, http.StatusRequestTimeout, map[string]string{"error": "请求已取消，尚未开始的任务不会执行"})
+			return
+		case <-ticker.C:
+			// Preparation can fail before the callback runs (for example a
+			// deleted account or an unavailable route). Do not wait forever.
+			if phase, _ := job.snapshot()["phase"].(string); phase == "failed" || phase == "cancelled" {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "任务未执行，请查看任务详情", "job_id": job.ID})
+				return
+			}
+		}
+	}
 }
 
 // runGrowthAction 执行单个动作并组装响应（回读 + 自动领奖）。
 // 调用方必须已持有该账号的 growth 锁。
 func (h *Handler) runGrowthAction(a *auth.Auth, act *growthAction) map[string]any {
-	uid := a.Snapshot().UID
-	// 前置读取：已完成的任务直接跳过（幂等，不浪费上游调用）。
 	before, err := h.taskByCode(a, act.TaskCode)
 	if err != nil {
 		return map[string]any{"ok": false, "error": "list tasks: " + err.Error()}
 	}
+	return h.runGrowthActionFromTask(a, act, before)
+}
+
+// The supplied preflight state decides whether an action is still needed.
+func (h *Handler) runGrowthActionFromTask(a *auth.Auth, act *growthAction, before *upstream.Task) map[string]any {
+	uid := a.Snapshot().UID
+	if !h.cfg.Upstream.GrowthRouteValid(a) {
+		return map[string]any{"ok": false, "error": "账号或凭据已变化，成长任务已停止"}
+	}
 	if before == nil {
-		return map[string]any{"ok": false, "error": "该账号没有此任务"}
+		return map[string]any{"ok": true, "skipped": true, "message": "该账号没有此任务"}
 	}
-	if before.Claimed {
-		return map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"}
+	if reason := h.growthTaskSkipReason(uid, before); reason != "" {
+		return map[string]any{"ok": true, "skipped": true, "message": reason}
 	}
-	msg, err := act.run(h, a)
-	if err != nil {
-		return map[string]any{"ok": false, "error": "执行失败: " + err.Error()}
+	if act.TaskCode == "black_cat" && !before.Claimable && !upstream.InNightWindow(time.Now()) {
+		return map[string]any{"ok": true, "skipped": true, "message": "当前不在夜猫子任务窗口，留待有效时段执行"}
 	}
-	// 回读验证：上报 200 ≠ 计分（上游可能静默丢弃 + 计分异步），
-	// 用有界轮询等异步计分落定，再决定是否自动领奖。
-	after, aerr := h.taskByCodeWaiting(a, act.TaskCode)
+	msg := "任务已达标，无需重复执行"
+	after := before
+	var aerr error
+	if !before.Claimable {
+		var err error
+		msg, err = act.run(h, a)
+		if err != nil {
+			return map[string]any{"ok": false, "error": "执行失败: " + err.Error()}
+		}
+		// A successful event is not proof of progress. Read back with a bounded
+		// polling budget before attempting a reward claim.
+		after, aerr = h.taskByCodeWaiting(a, act.TaskCode)
+	}
 	progressBefore, progressAfter := taskProgressText(before), ""
 	claimable := false
 	if aerr == nil && after != nil {
 		progressAfter = taskProgressText(after)
 		claimable = after.Claimable
+	}
+	if aerr != nil {
+		return map[string]any{"ok": false, "error": "任务执行后状态查询失败，结果未确认"}
 	}
 	resp := map[string]any{
 		"ok":              true,
@@ -713,6 +832,9 @@ func (h *Handler) runGrowthAction(a *auth.Auth, act *growthAction) map[string]an
 	// 达标即自动领奖（Web 端 claim）：把"完成→领奖"收敛成一步。
 	if claimable {
 		if credit, energy, cerr := h.cfg.Upstream.ClaimReward(a, act.TaskCode); cerr == nil {
+			if !h.cfg.Upstream.GrowthRouteValid(a) {
+				return map[string]any{"ok": false, "error": "账号或凭据已变化，领奖结果需重新核对"}
+			}
 			resp["claimed"] = true
 			resp["credit"] = credit
 			resp["energy"] = energy
@@ -729,6 +851,7 @@ func (h *Handler) runGrowthAction(a *auth.Auth, act *growthAction) map[string]an
 				resp["message"] = msg + "；奖励此前已领取"
 			}
 		} else {
+			resp["ok"] = false
 			resp["claim_error"] = cerr.Error()
 			resp["message"] = msg + "；达标但领奖失败，可在任务列表手动点「领取」重试"
 		}
@@ -738,10 +861,60 @@ func (h *Handler) runGrowthAction(a *auth.Auth, act *growthAction) map[string]an
 	return resp
 }
 
+func growthTaskUnavailable(t *upstream.Task) bool {
+	for _, state := range []string{t.Status, t.AcceptStatus} {
+		switch strings.ToLower(strings.TrimSpace(state)) {
+		case "expired", "disabled", "unavailable", "closed", "ended", "not_eligible", "invalid":
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) growthTaskSkipReason(uid string, t *upstream.Task) string {
+	return h.growthTaskSkipReasonAt(uid, t, time.Now())
+}
+
+func (h *Handler) growthTaskSkipReasonAt(uid string, t *upstream.Task, now time.Time) string {
+	if t.Claimed {
+		return "该任务已领取过奖励"
+	}
+	// The durable ledger is only authoritative for explicitly one-off tasks.
+	// A recurring task must always use its current upstream state.
+	if strings.EqualFold(strings.TrimSpace(t.TaskType), "single") && h.growthLedger != nil {
+		h.growthLedger.mu.Lock()
+		account := h.growthLedger.byUID[uid]
+		claimed := false
+		if account != nil {
+			for _, c := range account.Claims {
+				claimed = claimed || c.TaskCode == t.TaskCode
+			}
+		}
+		h.growthLedger.mu.Unlock()
+		if claimed {
+			return "一次性任务已在持久台账中完成，跳过"
+		}
+	}
+	if growthTaskUnavailable(t) {
+		return "任务已结束或当前账号不具备完成条件，跳过"
+	}
+	if t.Locked {
+		return "任务尚未解锁，跳过"
+	}
+	status, acceptStatus := strings.ToLower(strings.TrimSpace(t.Status)), strings.ToLower(strings.TrimSpace(t.AcceptStatus))
+	if !t.Claimable && (status == "complete" || status == "completed" || acceptStatus == "completed") {
+		return "任务已完成，无需重复执行"
+	}
+	if t.TaskCode == "black_cat" && !t.Claimable && !upstream.InNightWindow(now) {
+		return "当前不在夜猫子任务窗口，留待有效时段执行"
+	}
+	return ""
+}
+
 // accountTaskAutoAll 一键完成该账号全部可自动任务（17 项，依赖序 + 逐项自动领奖）。
 // 异步 job 化 + 入执行池：立即返回 202 + job_id，进度走 GET /admin/growth/jobs/{id} 轮询。
-// 与全池批跑共用同一队列（growthRunner）：排队串行执行，不会与其它触发源并发
-// 跑同一账号；已在队列/执行中返回 409（前端提示等待）。
+// 与全池批跑共用同一队列（growthRunner）：同账号/连接IP互斥，按实时并发设置不同资源并发；
+// 已在队列/执行中返回409（前端提示等待）。
 func (h *Handler) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := h.growthAccount(w, uid)
@@ -750,6 +923,7 @@ func (h *Handler) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	}
 	job := h.growthJobs.newJob(uid, "account")
 	if !h.growthSubmitAccount(job, a) {
+		job.finish("failed", "该账号已在执行队列中，请等本轮结束后再试")
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "该账号已在执行队列中，请等本轮结束后再试"})
 		return
 	}
@@ -802,7 +976,7 @@ func (h *Handler) runGrowthAllWithJob(a *auth.Auth, job *growthJob) {
 
 // allAccountsTaskAutoAll 对全部非禁用 CN 账号执行一键完成（批跑）。
 // 入执行池（growthRunner）：所有触发源（手动全池/手动单账号/自动加号/重启恢复）
-// 共用同一队列串行消费——不撞锁、不丢统计。job 化立即返回 202 + job_id；
+// 共用账号/连接IP互斥的有界执行池。job化立即返回202 + job_id；
 // 进度 = 账号粒度（当前跑到哪个账号）。
 func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	var accounts []*auth.Auth
@@ -824,13 +998,6 @@ func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	job := h.growthJobs.newJob("", "all")
-	// 先写初始快照再入队：入队后 drain 立即起跑，run 尾部的 syncGrowthMark
-	// 是标记文件唯一同步点（入队方滞后写会与 drain 的 clear 竞争复活标记）。
-	pendingUIDs := make([]string, 0, len(accounts))
-	for _, a := range accounts {
-		pendingUIDs = append(pendingUIDs, a.Snapshot().UID)
-	}
-	h.writeGrowthJobMark(pendingUIDs)
 	enqueued := h.growthSubmitAll(job, accounts)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok": true, "job_id": job.ID, "total_accounts": enqueued,
@@ -842,7 +1009,11 @@ func (h *Handler) allAccountsTaskAutoAll(w http.ResponseWriter, r *http.Request)
 // 动作开始前调用一次）。返回 (明细, 列表拉取是否成功)。
 func (h *Handler) runGrowthAllCollect(a *auth.Auth, onStart func(code, desc string)) ([]growthJobItem, bool) {
 	uid := a.Snapshot().UID
-	defer h.collectAfterAction(uid)
+	defer func() {
+		if h.cfg.Upstream.GrowthRouteValid(a) {
+			h.collectAfterAction(uid)
+		}
+	}()
 	tasks, err := h.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		return nil, false
@@ -853,7 +1024,7 @@ func (h *Handler) runGrowthAllCollect(a *auth.Auth, onStart func(code, desc stri
 	}
 	var codes []string
 	for _, t := range tasks {
-		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
+		if growthActionFor(t.TaskCode) == nil || h.growthTaskSkipReason(uid, &t) != "" || t.Claimable || t.AcceptStatus == "accepted" {
 			continue
 		}
 		codes = append(codes, t.TaskCode)
@@ -880,6 +1051,8 @@ func (h *Handler) runGrowthAllCollect(a *auth.Auth, onStart func(code, desc stri
 		if onStart != nil {
 			onStart(act.TaskCode, act.Desc)
 		}
+		// Earlier actions can complete or unlock another task (Buddy_App and
+		// Buddy_App_QQ share events). Recheck outstanding items before acting.
 		res := h.runGrowthAction(a, act)
 		item := growthJobItem{TaskCode: act.TaskCode, Desc: act.Desc}
 		if ok, _ := res["ok"].(bool); ok {
@@ -897,8 +1070,14 @@ func (h *Handler) runGrowthAllCollect(a *auth.Auth, onStart func(code, desc stri
 				item.Message = e
 			}
 		}
+		if item.OK && !item.Skipped && !item.Claimed {
+			item.OK = false
+			item.Message += fmt.Sprintf("；上游未确认完成（进度 %v → %v），未领奖", res["progress_before"], res["progress_after"])
+		}
 		items = append(items, item)
-		time.Sleep(actionStepGap)
+		if !item.Skipped {
+			time.Sleep(actionStepGap)
+		}
 	}
 	return items, true
 }

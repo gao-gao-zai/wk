@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"workbuddy2api/internal/growthlimit"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/responsehistory"
 	"workbuddy2api/internal/upstream"
@@ -18,12 +19,13 @@ import (
 
 // Config 顶层配置。
 type Config struct {
-	Listen           string `json:"listen"`            // ":7863"
-	APIKey           string `json:"api_key"`           // 空 = 不鉴权
-	FrontendPassword string `json:"frontend_password"` // 前端控制台密码；空 = 不启用
-	AuthDir          string `json:"auth_dir"`          // ./auths
-	StateFile        string `json:"state_file"`        // ./data/state.json
-	Region           string `json:"region"`            // "cn" / "global" / "all"
+	GrowthConcurrency int    `json:"growth_concurrency"`
+	Listen            string `json:"listen"`            // ":7863"
+	APIKey            string `json:"api_key"`           // 空 = 不鉴权
+	FrontendPassword  string `json:"frontend_password"` // 前端控制台密码；空 = 不启用
+	AuthDir           string `json:"auth_dir"`          // ./auths
+	StateFile         string `json:"state_file"`        // ./data/state.json
+	Region            string `json:"region"`            // "cn" / "global" / "all"
 	// FrontendDir 静态控制台资源目录，默认 "frontend"（相对进程工作目录）。
 	// 只有 index.html 与 assets/index-<hash>.{js,css} 会被放行。
 	FrontendDir string `json:"frontend_dir"`
@@ -293,6 +295,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "60s"
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
+	c.GrowthConcurrency = growthlimit.Default
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
@@ -391,6 +394,9 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	applyEnv(c)
+	if err := growthlimit.Validate(c.GrowthConcurrency); err != nil {
+		return nil, err
+	}
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
@@ -454,6 +460,13 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_POSTGRES_FALLBACK_SQLITE"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Postgres.FallbackToSQLite = b
+		}
+	}
+	if v := os.Getenv("WB2A_GROWTH_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.GrowthConcurrency = n
+		} else {
+			c.GrowthConcurrency = -1
 		}
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {

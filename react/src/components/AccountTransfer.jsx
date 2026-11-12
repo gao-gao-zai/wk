@@ -1,9 +1,44 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Alert, App, Button, Input, Modal, Progress, Select, Space, Steps, Table, Tag, Typography } from 'antd';
+import { Alert, App, Button, Checkbox, Input, Modal, Progress, Select, Space, Steps, Table, Tag, Typography } from 'antd';
 import { downloadFile } from '../lib/accountManagement';
-import { accountImportDeviceLabel, accountImportResultType, buildAccountImportRequest, createAccountImportFileLoader, normalizeAccountImportOptions, runMultiAccountImport, validTransferPassword } from '../lib/accountTransfer';
+import { accountImportDeviceLabel, accountImportGrowthLabel, accountImportResultType, buildAccountImportRequest, createAccountImportFileLoader, importGrowthJobView, normalizeAccountImportOptions, runMultiAccountImport, validTransferPassword } from '../lib/accountTransfer';
 
 const { Text } = Typography;
+
+function ImportGrowthProgress({ api, jobId }) {
+  const [snapshot, setSnapshot] = useState(null);
+  const [error, setError] = useState('');
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    let disposed = false, timer;
+    const controller = new AbortController();
+    setSnapshot(null); setError('');
+    const read = async () => {
+      try {
+        const body = await api(`/admin/growth/jobs/${encodeURIComponent(jobId)}`, { signal: controller.signal, cache: 'no-store' });
+        if (disposed) return;
+        const next = importGrowthJobView(body);
+        setSnapshot(next); setError('');
+        if (next.active) timer = window.setTimeout(read, 2000);
+      } catch {
+        if (!disposed) setError('任务进度读取失败，可能已过期或服务重启。可重试查询，导入结果不受影响。');
+      }
+    };
+    void read();
+    return () => { disposed = true; window.clearTimeout(timer); controller.abort(); };
+  }, [api, jobId, revision]);
+  return <Space direction="vertical" size={10} style={{ width: '100%' }}>
+    <Space wrap><Text strong>成长任务 {jobId}</Text><Button size="small" onClick={() => setRevision(value => value + 1)}>刷新任务进度</Button></Space>
+    <Text type="secondary">只读跟踪当前任务。关闭页面后服务端继续执行；任务结果不改变账号停用状态。</Text>
+    {error && <Alert type="warning" showIcon message={error} />}
+    {snapshot ? <><Alert type={snapshot.severity} showIcon message={snapshot.label} description={snapshot.error || snapshot.current || '检查任务及奖励状态'} /><Progress percent={snapshot.percent} status={snapshot.severity === 'warning' ? 'exception' : snapshot.active ? 'active' : 'normal'} /><Text>已处理 {snapshot.done} / {snapshot.total || (snapshot.active ? '待确定' : 0)} 项</Text><Table rowKey="key" size="small" pagination={{ pageSize: 10, showSizeChanger: false }} dataSource={snapshot.results} columns={[
+      { title: '任务', render: (_, row) => row.desc || row.task_code || '—' },
+      { title: '结果', render: (_, row) => <Tag color={!row.ok ? 'red' : row.claimed ? 'green' : undefined}>{!row.ok ? '失败' : row.claimed ? '已领奖' : row.skipped ? '跳过' : '完成'}</Tag> },
+      { title: '说明', dataIndex: 'message' },
+    ]} /></> : !error && <Text type="secondary">正在读取成长任务进度…</Text>}
+  </Space>;
+}
+
 export default function AccountTransfer({ api, mode, uids = [], groups = [], groupsError = '', onClose, onImported }) {
   const { message } = App.useApp();
   const [password, setPassword] = useState('');
@@ -12,13 +47,14 @@ export default function AccountTransfer({ api, mode, uids = [], groups = [], gro
   const [fileName, setFileName] = useState('');
   const [preview, setPreview] = useState(null);
   const [selected, setSelected] = useState([]);
-  const [options, setOptions] = useState({ group_mode: 'source', groups: [], nickname: '' });
+  const [options, setOptions] = useState({ group_mode: 'source', groups: [], nickname: '', run_growth_tasks: false });
   const [previewOptions, setPreviewOptions] = useState(null);
   const [accountCount, setAccountCount] = useState(null);
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [loadingFile, setLoadingFile] = useState(false);
   const [error, setError] = useState('');
+  const [growthJobID, setGrowthJobID] = useState('');
   const [progress, setProgress] = useState(null);
   const [stopping, setStopping] = useState(false);
   const stopRequested = useRef(false);
@@ -46,7 +82,7 @@ export default function AccountTransfer({ api, mode, uids = [], groups = [], gro
     event.target.value = '';
     if (!files.length) return;
     setPreview(null); setPreviewOptions(null); setSelected([]); setResult(null); setSource(null); setError('');
-    setOptions({ group_mode: 'source', groups: [], nickname: '' }); setAccountCount(null);
+    setOptions({ group_mode: 'source', groups: [], nickname: '', run_growth_tasks: false }); setAccountCount(null); setGrowthJobID('');
     setPassword(''); setPasswordAgain(''); setFileName(''); setLoadingFile(true);
     const loaded = await fileLoader.current.loadMany(files);
     if (!alive.current || !loaded) return;
@@ -81,6 +117,8 @@ export default function AccountTransfer({ api, mode, uids = [], groups = [], gro
           : await post('/admin/accounts/import', buildAccountImportRequest(source, password, selected, previewOptions, singleAccount));
         if (!alive.current) return;
         setResult(body); setPassword(''); setPasswordAgain(''); setSource(null); setSelected([]);
+        const jobs = (body.results || []).filter(row => row.growth_job_id);
+        setGrowthJobID((jobs.find(row => row.growth_status === 'queued') || jobs[0])?.growth_job_id || '');
         await onImported();
       }
     } catch (e) { if (alive.current) setError(`${e.message}。若执行期间网络中断，请先刷新账号列表核对结果，再重新预览。`); }
@@ -98,7 +136,7 @@ export default function AccountTransfer({ api, mode, uids = [], groups = [], gro
       </> : <>
         <Steps size="small" current={result ? 2 : preview ? 1 : 0} items={[{ title: '选择账号文件' }, { title: '核对账号' }, { title: '导入结果' }]} />
         {busy && progress && <div className="account-transfer-progress" role="status" aria-live="polite">
-          <div className="account-transfer-progress-header"><div><strong>{preview ? '正在导入账号' : '正在预览账号'}</strong><div className="account-transfer-progress-caption">{stopping ? '正在等待当前请求完成，后续账号不会提交。' : '逐个处理，请保持页面打开。'}</div></div><span className="account-transfer-progress-count">{progress.completed} <span>/ {progress.total}</span></span></div>
+          <div className="account-transfer-progress-header"><div><strong>{preview ? '正在导入账号' : '正在预览账号'}</strong><div className="account-transfer-progress-caption">{stopping ? '正在等待当前请求完成，后续账号不会提交。' : '逐个处理，请保持页面打开；停止仅阻止后续导入，不取消已排队成长任务。'}</div></div><span className="account-transfer-progress-count">{progress.completed} <span>/ {progress.total}</span></span></div>
           <Progress percent={progress.total ? Math.floor(progress.completed * 100 / progress.total) : 0} showInfo={false} status="active" strokeColor={{ '0%': '#5b8def', '100%': '#6558d3' }} />
           <div className="account-transfer-progress-footer"><span>已处理 {progress.completed} 个</span><span>剩余 {progress.total - progress.completed} 个</span></div>
         </div>}
@@ -114,12 +152,14 @@ export default function AccountTransfer({ api, mode, uids = [], groups = [], gro
           {groupsError && <Alert type="warning" showIcon message={groupsError} />}
           {options.group_mode !== 'source' && <><label htmlFor="account-import-groups">目标分组</label><Select id="account-import-groups" mode="multiple" style={{ width: '100%' }} placeholder="至少选择一个目标分组" value={options.groups} disabled={busy} onChange={groups => changeOptions({ groups })} options={groups.map(group => ({ value: group.name, label: `${group.name} · ${group.region === 'cn' ? '中国区' : group.region === 'global' ? '海外版' : '所有区域'}` }))} /><Text type="secondary">目标分组必须存在且区域兼容，预览时会逐项校验。</Text></>}
           {singleAccount ? <><label htmlFor="account-import-nickname">自定义昵称（留空保留原昵称）</label><Input id="account-import-nickname" value={options.nickname} disabled={busy} placeholder="最多 128 个字符" showCount={{ formatter: ({ value }) => `${Array.from(value || '').length}/128` }} onChange={event => changeOptions({ nickname: event.target.value })} /></> : <Text type="secondary">{encrypted && accountCount === null ? '加密包预览确认只有一个账号后，可自定义昵称。' : '批量导入保留每个账号原昵称。'}</Text>}
+          <Checkbox checked={options.run_growth_tasks} disabled={busy} onChange={event => changeOptions({ run_growth_tasks: event.target.checked })}>导入后自动检查并完成未完成成长任务（默认关闭）</Checkbox>
+          {options.run_growth_tasks && <Alert type="warning" showIcon message="将产生真实上游任务请求及必要的短对话，可能消耗用量。" description="仅为本次确定成功新增的中国区账号排队；重复、失败、待核对及海外版账号不执行。新账号始终保持停用，任务失败不回滚成功导入。" />}
           <Text type="secondary">缺少设备档案时将为新账号生成 Mac 设备档案；已有设备档案保持原值。更改导入参数后需重新预览。</Text>
           {optionError && <Alert type="error" showIcon message={optionError} />}
         </Space>}
         {preview && !result && <><Alert type="warning" showIcon message="新账号导入后均为停用状态，核对后在账号管理页手动启用。" description="重复账号和已有授权文件不覆盖。请核对目标分组与设备处理方式；临时冷却、代理和统计不迁移。" /><Space wrap><Text>共 {preview.length} 个账号 · 已有 {preview.filter(a => a.exists).length} 个 · 已选择 {selected.length} 个</Text><Button size="small" disabled={busy} onClick={() => setSelected(preview.filter(a => !a.exists && !a.issue).map(a => a.uid))}>选择全部可导入账号</Button></Space>
-          <Table className="account-import-table" rowKey="uid" size="small" dataSource={preview} scroll={{ x: 760 }} pagination={{ pageSize: 10, showSizeChanger: false }} rowSelection={{ selectedRowKeys: selected, preserveSelectedRowKeys: true, onChange: setSelected, getCheckboxProps: a => ({ disabled: busy || a.exists || !!a.issue }) }} columns={[{ title: '账号', dataIndex: 'uid', render: (uid, a) => <div><Text>{a.nickname || '未命名'}</Text><div className="account-uid">{uid}</div></div> }, { title: '区域', dataIndex: 'region', render: r => r === 'global' ? '海外版' : '中国区' }, { title: '目标分组', dataIndex: 'groups', render: g => (g || []).join('、') }, { title: '设备', key: 'device', render: (_, account) => accountImportDeviceLabel(account) }, { title: '处理方式', render: (_, a) => a.exists ? <Tag>已存在 · 跳过</Tag> : a.issue ? <Text type="danger">{a.issue}</Text> : <Tag color="blue">新增 · 停用</Tag> }]} /></>}
-        {result && <><Alert showIcon type={accountImportResultType(result)} message={`成功导入 ${result.success || 0} 个，跳过 ${result.skipped || 0} 个，失败 ${(result.results || []).filter(r => !r.ok && !r.skipped && !r.cancelled).length} 个，未提交 ${(result.results || []).filter(r => r.cancelled).length} 个`} /><Table rowKey="uid" size="small" dataSource={result.results || []} pagination={{ pageSize: 10, showSizeChanger: false }} columns={[{ title: 'UID', dataIndex: 'uid' }, { title: '结果', render: (_, r) => <Tag color={r.ok ? 'green' : r.skipped || r.cancelled ? undefined : 'red'}>{r.ok ? '成功' : r.skipped ? '跳过' : r.cancelled ? '未提交' : '失败'}</Tag> }, { title: '详情', dataIndex: 'detail' }]} /></>}
+          <Table className="account-import-table" rowKey="uid" size="small" dataSource={preview} scroll={{ x: 920 }} pagination={{ pageSize: 10, showSizeChanger: false }} rowSelection={{ selectedRowKeys: selected, preserveSelectedRowKeys: true, onChange: setSelected, getCheckboxProps: a => ({ disabled: busy || a.exists || !!a.issue }) }} columns={[{ title: '账号', dataIndex: 'uid', render: (uid, a) => <div><Text>{a.nickname || '未命名'}</Text><div className="account-uid">{uid}</div></div> }, { title: '区域', dataIndex: 'region', render: r => r === 'global' ? '海外版' : '中国区' }, { title: '目标分组', dataIndex: 'groups', render: g => (g || []).join('、') }, { title: '设备', key: 'device', render: (_, account) => accountImportDeviceLabel(account) }, { title: '成长任务', key: 'growth', render: (_, account) => accountImportGrowthLabel(account, previewOptions?.run_growth_tasks) }, { title: '处理方式', render: (_, a) => a.exists ? <Tag>已存在 · 跳过</Tag> : a.issue ? <Text type="danger">{a.issue}</Text> : <Tag color="blue">新增 · 停用</Tag> }]} /></>}
+        {result && <><Alert showIcon type={accountImportResultType(result)} message={`成功导入 ${result.success || 0} 个，跳过 ${result.skipped || 0} 个，未提交 ${(result.results || []).filter(r => r.cancelled).length} 个，失败 ${(result.results || []).filter(r => !r.ok && !r.skipped && !r.cancelled).length} 个`} /><Table rowKey="uid" size="small" dataSource={result.results || []} pagination={{ pageSize: 10, showSizeChanger: false }} columns={[{ title: 'UID', dataIndex: 'uid' }, { title: '结果', render: (_, r) => <Tag color={r.ok ? 'green' : r.skipped || r.cancelled ? undefined : 'red'}>{r.ok ? '成功' : r.skipped ? '跳过' : r.cancelled ? '未提交' : '失败'}</Tag> }, { title: '详情', dataIndex: 'detail' }, { title: '成长任务', render: (_, row) => <Space direction="vertical" size={3}><Text>{accountImportGrowthLabel(row, previewOptions?.run_growth_tasks)}</Text>{row.growth_detail && <Text type="secondary">{row.growth_detail}</Text>}{row.growth_job_id && <Button type="link" size="small" onClick={() => setGrowthJobID(row.growth_job_id)}>查看进度</Button>}</Space> }]} />{growthJobID && <ImportGrowthProgress key={growthJobID} api={api} jobId={growthJobID} />}<Text type="secondary">查看其它任务可进入<a href="#/growth" onClick={onClose}>成长任务中心</a>；关闭此窗口不会取消服务端任务。</Text></>}
       </>}
       {error && <Alert type="error" showIcon message={error} />}
     </Space>

@@ -94,6 +94,38 @@ func (c *Client) cachedWebsite(key, base string) (websiteSession, bool) {
 }
 
 func (c *Client) websiteSessionFor(ctx context.Context, a *auth.Auth, page string) (websiteSession, error) {
+	if scope := c.growthRouteFor(a); scope != nil {
+		if err := scope.check(); err != nil {
+			return websiteSession{}, err
+		}
+		scope.webMu.Lock()
+		defer scope.webMu.Unlock()
+		if err := scope.check(); err != nil {
+			return websiteSession{}, err
+		}
+		key, base := c.websiteKey(a), c.websiteBase(a)
+		if entry, ok := scope.webSessions[key]; ok {
+			if (entry.unsupported && time.Since(entry.created) < 5*time.Minute) || (!entry.unsupported && time.Since(entry.created) < 24*time.Hour && hasWebsiteCookie(entry.jar, base)) {
+				return entry, nil
+			}
+		}
+		// Task login is owned by this exact private route and cancellation
+		// scope. It cannot join an ordinary account's shared login flight.
+		entry, err := c.openWebsite(ctx, a, page)
+		if err == nil {
+			err = scope.check()
+		}
+		if err != nil && c.WebAuthMode == "auto" && scope.check() == nil && legacyReadAllowed(ctx, err) {
+			entry, err = websiteSession{created: time.Now(), unsupported: true}, nil
+		}
+		if err == nil {
+			if scope.webSessions == nil {
+				scope.webSessions = map[string]websiteSession{}
+			}
+			scope.webSessions[key] = entry
+		}
+		return entry, err
+	}
 	key, base := c.websiteKey(a), c.websiteBase(a)
 	if entry, ok := c.cachedWebsite(key, base); ok {
 		return entry, nil
@@ -218,7 +250,7 @@ func (c *Client) websiteJSON(ctx context.Context, a *auth.Auth, method, path str
 	if !c.websiteEnabled() {
 		return nil, false, nil
 	}
-	a = authFromCredentials(a.Snapshot())
+	a = c.growthAuthSnapshot(a, a.Snapshot())
 	uri, err := url.ParseRequestURI(path)
 	if err != nil {
 		return nil, true, err
@@ -271,11 +303,19 @@ func (c *Client) websiteJSON(ctx context.Context, a *auth.Auth, method, path str
 			// Invalidate only the generation that received 401. Another request
 			// may already have installed a newer session while this was in flight.
 			key := c.websiteKey(a)
-			c.webMu.Lock()
-			if current := c.webSessions[key]; current.jar == entry.jar {
-				delete(c.webSessions, key)
+			if scope := c.growthRouteFor(a); scope != nil {
+				scope.webMu.Lock()
+				if current := scope.webSessions[key]; current.jar == entry.jar {
+					delete(scope.webSessions, key)
+				}
+				scope.webMu.Unlock()
+			} else {
+				c.webMu.Lock()
+				if current := c.webSessions[key]; current.jar == entry.jar {
+					delete(c.webSessions, key)
+				}
+				c.webMu.Unlock()
 			}
-			c.webMu.Unlock()
 			continue
 		}
 		return data, true, err

@@ -311,19 +311,37 @@ func (h *Handler) ResumeGrowthJobsAfterRestart() {
 	}
 	log.Printf("growth: 检测到重启前未完成的批跑标记（%d 个待跑账号），自动恢复", len(mark.Pending))
 	if len(accounts) == 0 {
-		h.clearGrowthJobMark()
+		h.initGrowthRunner()
+		h.syncGrowthMark()
 		log.Printf("growth: 待跑账号均已不可用，标记清除")
 		return
 	}
 	job := h.growthJobs.newJob("", "all")
-	// 先写初始快照再入队（入队后 drain 立即起跑，run 尾部的 syncGrowthMark
-	// 是唯一同步点；入队方滞后写会与 drain 的 clear 竞争复活已删标记）。
-	h.writeGrowthJobMark(mark.Pending)
+	// The runner serializes admission/completion snapshots, including active
+	// accounts. Keep the old marker during the startup delay.
+	h.initGrowthRunner()
+	h.growthRunner.mu.Lock()
+	for _, a := range accounts {
+		h.growthRunner.restoring = append(h.growthRunner.restoring, a.Snapshot().UID)
+	}
+	h.growthRunner.syncLocked()
+	h.growthRunner.mu.Unlock()
 	// 延迟几秒再入队：让服务先把监听/健康检查立起来，部署脚本不误判启动失败。
 	lifecycle.Go(func() {
 		time.Sleep(5 * time.Second)
-		if n := h.growthSubmitAll(job, accounts); n == 0 {
-			h.clearGrowthJobMark()
-		}
+		h.submitRestoredGrowthJobs(job, accounts)
 	})
+}
+
+func (h *Handler) submitRestoredGrowthJobs(job *growthJob, accounts []*auth.Auth) {
+	h.growthSubmitAll(job, accounts)
+	h.growthRunner.mu.Lock()
+	defer h.growthRunner.mu.Unlock()
+	// Shutdown may reject admission during the startup delay. Never erase the
+	// only recovery intent merely because no new worker can be started now.
+	if h.growthRunner.closed {
+		return
+	}
+	h.growthRunner.restoring = nil
+	h.growthRunner.syncLocked()
 }

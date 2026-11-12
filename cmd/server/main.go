@@ -29,6 +29,7 @@ import (
 	"workbuddy2api/internal/collectionservice"
 	"workbuddy2api/internal/coordination"
 	"workbuddy2api/internal/groups"
+	"workbuddy2api/internal/growthlimit"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/lifecycle"
 	"workbuddy2api/internal/metricsstore"
@@ -523,6 +524,7 @@ func main() {
 	// reqproxy：实际请求账号的代理池（区别于 sms 的注册代理）。
 	// 始终构造（WebUI 需要管理界面），enabled 状态在 state.json 里控制。
 	// 启动失败不致命：降级为直连（零回归），控制台仍可诊断。
+	growthBudget := growthlimit.New(cfg.GrowthConcurrency)
 	reqProxyMgr, reqProxyKernel, reqProxyErr := newReqProxyManagerWithOverlap(cfg, overlapState, initialOwner)
 	if reqProxyErr != nil {
 		if overlap {
@@ -531,6 +533,7 @@ func main() {
 		log.Printf("reqproxy: 启动失败，账号请求直连: %v", reqProxyErr)
 	}
 	if reqProxyMgr != nil {
+		reqProxyMgr.SetGrowthBudget(growthBudget)
 		defer reqProxyMgr.Close()
 		if reqProxyKernel != nil {
 			defer reqProxyKernel.Close()
@@ -539,6 +542,8 @@ func main() {
 		// 不等第一个请求才分配。
 		reqProxyMgr.SetAccounts(poolAccountSource{p})
 		up.DialProxy = reqProxyMgr.DialProxy
+		up.GrowthRouteLease = reqProxyMgr.GrowthRouteLease
+		up.GrowthRoutePlan = reqProxyMgr.GrowthRoutePlan
 	}
 
 	accountControl := &sync.Mutex{}
@@ -557,12 +562,13 @@ func main() {
 		CollectionRequired: true,
 		Pool:               p,
 		Upstream:           up,
-		RequestCredits:     metricsDB,
-		CheckinHours:       cfg.Schedule.CheckinHours,
-		TravelHours:        cfg.Schedule.TravelHours,
-		ActivityHours:      cfg.Schedule.ActivityHours,
-		KeepaliveHours:     cfg.Schedule.KeepaliveHours,
-		BlackcatHours:      cfg.Schedule.BlackcatHours,
+
+		RequestCredits: metricsDB,
+		CheckinHours:   cfg.Schedule.CheckinHours,
+		TravelHours:    cfg.Schedule.TravelHours,
+		ActivityHours:  cfg.Schedule.ActivityHours,
+		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		BlackcatHours:  cfg.Schedule.BlackcatHours,
 
 		CheckinDisabled:   !cfg.ScheduleEnabled.Checkin,
 		TravelDisabled:    !cfg.ScheduleEnabled.Travel,
@@ -635,6 +641,7 @@ func main() {
 		PromptGuard:        promptManager,
 		Pool:               p,
 		Upstream:           up,
+		GrowthBudget:       growthBudget,
 		APIKey:             cfg.APIKey,
 		FrontendPassword:   cfg.FrontendPassword,
 		Groups:             groupStore,
@@ -1000,6 +1007,7 @@ func main() {
 			log.Printf("HTTP shutdown: %v", err)
 		}
 		lifecycle.Default.Pause()
+		h.StopGrowthRunner()
 		if w := h.UIDWatcher(); w != nil {
 			w.Stop()
 		}

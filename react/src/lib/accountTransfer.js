@@ -26,7 +26,8 @@ export function identifyAccountImport(content) {
 export function normalizeAccountImportOptions(options, singleAccount) {
   const groupMode = options.group_mode || 'source';
   if (!['source', 'replace', 'append'].includes(groupMode)) throw new Error('请选择有效的分组策略');
-  const normalized = { group_mode: groupMode };
+  if (options.run_growth_tasks !== undefined && typeof options.run_growth_tasks !== 'boolean') throw new Error('成长任务开关格式无效');
+  const normalized = { group_mode: groupMode, run_growth_tasks: options.run_growth_tasks === true };
   if (groupMode !== 'source') {
     if (!Array.isArray(options.groups) || options.groups.some(group => typeof group !== 'string' || !group.trim())) {
       throw new Error('请选择有效的目标分组');
@@ -120,6 +121,7 @@ export function createAccountImportFileLoader() {
 // Each official credential uses the existing single-account endpoint. Stop on
 // uncertain writes so the remaining accounts are never silently replayed.
 export async function runMultiAccountImport(post, sources, options, selected, cancelled = () => false, onProgress = () => {}) {
+  const frozenOptions = normalizeAccountImportOptions(options, false);
   const preview = selected === undefined;
   const wanted = new Set(selected || []);
   const targets = preview ? sources : sources.filter(source => wanted.has(source.credential.account.uid));
@@ -136,7 +138,7 @@ export async function runMultiAccountImport(post, sources, options, selected, ca
     }
     try {
       const body = await post(preview ? '/admin/accounts/import/preview' : '/admin/accounts/import',
-        buildAccountImportRequest(source, '', preview ? undefined : [uid], options, false));
+        buildAccountImportRequest(source, '', preview ? undefined : [uid], frozenOptions, false));
       if (preview) {
         if (!Array.isArray(body.accounts) || body.accounts.length !== 1 || body.accounts[0].uid !== uid) throw new Error('预览回执无效');
         rows.push(body.accounts[0]);
@@ -168,4 +170,38 @@ export function accountImportResultType(result) {
   const rows = result.results || [];
   if (rows.some(row => !row.ok && !row.skipped)) return 'warning';
   return result.ok === true ? 'success' : 'info';
+}
+
+export function accountImportGrowthLabel(account, enabled) {
+  if (account.skipped || account.exists) return '重复账号，未排队';
+  if (account.cancelled) return '未提交，未排队';
+  if (account.pending) return '导入待核对，未排队';
+  if (account.issue || account.ok === false) return '导入未完成，未排队';
+  if (!enabled) return '未开启';
+  if (account.growth_status === 'enqueue_failed') return '排队失败（导入已成功）';
+  if (account.growth_status === 'queued') return '已排队，账号保持停用';
+  if (account.growth_status === 'unsupported_region' || account.region === 'global') return '海外版不支持，未排队';
+  if (account.ok === true) return '未返回排队状态，请到成长任务中心核对';
+  return '成功新增后检查未完成任务';
+}
+
+const growthText = value => typeof value === 'string' ? value.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [已隐藏]')
+  .replace(/("(?:access_?token|refresh_?token|api[_-]?key|authorization)"\s*:\s*")[^"]*(")/gi, '$1[已隐藏]$2') : '';
+
+export function importGrowthJobView(snapshot) {
+  const phase = ['queued', 'running', 'done', 'failed', 'cancelled'].includes(snapshot?.phase) ? snapshot.phase : 'unknown';
+  const total = Number.isFinite(snapshot?.total) ? Math.max(0, snapshot.total) : 0;
+  const done = Number.isFinite(snapshot?.done) ? Math.max(0, snapshot.done) : 0;
+  const results = (Array.isArray(snapshot?.results) ? snapshot.results : []).map((item, index) => ({
+    key: index, task_code: growthText(item.task_code), desc: growthText(item.desc), message: growthText(item.message),
+    ok: item.ok === true, skipped: item.skipped === true, claimed: item.claimed === true,
+  }));
+  const partialFailure = results.some(item => !item.ok);
+  return {
+    phase, active: phase === 'running' || phase === 'queued', total, done,
+    percent: total > 0 ? Math.min(100, Math.floor(done * 100 / total)) : 0,
+    label: { queued: '排队中', running: '执行中', done: partialFailure ? '已结束，部分任务失败' : '已结束', failed: '任务失败', cancelled: '任务已取消', unknown: '状态未知' }[phase],
+    severity: phase === 'failed' || partialFailure ? 'warning' : phase === 'done' ? 'success' : 'info',
+    current: growthText(snapshot?.current), error: growthText(snapshot?.error), results,
+  };
 }

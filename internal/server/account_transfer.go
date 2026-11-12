@@ -51,6 +51,7 @@ type accountImportRequest struct {
 	GroupMode      string                `json:"group_mode,omitempty"`
 	Groups         []string              `json:"groups,omitempty"`
 	Nickname       string                `json:"nickname,omitempty"`
+	RunGrowthTasks bool                  `json:"run_growth_tasks,omitempty"`
 }
 type accountImportRow struct {
 	UID            string   `json:"uid"`
@@ -392,6 +393,7 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 	success := 0
 	skipped := 0
 	stop := false
+	imported := map[string]*auth.Auth{}
 	for _, uid := range uids {
 		if stop || r.Context().Err() != nil {
 			results = append(results, map[string]any{"uid": uid, "ok": false, "detail": "导入已中止，此账号未处理，请重新预览"})
@@ -480,6 +482,7 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 			}
 		}
 		success++
+		imported[uid] = a
 		if h.cfg.Collection != nil {
 			h.cfg.Collection.Forget(uid)
 		}
@@ -494,6 +497,40 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 			}
 		}
 		success = 0
+	}
+	// Import success is committed before any optional upstream work can start.
+	// Growth failures never roll back credentials or make quarantined accounts routable.
+	if req.RunGrowthTasks {
+		for _, row := range results {
+			if row["ok"] != true {
+				continue
+			}
+			uid, _ := row["uid"].(string)
+			a := imported[uid]
+			if a == nil {
+				continue
+			}
+			if a.Region() != auth.RegionCN {
+				row["growth_status"] = "unsupported_region"
+				row["growth_detail"] = "海外版账号不支持成长任务，未排队"
+				continue
+			}
+			if h.cfg.Upstream == nil {
+				row["growth_status"] = "enqueue_failed"
+				row["growth_detail"] = "成长任务服务未配置；账号已成功导入并保持停用"
+				continue
+			}
+			job := h.growthJobs.newJob(uid, "account")
+			row["growth_job_id"] = job.ID
+			if !h.growthSubmitAccount(job, a) {
+				job.finish("failed", "成长任务未能加入执行队列；可能已在队列或队列暂不可用，请稍后核对")
+				row["growth_status"] = "enqueue_failed"
+				row["growth_detail"] = "成长任务未入队；账号已成功导入并保持停用"
+				continue
+			}
+			row["growth_status"] = "queued"
+			row["growth_detail"] = "已排队检查并完成未完成成长任务；账号保持停用，关闭页面后继续执行"
+		}
 	}
 	invalidateDynamicModelsCache()
 	writeJSON(w, 200, map[string]any{"ok": success == len(uids), "success": success, "skipped": skipped, "stop": stop, "results": results})

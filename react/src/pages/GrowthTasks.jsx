@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CollectionLaunch } from '../components/Collection';
+import GrowthConcurrency from '../components/GrowthConcurrency';
 import { freshness } from '../lib/collection';
 import {
   App, Alert, Button, Card, Drawer, Empty, Input, Popconfirm, Progress,
@@ -701,6 +702,7 @@ export default function GrowthTasks({ api, data, refresh }) {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <GrowthConcurrency api={api} />
       {progressCard}
       {ledgerCard}
       {schoolCard}

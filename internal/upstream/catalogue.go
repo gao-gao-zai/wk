@@ -48,7 +48,7 @@ type modelCatalogue struct {
 
 func (c *Client) FetchModelsContext(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
 	// Pin identity and credentials for every request in this collection.
-	account := authFromCredentials(a.Snapshot())
+	account := c.growthAuthSnapshot(a, a.Snapshot())
 	primary, err := c.readCatalogue(ctx, account, false)
 	if err != nil && legacyReadAllowed(ctx, err) {
 		rows, legacyErr := c.fetchLegacyModels(ctx, account)

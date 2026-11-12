@@ -275,6 +275,11 @@ type Client struct {
 	// DialProxy reqproxy 接入钩子（账号级统一路由，见 reqproxy_hook.go）。
 	// nil = 模块关闭，全部直连，行为与旧版逐字节一致。
 	DialProxy DialProxyFunc
+
+	// GrowthRouteLease freezes a task-only proxy route. Server IPs identify the
+	// remote proxy server, never the local HTTP slot or a public egress probe.
+	GrowthRouteLease GrowthRouteLeaseFunc
+	GrowthRoutePlan  GrowthRoutePlanFunc
 }
 
 type diagnosticContextKey struct{}

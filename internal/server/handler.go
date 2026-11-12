@@ -32,6 +32,7 @@ import (
 	"workbuddy2api/internal/cacheroute"
 	"workbuddy2api/internal/collection"
 	"workbuddy2api/internal/groups"
+	"workbuddy2api/internal/growthlimit"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/haozhumah5"
 	"workbuddy2api/internal/lifecycle"
@@ -133,6 +134,7 @@ type Config struct {
 	// 全部跑完删除。进程重启后 main 检测到标记自动重新拉起剩余账号
 	//（动作幂等：已完成的秒级跳过）。
 	GrowthJobMarkPath string
+	GrowthBudget      *growthlimit.Budget
 	// GrowthLedgerPath 一次性任务台账落盘路径（state.json 同目录；空 = 纯内存）。
 	// 记录每账号每任务的领取时间与积分/能量收益，重启不丢；查询端点合并
 	// 上游 claimed 对账产出三态视图（完成/部分/未开始）。
@@ -319,6 +321,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
+	}
+	if cfg.GrowthBudget == nil {
+		cfg.GrowthBudget = growthlimit.New(growthlimit.Default)
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]*storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
 	if cfg.Session != nil {
@@ -1332,8 +1337,10 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		ResponseHistory            any    `json:"response_history"`
 		ResponseHistoryStorage     string `json:"response_history_storage"`
 		// MaxRequestBodyMB 对前端组装成嵌套对象（与 POST 补丁形状一致）。
-		MaxRequestBody any `json:"max_request_body"`
+		MaxRequestBody    any `json:"max_request_body"`
+		GrowthConcurrency int `json:"growth_concurrency"`
 	}{
+		GrowthConcurrency:          h.cfg.GrowthBudget.Current(),
 		LegacyPromptCompatMigrated: h.legacyPromptMigrated(),
 		Schedule:                   c.Schedule,
 		Region:                     c.Region,
@@ -1612,11 +1619,19 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		Retention             *retentionPatch       `json:"request_log_retention"`
 		ResponseHistory       *responseHistoryPatch `json:"response_history"`
 		MaxRequestBody        *maxRequestBodyPatch  `json:"max_request_body"`
+		GrowthConcurrency     *int                  `json:"growth_concurrency"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
+	if req.GrowthConcurrency != nil {
+		if err := growthlimit.Validate(*req.GrowthConcurrency); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
 	if h.legacyPromptMigrated() && req.Features != nil && (req.Features.CodexCompat != nil || req.Features.DSHCompat != nil) {
 		writeJSON(w, 400, map[string]string{"error": "Codex/DSH 兼容配置已迁移，请在系统提示词规则中修改", "code": "prompt_compat_migrated"})
 		return
@@ -2087,6 +2102,9 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if req.ResponseHistory != nil {
 		doc["response_history"] = historyPolicy
 	}
+	if req.GrowthConcurrency != nil {
+		doc["growth_concurrency"] = *req.GrowthConcurrency
+	}
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	persistAttempted := false
 	persistSMS := func() error {
@@ -2322,6 +2340,10 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		h.maxRequestBody = mb * 1_000_000
 		h.featuresMu.Unlock()
 		updated["max_request_body_mb"] = mb
+	}
+	if req.GrowthConcurrency != nil {
+		h.setGrowthConcurrency(*req.GrowthConcurrency)
+		updated["growth_concurrency"] = *req.GrowthConcurrency
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "updated": updated})
 }

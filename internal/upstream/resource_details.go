@@ -151,7 +151,7 @@ func (s *balanceSummary) freeOnly() bool {
 }
 
 func (c *Client) UserResourceDetailsContext(ctx context.Context, a *auth.Auth) (usage ResourceUsage, err error) {
-	a = authFromCredentials(a.Snapshot())
+	a = c.growthAuthSnapshot(a, a.Snapshot())
 	trace := &balanceTrace{}
 	ctx = context.WithValue(ctx, balanceTraceKey{}, trace)
 	defer func() {

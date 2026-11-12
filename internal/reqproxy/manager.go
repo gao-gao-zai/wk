@@ -3,13 +3,16 @@
 package reqproxy
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"sync"
 	"time"
 
 	"workbuddy2api/internal/coordination"
+	"workbuddy2api/internal/growthlimit"
 	"workbuddy2api/internal/lifecycle"
 )
 
@@ -79,6 +82,14 @@ type Manager struct {
 	listenIP     string
 	localTargets map[string]string
 	localPorts   map[string]int
+
+	// Task-private slots are absent from business bindings and survive normal
+	// rebalancing. Only their owner or manager shutdown can remove them.
+	growthBudget *growthlimit.Budget
+	growthMu     sync.Mutex
+	growthClosed bool
+	growthSlots  map[string]int
+	growthLookup func(context.Context, string) ([]net.IPAddr, error)
 }
 
 // NewManager 构建并启动模块。kernel 为 nil 时纯逻辑模式（测试）。
@@ -215,6 +226,7 @@ func (m *Manager) ActivateBackground() error {
 
 // Close 停止全部后台任务。
 func (m *Manager) Close() {
+	m.closeGrowthRoutes()
 	m.bgMu.Lock()
 	background := m.background
 	m.bgMu.Unlock()

@@ -21,6 +21,9 @@ type Auth struct {
 	refreshMu      sync.Mutex
 	saveMu         sync.Mutex
 	sharedBaseline string
+	// Ephemeral request state belongs only to an independent task auth value.
+	// It is intentionally absent from Credentials, snapshots and persistence.
+	requestScope any
 
 	AccessToken  string
 	RefreshToken string
@@ -63,6 +66,13 @@ func (a *Auth) Lock() { a.refreshMu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.refreshMu.Unlock() }
+
+func (a *Auth) EphemeralRequestScope() any { a.mu.RLock(); defer a.mu.RUnlock(); return a.requestScope }
+func (a *Auth) SetEphemeralRequestScope(scope any) {
+	a.mu.Lock()
+	a.requestScope = scope
+	a.mu.Unlock()
+}
 
 // Snapshot returns a consistent copy safe for concurrent request building.
 func (a *Auth) Snapshot() Credentials {
