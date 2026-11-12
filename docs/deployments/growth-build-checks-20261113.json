@@ -1,0 +1,182 @@
+{
+  "revision": "5fb99f994dca586db0c2236068f8176c3663b38c",
+  "build_host": "tyy2",
+  "release_run": "deploy-growth-5fb99f9-20261112-r2",
+  "source_input_git_archive_sha256": "9bc56e7a8705d9080d551ef56258575cdee30072393dd915777195c55fbb489a",
+  "tested_source_snapshot_sha256": "fbfd7cdc7d0ab0eeb82d2ee499e87be3cf259cfb0035a34d1cb73c3536402c74",
+  "canonical_comparison": "All Go/React source, lockfiles, active frontend and notices match A27 modulo CRLF; all 567 source manifest files match pushed Git canonical content.",
+  "corresponding_source": {
+    "all_manifest_files_match_git_canonical": true,
+    "file_count": 567,
+    "vendor_present": true,
+    "production_npm_sources_present": true
+  },
+  "source_sha256": "53f4b789258aac2a31af0f087e0d940ce93d4a665ed86421b86019624a6f5cee",
+  "formal_checks": [
+    "canonical-proof PASS",
+    "source-package-tests PASS",
+    "controller-unit-tests PASS",
+    "go-vendor PASS",
+    "source-package PASS",
+    "build-server PASS",
+    "build-login PASS",
+    "build-gateway PASS",
+    "handoff-integration PASS",
+    "runtime-only image-build PASS",
+    "network-none read-only image-preflight PASS"
+  ],
+  "prior_targeted_go": {
+    "workbuddy2api/internal/growthlimit": {
+      "pass_top": 0,
+      "pass_total": 0,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/internal/server": {
+      "pass_top": 51,
+      "pass_total": 68,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/internal/reqproxy": {
+      "pass_top": 7,
+      "pass_total": 7,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/internal/upstream": {
+      "pass_top": 7,
+      "pass_total": 20,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/internal/lifecycle": {
+      "pass_top": 2,
+      "pass_total": 2,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/cmd/server": {
+      "pass_top": 1,
+      "pass_total": 1,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    }
+  },
+  "prior_budget_full": {
+    "workbuddy2api/internal/growthlimit": {
+      "pass_top": 2,
+      "pass_total": 2,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    }
+  },
+  "prior_targeted_race": {
+    "workbuddy2api/internal/growthlimit": {
+      "pass_top": 2,
+      "pass_total": 2,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/internal/server": {
+      "pass_top": 53,
+      "pass_total": 70,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/internal/reqproxy": {
+      "pass_top": 8,
+      "pass_total": 8,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/internal/upstream": {
+      "pass_top": 9,
+      "pass_total": 32,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/internal/lifecycle": {
+      "pass_top": 2,
+      "pass_total": 2,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    },
+    "workbuddy2api/cmd/server": {
+      "pass_top": 1,
+      "pass_total": 1,
+      "skip": [],
+      "fail": [],
+      "status": "pass"
+    }
+  },
+  "frontend_full": {
+    "tests": "112",
+    "pass": "112",
+    "fail": "0",
+    "cancelled": "0",
+    "skipped": "0",
+    "todo": "0"
+  },
+  "mock_browser": {
+    "checks": [
+      "growth_checkbox_defaults_off",
+      "changing_growth_choice_invalidates_preview",
+      "apply_uses_frozen_growth_choice_and_only_import_posts",
+      "job_failure_keeps_import_success_and_quarantine_visible",
+      "closing_dialog_stops_polling_without_cancel_or_replay",
+      "multi_file_growth_option_repreview_and_both_frozen_imports",
+      "multi_file_independent_growth_job_receipts_are_viewable",
+      "multi_file_stop_preserves_successful_job_without_importing_remaining_or_cancelling_jobs",
+      "growth_concurrency_defaults_16_and_saves_only_validated_config",
+      "growth_concurrency_save_failure_does_not_claim_change_or_trigger_tasks"
+    ],
+    "uncaught_exceptions": []
+  },
+  "artifact": {
+    "revision": "5fb99f994dca586db0c2236068f8176c3663b38c",
+    "release": "growth-5fb99f9",
+    "build_host": "tyy2",
+    "image_tag": "wk:20261112-growth-5fb99f9",
+    "image_id": "sha256:9e3154a4acb658a680b79ab5ade00afaf0aa3e458e908f994b7baf9f76a1c301",
+    "frontend_js": "index-DF3JUfKX.js",
+    "sha256": {
+      "wb2api": "a2adfd9478714df3e54572db4a9f619f84465ed0800afbcd27ea579e826c6e5b",
+      "login": "23d1738587adff8075b469b39725709d20a83db13124be329b08fc52ae06e975",
+      "handoff-gateway": "9159b537b6e062055457637ffe566ebf5c473443c34297534adeba466b15125c",
+      "source.tar.gz": "53f4b789258aac2a31af0f087e0d940ce93d4a665ed86421b86019624a6f5cee",
+      "image.tar.gz": "381822d494f06f79cf430946a8e153922152aea7f1cfea5325486d7a44e81bc5"
+    },
+    "image_bytes": 129074602,
+    "canonical_proof": "canonical-proof.json",
+    "reused_checks": "growth-concurrency-20261112-a27, growth-integration-20261112-a19-merged-r3",
+    "frontend_sha256": {
+      "index-DF3JUfKX.js": "238cffc3d6f415510842e1c973d687a9872f30d215d9914f4e0ebf72db8ebb76",
+      "index-Cl_wrrJm.css": "7180a23094ac6b0348b6ebcfb9f70ccfd048d8d4435faa4d7d8b1e52bf93153e"
+    },
+    "frontend_index_sha256": "d7efdc1c2ed9257dd76e75fad98fe9c9049c4f2bd153a34cc6b5b09d95e302d0",
+    "source_proof": {
+      "all_manifest_files_match_git_canonical": true,
+      "file_count": 567,
+      "vendor_present": true,
+      "production_npm_sources_present": true
+    }
+  },
+  "notes": [
+    "Fresh formal build uses the pushed commit; A19/A27 tests reused only after canonical equality proof.",
+    "Git export CRLF changes raw frontend digests; release manifest records the actual served bytes.",
+    "Docker packages host-built binaries and dependencies only, with no application compilation in Docker."
+  ]
+}
