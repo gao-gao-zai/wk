@@ -2,13 +2,58 @@ package pool
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"workbuddy2api/internal/auth"
 )
+
+func TestRouteLeaseKeyPreservesPrintableFieldBoundaries(t *testing.T) {
+	routes := []RouteRequest{
+		{},
+		{Tenant: "a", Session: "bc", Prefix: "d"},
+		{Tenant: "ab", Session: "c", Prefix: "d"},
+		{Tenant: "a", Session: "b", Prefix: "cd"},
+		{Tenant: "a.b", Session: "c", Prefix: "d"},
+		{Tenant: "a", Session: "b.c", Prefix: "d"},
+		{Tenant: "a\x00b", Session: "c", Prefix: "d"},
+		{Tenant: "a", Session: "b\x00c", Prefix: "d"},
+		{Tenant: "", Session: "\x00", Prefix: ""},
+		{Tenant: "\x00", Session: "", Prefix: ""},
+		{Tenant: "租户", Session: "session/-_", Prefix: "\xff\x00"},
+	}
+	seen := map[string]bool{}
+	for _, route := range routes {
+		key := routeLeaseKey(route)
+		if seen[key] {
+			t.Fatalf("distinct route identities share a key: %#v", route)
+		}
+		seen[key] = true
+		for _, ch := range key {
+			if ch < 0x20 || ch > 0x7e {
+				t.Fatalf("route key contains a nonprintable character: %q", key)
+			}
+		}
+		parts := strings.Split(key, ".")
+		if len(parts) != 3 {
+			t.Fatalf("route key lost field boundaries: %q", key)
+		}
+		for i, want := range []string{route.Tenant, route.Session, route.Prefix} {
+			got, err := base64.RawURLEncoding.DecodeString(parts[i])
+			if err != nil || string(got) != want {
+				t.Fatalf("field %d round trip failed: %v", i, err)
+			}
+		}
+		route.Related = true
+		if routeLeaseKey(route) != key {
+			t.Fatal("request-local related hint changed route identity")
+		}
+	}
+}
 
 func admissionPool(uids ...string) *Pool {
 	var accounts []*auth.Auth

@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"encoding/base64"
 	"math"
 	"sort"
 	"time"
@@ -69,7 +70,13 @@ func (p *Pool) ConfigureAdmission(c AdmissionConfig) {
 	}
 }
 
-func routeLeaseKey(r RouteRequest) string { return r.Tenant + "\x00" + r.Session + "\x00" + r.Prefix }
+// Route keys also become JSONB object keys in overlap mode. Encode each field
+// separately: PostgreSQL JSONB rejects NUL, and '.' is outside the raw URL-safe
+// base64 alphabet, preserving all three field boundaries without collisions.
+func routeLeaseKey(r RouteRequest) string {
+	encode := base64.RawURLEncoding.EncodeToString
+	return encode([]byte(r.Tenant)) + "." + encode([]byte(r.Session)) + "." + encode([]byte(r.Prefix))
+}
 
 func (p *Pool) RouteActivity(uid string) (active, hot int) {
 	p.mu.RLock()

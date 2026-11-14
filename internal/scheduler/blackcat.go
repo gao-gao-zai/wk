@@ -12,6 +12,10 @@ import (
 
 // RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过）。
 func (s *Scheduler) RunBlackcatNow() {
+	// Old saved schedules must not resurrect the retired, billable task.
+	if !upstream.IsCurrentGrowthTask("black_cat") {
+		return
+	}
 	if !upstream.InNightWindow(time.Now()) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 夜间窗口，跳过本轮")
 		return

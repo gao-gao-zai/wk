@@ -152,8 +152,8 @@ export default function AccountTransfer({ api, mode, uids = [], groups = [], gro
           {groupsError && <Alert type="warning" showIcon message={groupsError} />}
           {options.group_mode !== 'source' && <><label htmlFor="account-import-groups">目标分组</label><Select id="account-import-groups" mode="multiple" style={{ width: '100%' }} placeholder="至少选择一个目标分组" value={options.groups} disabled={busy} onChange={groups => changeOptions({ groups })} options={groups.map(group => ({ value: group.name, label: `${group.name} · ${group.region === 'cn' ? '中国区' : group.region === 'global' ? '海外版' : '所有区域'}` }))} /><Text type="secondary">目标分组必须存在且区域兼容，预览时会逐项校验。</Text></>}
           {singleAccount ? <><label htmlFor="account-import-nickname">自定义昵称（留空保留原昵称）</label><Input id="account-import-nickname" value={options.nickname} disabled={busy} placeholder="最多 128 个字符" showCount={{ formatter: ({ value }) => `${Array.from(value || '').length}/128` }} onChange={event => changeOptions({ nickname: event.target.value })} /></> : <Text type="secondary">{encrypted && accountCount === null ? '加密包预览确认只有一个账号后，可自定义昵称。' : '批量导入保留每个账号原昵称。'}</Text>}
-          <Checkbox checked={options.run_growth_tasks} disabled={busy} onChange={event => changeOptions({ run_growth_tasks: event.target.checked })}>导入后自动检查并完成未完成成长任务（默认关闭）</Checkbox>
-          {options.run_growth_tasks && <Alert type="warning" showIcon message="将产生真实上游任务请求及必要的短对话，可能消耗用量。" description="仅为本次确定成功新增的中国区账号排队；重复、失败、待核对及海外版账号不执行。新账号始终保持停用，任务失败不回滚成功导入。" />}
+          <Checkbox checked={options.run_growth_tasks} disabled={busy} onChange={event => changeOptions({ run_growth_tasks: event.target.checked })}>导入后检查并执行 3 项可自动成长任务（默认关闭）</Checkbox>
+          {options.run_growth_tasks && <Alert type="warning" showIcon message="将产生真实上游事件上报、接受任务、领养及领奖请求，不发送模型对话。" description="仅为本次确定成功新增的中国区账号排队；公众号订阅和分享技能需用户真实操作。重复、失败、待核对及海外版账号不执行。新账号始终保持停用，任务失败不回滚成功导入。" />}
           <Text type="secondary">缺少设备档案时将为新账号生成 Mac 设备档案；已有设备档案保持原值。更改导入参数后需重新预览。</Text>
           {optionError && <Alert type="error" showIcon message={optionError} />}
         </Space>}

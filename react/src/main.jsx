@@ -247,7 +247,6 @@ function Console() {
       keepalive: (config.keepalive_hours || []).join(','),
       travel: (config.travel_hours || []).join(','),
       activity: (config.activity_hours || []).join(','),
-      blackcat: (config.blackcat_hours || []).join(','),
     });
   }, [config, form]);
 
@@ -308,8 +307,7 @@ function Console() {
       // 新排程字段（可选填写）：空值不上送，保留 config.json 现值（增量补丁语义）。
       if (values.travel !== undefined && String(values.travel || '').trim()) nextConfig.travel_hours = parseHours(values.travel);
       if (values.activity !== undefined && String(values.activity || '').trim()) nextConfig.activity_hours = parseHours(values.activity);
-      if (values.blackcat !== undefined && String(values.blackcat || '').trim()) nextConfig.blackcat_hours = parseHours(values.blackcat);
-      for (const key of ['travel_hours', 'activity_hours', 'blackcat_hours']) {
+      for (const key of ['travel_hours', 'activity_hours']) {
         if (nextConfig[key] && (nextConfig[key].some(hour => !Number.isInteger(hour) || hour < 0 || hour > 23))) {
           message.error('小时必须在 0-23 之间');
           return;
@@ -616,7 +614,7 @@ function Console() {
     proxy: ['注册代理', '短信直登链路的出口代理（旧模块）：池内容量、冷却状态。'],
     reqproxy: ['请求代理', '实际请求账号的代理池：v2rayN 订阅与多协议节点导入、按规则筛选、账号与槽位绑定，全部在此管理。'],
     groups: ['分组与密钥', '账号分组与 API 密钥管理：分组密钥只能使用绑定分组的账号；管理员密钥不受限。'],
-    growth: ['成长任务', '猫猫旅行、连登兑换、抽奖与 17 项成长任务自动化：一键完成、批量执行、进度与领奖闭环。'],
+    growth: ['成长任务', '保留 5 项成长任务，其中 3 项支持自动化；同时管理猫猫旅行、连登兑换与抽奖。'],
     settings: ['管理设置', '配置签到与保活计划，手动触发签到和积分刷新。'],
   };
   const [pageTitle, pageDescription] = pageCopy[activeSection] || pageCopy.dashboard;
@@ -668,13 +666,12 @@ function Console() {
               <Form.Item name="travel" label="旅行小时"><Input placeholder="9,21" style={{ width: 90 }} /></Form.Item>
               <Form.Item name="activity" label="活跃上报小时"><Input placeholder="10" style={{ width: 70 }} /></Form.Item>
               <Form.Item name="keepalive" label="保活小时"><Input placeholder="22" style={{ width: 70 }} /></Form.Item>
-              <Form.Item name="blackcat" label="夜猫子小时"><Input placeholder="23" style={{ width: 70 }} /></Form.Item>
               <Button type="primary" htmlType="submit">保存</Button>
             </Form>
             <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
               定时任务按上面的整点触发（逗号分隔多个时点）；留空的项保持现有配置不变。
               需要立刻执行时可点右侧按钮（对全部启用中的账号生效）。
-              旅行 = 猫猫旅行巡检（领养/派出/领奖）；活跃上报 = 点亮连登 + 解锁领养前置；夜猫子 = 23:00–08:00 窗口对话补足。
+              旅行 = 猫猫旅行巡检（领养/派出/领奖）；活跃上报 = 点亮连登 + 解锁领养前置。夜猫子任务与排程已停用。
             </Paragraph>
             <Space wrap style={{ marginTop: 8 }}>
               <Button icon={<CheckCircleOutlined />} loading={checkinRunning} onClick={runCheckinAll}>立即签到（含连登兑换/抽奖）</Button>
@@ -687,7 +684,6 @@ function Console() {
                   ['travel_enabled', '猫猫旅行', '独立排程：无猫领养 / 空闲派出 / 到站领奖'],
                   ['activity_enabled', '活跃上报', '每日一条 chat_request_send 事件，点亮连登与任务解锁'],
                   ['keepalive_enabled', 'token 保活', '刷新全部账号 token，session 失效自动禁用'],
-                  ['blackcat_enabled', '夜猫子', '23:00–08:00 窗口内 glm-5.2 对话补足（black_cat 任务）'],
                   // autoenroll_growth_tasks 已搬到「自动加号」页（与加号主流程
                   // 同处一目了然），这里不再重复入口。
                 ].map(([key, label, desc]) => (

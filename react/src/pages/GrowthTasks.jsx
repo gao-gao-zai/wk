@@ -344,7 +344,7 @@ export default function GrowthTasks({ api, data, refresh }) {
           <Button size="small" icon={<GiftOutlined />} onClick={() => openTasks(record.uid)}>任务</Button>
           <Popconfirm
             title="一键完成全部可自动任务"
-            description="含 17 项任务动作（数条真实短对话），约 2-4 分钟；后台执行，可离开页面"
+            description="执行 3 项可自动任务，会发起真实上游事件上报、接受任务、领养及领奖请求；后台运行，不发送模型对话"
             onConfirm={() => runAutoAll(record.uid)}
           >
             <Button size="small" type="primary" icon={<RocketOutlined />}>一键完成</Button>
@@ -364,6 +364,7 @@ export default function GrowthTasks({ api, data, refresh }) {
             {taskStatusTag(task)}
           </Space>
           <Text type="secondary" ellipsis style={{ maxWidth: 260 }}>{task.task_desc || task.description || task.task_code}</Text>
+          {['wb_wechat_oa_subscribe_task', 'skill_share'].includes(task.task_code) && <Text type="secondary">需用户真实操作，完成后可采集进度并领奖</Text>}
         </Space>
       ),
     },
@@ -526,8 +527,8 @@ export default function GrowthTasks({ api, data, refresh }) {
     },
   ];
 
-  // 汇总进度：全池一次性任务的总完成度（已完成任务数 / 账号数×17）。
-  const ledgerTotalItems = ledger ? ledger.total_accounts * (ledger.accounts[0]?.total_count || 17) : 0;
+  // 汇总进度：保留的 5 项一次性成长任务，以后端返回的任务数为准。
+  const ledgerTotalItems = ledger ? ledger.total_accounts * (ledger.accounts[0]?.total_count || 5) : 0;
   const ledgerDoneItems = ledger
     ? ledger.accounts.reduce((sum, account) => sum + account.done_count, 0)
     : 0;
@@ -713,14 +714,18 @@ export default function GrowthTasks({ api, data, refresh }) {
           <Button icon={<ClockCircleOutlined />} loading={travelRunning} onClick={runTravel}>立即旅行巡检（全部账号）</Button>
           <Popconfirm
             title="对全部 CN 账号执行一键完成"
-            description="后台异步执行（可离开页面），页面顶部实时显示进度"
+            description="每号执行 3 项可自动任务，会发起真实上游事件上报、接受任务、领养及领奖请求；后台运行，不发送模型对话"
             onConfirm={runAllAccounts}
           >
             <Button type="primary" icon={<RocketOutlined />} disabled={running}>全部账号一键完成</Button>
           </Popconfirm>
           {running && <Text type="secondary">批跑进行中，结束后可再次发起</Text>}
-          <Text type="secondary">一键完成 ≈ +1950 积分 +78 能量 / 新账号；Expert_Philanthropy（真实捐款）无法自动完成</Text>
+          <Text type="secondary">保留 5 项成长任务，3 项支持自动化；奖励以当前上游任务为准。</Text>
         </Space>
+        <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
+          可自动执行：桌面端对话 1 次（RichMeow_Chat，事件链上报）、体验资料库（Library_read）、领取 Buddy（first_buddy）。
+          公众号订阅（wb_wechat_oa_subscribe_task）和分享技能（skill_share）需用户在官方客户端完成真实操作，仅展示进度与提供领奖。
+        </Paragraph>
       </Card>
 
       <Card
@@ -753,7 +758,7 @@ export default function GrowthTasks({ api, data, refresh }) {
             <CollectionLaunch api={api} initialResources={["tasks"]} uids={[drawerUid]} title="当前账号" onComplete={() => loadTasks(drawerUid)}>在线采集</CollectionLaunch>
             <Popconfirm
               title="一键完成全部可自动任务"
-              description="后台异步执行（可离开页面），页面顶部实时显示进度"
+              description="执行 3 项可自动任务，会发起真实上游事件上报、接受任务、领养及领奖请求；后台运行，不发送模型对话"
               onConfirm={() => runAutoAll(drawerUid)}
             >
               <Button type="primary" icon={<RocketOutlined />}>一键完成全部</Button>
@@ -774,8 +779,8 @@ export default function GrowthTasks({ api, data, refresh }) {
         )}
         <Paragraph type="secondary" style={{ marginTop: 16 }}>
           说明：任务计分为上游异步处理，「一键完成」执行后会等待计分落定并自动领奖；
-          全量任务在后台异步执行，关闭页面不影响；个别任务（如需真实捐款的
-          Expert_Philanthropy）无法自动完成。
+          3 项可自动任务在后台执行，关闭页面不影响。公众号订阅和分享技能需用户在官方客户端完成真实操作，
+          再通过在线采集更新进度；达标后可手动领奖。执行会发起真实上游事件上报、接受任务、领养及领奖请求，不发送模型对话。
         </Paragraph>
       </Drawer>
     </Space>

@@ -25,6 +25,9 @@ func InNightWindow(now time.Time) bool {
 // BlackcatNeed 查 black_cat 任务剩余差额（需要再完成几次对话）。
 // 任务不存在返回 0（无可做）；拉取失败返回错误。
 func (c *Client) BlackcatNeed(a *auth.Auth) (int64, error) {
+	if !IsCurrentGrowthTask("black_cat") {
+		return 0, nil
+	}
 	tasks, err := c.ListTasks(a)
 	if err != nil {
 		return 0, err
@@ -43,6 +46,9 @@ func (c *Client) BlackcatNeed(a *auth.Auth) (int64, error) {
 // RunNightChats 夜猫子：发 need 次 glm-5.2 真实对话（读干流）并上报事件链。
 // 返回成功次数。对话内容极短（1+1），消耗可忽略。
 func (c *Client) RunNightChats(a *auth.Auth, need int) (int64, error) {
+	if need > 0 && !IsCurrentGrowthTask("black_cat") {
+		return 0, ErrGrowthTaskUnavailable
+	}
 	var ok int64
 	for i := 0; i < need; i++ {
 		body, _ := json.Marshal(map[string]any{

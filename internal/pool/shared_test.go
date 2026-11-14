@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,116 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/coordination"
 )
+
+func TestSharedPoolJSONBRouteLeasesAcross41Accounts(t *testing.T) {
+	p1, p2, store, _ := sharedTestPools(t)
+	ctx := context.Background()
+	// Confirm the production failure mechanism without corrupting pool/runtime:
+	// encoding/json accepts a NUL key, but PostgreSQL JSONB rejects it as 22P05.
+	legacyKey := "tenant" + "\x00" + "session" + "\x00" + "prefix"
+	legacy, err := json.Marshal(map[string]any{"Routes": map[string]any{"A": map[string]any{legacyKey: sharedRoute{Active: 1}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = store.Update(ctx, "pool/legacy-nul-route-regression", func(json.RawMessage) (json.RawMessage, error) { return legacy, nil })
+	var pgError interface{ SQLState() string }
+	if !errors.As(err, &pgError) || pgError.SQLState() != "22P05" {
+		t.Fatalf("legacy NUL route key did not reproduce SQLSTATE 22P05: %v", err)
+	}
+
+	dir := t.TempDir()
+	accounts := make([]*auth.Auth, 0, 41)
+	for i := 0; i < 41; i++ {
+		uid := "A"
+		if i != 0 {
+			uid = fmt.Sprintf("offline-%02d", i)
+		}
+		path := filepath.Join(dir, "workbuddy-"+uid+".json")
+		raw, _ := json.Marshal(map[string]any{"uid": uid, "accessToken": "offline-test-only", "expiresAt": int64(9999999999)})
+		if err := os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		a, err := auth.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.FilePath = path
+		accounts = append(accounts, a)
+		p1.Add(a)
+		p1.SetCredits(uid, 1000)
+	}
+	if err := p2.AttachSharedAuths(accounts); err != nil {
+		t.Fatal(err)
+	}
+	p1.ConfigureAdmission(AdmissionConfig{Enabled: true, FairQueue: true, LeaseMin: time.Hour, LeaseMax: time.Hour})
+	for _, a := range accounts {
+		// Real routing supplies printable hex digests in these three fields.
+		first := RouteRequest{Tenant: fmt.Sprintf("%064x", 1), Session: fmt.Sprintf("%064x", 2), Prefix: fmt.Sprintf("%064x", 3)}
+		second := first
+		second.Session = fmt.Sprintf("%064x", 4)
+		_, oldLease, err := p1.AcquireShared("m", first, nil, nil, a.UID, true)
+		if err != nil || oldLease.ID == "" {
+			t.Fatalf("old acquire for %s: %v", a.UID, err)
+		}
+		_, newLease, err := p2.AcquireShared("m", second, nil, nil, a.UID, true)
+		if err != nil || newLease.ID == "" {
+			t.Fatalf("new acquire for %s: %v", a.UID, err)
+		}
+		state, ok := p1.Status(a.UID)
+		active, _ := p2.RouteActivity(a.UID)
+		if !ok || state.InFlight != 2 || active != 2 {
+			t.Fatalf("overlapping routes for %s: in_flight=%d active=%d", a.UID, state.InFlight, active)
+		}
+		if got, _, err := p1.AcquireShared("m", first, nil, nil, a.UID, true); err != nil || got != nil {
+			t.Fatalf("overlap capacity exceeded for %s: %v", a.UID, err)
+		}
+		p1.NoteRouteSuccess(a.UID, first, time.Second)
+		p2.NoteRouteSuccess(a.UID, second, time.Second)
+		if err := p2.ReleaseLease(oldLease); err == nil {
+			t.Fatal("candidate released the old owner's route lease")
+		}
+		if err := p1.ReleaseLease(oldLease); err != nil {
+			t.Fatal(err)
+		}
+		state, _ = p2.Status(a.UID)
+		active, _ = p1.RouteActivity(a.UID)
+		if state.InFlight != 1 || active != 1 {
+			t.Fatalf("old completion lost the new lease for %s: in_flight=%d active=%d", a.UID, state.InFlight, active)
+		}
+		if err := p2.ReleaseLease(newLease); err != nil {
+			t.Fatal(err)
+		}
+		state, _ = p1.Status(a.UID)
+		active, _ = p2.RouteActivity(a.UID)
+		if state.InFlight != 0 || active != 0 {
+			t.Fatalf("route lease leaked for %s: in_flight=%d active=%d", a.UID, state.InFlight, active)
+		}
+	}
+	for _, p := range []*Pool{p1, p2} {
+		if err := p.FlushWithError(); err != nil {
+			t.Fatal(err)
+		}
+		if len(p.List()) != 41 || p.SharedError() != nil {
+			t.Fatal("route traffic fenced or emptied the 41-account pool")
+		}
+	}
+	raw, err := store.View(ctx, "pool/runtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state sharedState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Accounts) != 41 || len(state.Leases) != 0 || strings.Contains(string(raw), `\u0000`) {
+		t.Fatal("persisted runtime lost accounts, retained requests or contains a NUL escape")
+	}
+	for _, a := range accounts {
+		if len(state.Routes[a.UID]) != 2 {
+			t.Fatalf("route session identities collided for %s", a.UID)
+		}
+	}
+}
 
 func sharedTestPools(t *testing.T) (*Pool, *Pool, *coordination.Store, func(string, bool)) {
 	t.Helper()

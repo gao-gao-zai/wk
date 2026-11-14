@@ -85,27 +85,12 @@ type growthAction struct {
 	run      func(h *Handler, a *auth.Auth) (string, error)
 }
 
-// growthActions 已实现的任务动作表（顺序即执行顺序：先解锁依赖项）。
-// first_buddy 依赖活跃上报解锁，故 chat_5/first_buddy 的执行都自带 report 步骤。
+// growthActions 仅注册当前仍返回、已有实现的三个任务；旧动作实现暂时留存。
+// first_buddy 自带必要的解锁上报，不接受或领取已移除的 chat_5。
 var growthActions = []growthAction{
-	{TaskCode: "chat_5", Desc: "上报 5 条对话活跃事件（自动补足差额）", run: runChat5},
 	{TaskCode: "first_buddy", Desc: "上报解锁 → 同意协议 → 领取第一只 Buddy（+300 分）", run: runFirstBuddy},
-	{TaskCode: "Model_chat_GLM5.2", Desc: "接受任务 → glm-5.2 真实对话一次 → 对齐模型上报", run: runModelChat},
 	{TaskCode: "RichMeow_Chat", Desc: "桌面指纹事件链上报（纯 API 可点亮）", run: runRichMeow},
-	{TaskCode: "Buddy_App", Desc: "上报「进入 Buddy 应用」事件链", run: runBuddyApp},
-	// Buddy_App_QQ 与 Buddy_App 共用事件链（判据应用即 QQ 助手）。
-	{TaskCode: "Buddy_App_QQ", Desc: "上报「进入企鹅教师助手」事件链", run: runBuddyApp},
-	{TaskCode: "automation_1", Desc: "上报「定时任务创建」事件", run: runAutomationCreate},
 	{TaskCode: "Library_read", Desc: "上报「读资料库介绍」事件", run: runLibraryRead},
-	{TaskCode: "template_5", Desc: "上报「使用模板创建任务」事件组 ×5", run: runTemplateUse},
-	{TaskCode: "playbook_prompt", Desc: "上报「灵感案例做同款发送 Prompt」事件组", run: runPlaybookPrompt},
-	{TaskCode: "create_canvas", Desc: "上报「设计创意画布创建」事件组（+300 分）", run: runCreateCanvas},
-	{TaskCode: "expert_5", Desc: "真实专家召唤+使用链 ×5（含真实短对话）", run: runExpertUse},
-	{TaskCode: "Expert_team_use_3", Desc: "真实专家团召唤+使用链 ×3（含真实短对话）", run: runExpertTeamUse},
-	{TaskCode: "Hp_Appearance", Desc: "设置主题 API + 皮肤生效事件", run: runAppearance},
-	{TaskCode: "skill_1", Desc: "真实对话 + skill_info 技能加载事件", run: runSkillFresh},
-	{TaskCode: "Expert_lighthouse", Desc: "真实轻量云专家召唤+使用链（chat 链带 has_expert）", run: runExpertLighthouse},
-	{TaskCode: "black_cat", Desc: "夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足", Attempt: true, run: runBlackCat},
 }
 
 // growthActionFor 查任务对应的动作；无则返回 nil（不可自动化）。
@@ -541,7 +526,14 @@ func (h *Handler) accountTasks(w http.ResponseWriter, r *http.Request) {
 	for _, act := range growthActions {
 		autoable[act.TaskCode] = true
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": tasks, "auto_actions": autoable, "snapshot": snapshot})
+	// Collection may still hold snapshots from before tasks were retired.
+	current := make([]upstream.Task, 0, len(tasks))
+	for _, task := range tasks {
+		if upstream.IsCurrentGrowthTask(task.TaskCode) {
+			current = append(current, task)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": current, "auto_actions": autoable, "snapshot": snapshot})
 }
 
 // growthTaskHTTP preserves synchronous management responses while all mutations
@@ -615,6 +607,12 @@ func (h *Handler) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "task_codes required"})
 		return
 	}
+	for _, code := range body.TaskCodes {
+		if !upstream.IsCurrentGrowthTask(code) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "任务已暂停或不在当前任务列表"})
+			return
+		}
+	}
 	h.growthTaskHTTP(w, r, a, "接受任务", func(scoped *auth.Auth) (int, map[string]any) {
 		if err := h.cfg.Upstream.AcceptTasks(scoped, body.TaskCodes); err != nil {
 			return http.StatusBadGateway, map[string]any{"error": "accept: " + err.Error()}
@@ -684,6 +682,10 @@ func (h *Handler) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.TaskCode == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "task_code required"})
+		return
+	}
+	if !upstream.IsCurrentGrowthTask(body.TaskCode) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "任务已暂停或不在当前任务列表"})
 		return
 	}
 	h.growthTaskHTTP(w, r, a, "领取任务奖励", func(scoped *auth.Auth) (int, map[string]any) {
@@ -876,6 +878,9 @@ func (h *Handler) growthTaskSkipReason(uid string, t *upstream.Task) string {
 }
 
 func (h *Handler) growthTaskSkipReasonAt(uid string, t *upstream.Task, now time.Time) string {
+	if !upstream.IsCurrentGrowthTask(t.TaskCode) {
+		return "任务已暂停或不在当前任务列表，跳过"
+	}
 	if t.Claimed {
 		return "该任务已领取过奖励"
 	}
@@ -911,7 +916,7 @@ func (h *Handler) growthTaskSkipReasonAt(uid string, t *upstream.Task, now time.
 	return ""
 }
 
-// accountTaskAutoAll 一键完成该账号全部可自动任务（17 项，依赖序 + 逐项自动领奖）。
+// accountTaskAutoAll 一键完成该账号当前可自动任务（依赖序 + 逐项自动领奖）。
 // 异步 job 化 + 入执行池：立即返回 202 + job_id，进度走 GET /admin/growth/jobs/{id} 轮询。
 // 与全池批跑共用同一队列（growthRunner）：同账号/连接IP互斥，按实时并发设置不同资源并发；
 // 已在队列/执行中返回409（前端提示等待）。

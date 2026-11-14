@@ -218,18 +218,18 @@ func TestWebsiteTransportFailureNeverReplaysWrite(t *testing.T) {
 	}
 }
 
-func TestWebsiteTaskPathsAndEscapedTaskID(t *testing.T) {
+func TestWebsiteCurrentTaskPaths(t *testing.T) {
 	c, f := newWebsiteFixture(t)
 	a := &auth.Auth{UID: "u", AccessToken: "fake-at", RefreshToken: "fake-rt"}
-	if err := c.AcceptTasks(a, []string{"task"}); err != nil {
+	if err := c.AcceptTasks(a, []string{"RichMeow_Chat"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := c.ClaimReward(a, "task/a b"); err != nil {
+	if _, _, err := c.ClaimReward(a, "RichMeow_Chat"); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.requests) != 2 || f.requests[0] != "POST /activity/growth/tasks/accept" || f.requests[1] != "POST /activity/growth/tasks/task%2Fa%20b/claim" {
+	if len(f.requests) != 2 || f.requests[0] != "POST /activity/growth/tasks/accept" || f.requests[1] != "POST /activity/growth/tasks/RichMeow_Chat/claim" {
 		t.Fatalf("paths=%v", f.requests)
 	}
 }

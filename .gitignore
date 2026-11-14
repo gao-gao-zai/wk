@@ -49,6 +49,14 @@ docs/
 !README.md
 !LICENSES/**
 
+# 经确认的项目部署约定与复盘；其他 docs/ 内容仍保持忽略。
+!/AGENTS.md
+!/docs/
+/docs/*
+!/docs/operations/
+/docs/operations/*
+!/docs/operations/2026-11-14-overlap-deployment.md
+
 # 本机会话探针/部署临时产物（DSH 工具与离线部署流程的中间文件）
 .dsh-probe/
 deploy-tmp/

@@ -10,6 +10,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/collection"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -37,8 +39,9 @@ type growthStub struct {
 	// report / desktop 事件计数。
 	reportCalls, desktopCalls int64
 	// claimCalls claim 调用次数。
-	claimCalls int64
-	// reportProgress 上报驱动进度：每次 /v2/report 让 chat_5 的 current +1
+	claimCalls  int64
+	acceptCalls int64
+	// reportProgress 上报驱动进度：每批 /v2/report 让 RichMeow_Chat 的 current +2
 	// （模拟服务端异步计分；false = 进度恒定）。
 	reportProgress bool
 	listCalls      int64
@@ -53,13 +56,13 @@ func (s *growthStub) handler() http.Handler {
 			atomic.AddInt64(&s.listCalls, 1)
 			fmt.Fprintf(w, `{"code":0,"data":{"tasks":%s}}`, s.tasks)
 		case "/v2/activity/growth/tasks/accept":
+			atomic.AddInt64(&s.acceptCalls, 1)
 			w.Write([]byte(`{"code":0,"data":{}}`))
 		case "/v2/report":
 			n := atomic.AddInt64(&s.reportCalls, 1)
-			// 上报驱动进度：3 已有 + N 次上报，第 2 次后达标（5/5）。
-			// 旧串是上一轮的值（3+n-1），避免替换目标已变导致 no-op。
+			// 一批桌面事件链让样例进度从 3/5 达标。
 			if s.reportProgress {
-				prev, cur := 3+int(n)-1, 3+int(n)
+				prev, cur := 3+2*(int(n)-1), 3+2*int(n)
 				if cur > 5 {
 					cur = 5
 				}
@@ -131,9 +134,9 @@ func fastGrowthActions(t *testing.T) {
 	})
 }
 
-// 標準任务列表：chat_5 未达标（3/5），first_buddy 已领取。
+// 標準任务列表：RichMeow_Chat 未达标（3/5），first_buddy 已领取。
 const growthTasksSample = `[
-  {"task_code":"chat_5","title":"发起 5 次对话","reward_credit":100,"target":5,"current":3,"accept_status":"accepted"},
+  {"task_code":"RichMeow_Chat","title":"发起 5 次对话","reward_credit":100,"target":5,"current":3,"accept_status":"accepted"},
   {"task_code":"first_buddy","title":"领养第一只猫","reward_credit":300,"target":1,"current":1,"accept_status":"claimed"},
   {"task_code":"Expert_Philanthropy","title":"爱心捐赠","reward_credit":100,"target":1,"current":0,"accept_status":"not_accepted"}
 ]`
@@ -156,10 +159,10 @@ func TestAccountTasksReturnsListAndAutoActions(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Tasks) != 3 {
-		t.Fatalf("tasks = %d, want 3", len(out.Tasks))
+	if len(out.Tasks) != 2 {
+		t.Fatalf("tasks = %d, want 2 (retired task filtered)", len(out.Tasks))
 	}
-	if !out.AutoActions["chat_5"] || !out.AutoActions["first_buddy"] {
+	if len(out.AutoActions) != 3 || !out.AutoActions["RichMeow_Chat"] || !out.AutoActions["first_buddy"] || !out.AutoActions["Library_read"] {
 		t.Fatalf("auto_actions missing growth codes: %v", out.AutoActions)
 	}
 	if out.AutoActions["Expert_Philanthropy"] {
@@ -169,22 +172,22 @@ func TestAccountTasksReturnsListAndAutoActions(t *testing.T) {
 
 func TestAccountTaskAutoRunsAndClaims(t *testing.T) {
 	fastGrowthActions(t)
-	// reportProgress：上报驱动计分，2 条上报后 5/5 达标 → 自动领奖。
+	// reportProgress：一批桌面事件链驱动计分达标 → 自动领奖。
 	stub := &growthStub{
 		tasks:          growthTasksSample,
 		reportProgress: true,
 		claimCredit:    100, claimEnergy: 5,
 	}
 	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "at"})
-	code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"chat_5"}`)
+	code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"RichMeow_Chat"}`)
 	if code != 200 {
 		t.Fatalf("status = %d, want 200, body=%v", code, out)
 	}
 	if out["claimed"] != true {
 		t.Fatalf("claimed = %v, want true (out=%v)", out["claimed"], out)
 	}
-	if stub.reportCalls != 2 { // 5 目标 - 3 已有 = 2 条上报
-		t.Fatalf("report calls = %d, want 2", stub.reportCalls)
+	if stub.reportCalls != 1 { // 一批桌面事件链使 stub 计分达标。
+		t.Fatalf("report calls = %d, want 1", stub.reportCalls)
 	}
 	if stub.claimCalls != 1 {
 		t.Fatalf("claim calls = %d, want 1", stub.claimCalls)
@@ -231,14 +234,14 @@ func TestAccountTaskAutoAllRunsDependencyOrder(t *testing.T) {
 		t.Fatalf("phase = %v, want done (snap=%v)", snap["phase"], snap)
 	}
 	results, _ := snap["results"].([]any)
-	// 报名 1 项 + chat_5 + first_buddy（Philanthropy 无动作）。
+	// 报名 1 项 + RichMeow_Chat + first_buddy（Philanthropy 无动作）。
 	if len(results) != 3 {
 		t.Fatalf("results = %d, want 3 (got %v)", len(results), results)
 	}
-	// 依赖序：accept → chat_5（first_buddy 已 claimed 排其后跳过）。
+	// 依赖序：accept → first_buddy（已 claimed 跳过）→ RichMeow_Chat。
 	first, _ := results[1].(map[string]any)
-	if first["task_code"] != "chat_5" {
-		t.Fatalf("first action should be chat_5 (dependency order), got %v", first["task_code"])
+	if first["task_code"] != "first_buddy" {
+		t.Fatalf("first action should be first_buddy (dependency order), got %v", first["task_code"])
 	}
 	// done/total 计数自洽。
 	if snap["done"].(float64) != 3 || snap["total"].(float64) != 3 {
@@ -357,7 +360,7 @@ func TestAllAccountsAutoAllJob(t *testing.T) {
 	if snap["done"].(float64) != 2 || snap["total"].(float64) != 2 {
 		t.Fatalf("done/total = %v/%v, want 2/2 (account granularity)", snap["done"], snap["total"])
 	}
-	// 每账号 2 项任务（chat_5 + first_buddy）× 2 账号 = 4（all 模式无报名条目）。
+	// 每账号 2 项任务（RichMeow_Chat + first_buddy）× 2 账号 = 4（all 模式无报名条目）。
 	results, _ := snap["results"].([]any)
 	if len(results) != 4 {
 		t.Fatalf("results = %d, want 4 (got %v)", len(results), results)
@@ -366,16 +369,16 @@ func TestAllAccountsAutoAllJob(t *testing.T) {
 
 func TestGrowthLedgerRecordsClaimsAndOverview(t *testing.T) {
 	fastGrowthActions(t)
-	// chat_5 上报后达标（claim +50 分）；first_buddy 上游已领（对账补全）。
+	// RichMeow_Chat 上报后达标（claim +50 分）；first_buddy 上游已领（对账补全）。
 	stub := &growthStub{tasks: growthTasksSample, claimCredit: 50, claimEnergy: 5, reportProgress: true}
 	h, _ := newGrowthHandler(t, stub,
 		&auth.Auth{UID: "u1", AccessToken: "at"},
 		&auth.Auth{UID: "u2", AccessToken: "at"}, // u2 不跑任何动作
 	)
-	// u1 跑单任务 chat_5：台账记 1 条（+50 分 +5 能）。
-	code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"chat_5"}`)
+	// u1 跑单任务 RichMeow_Chat：台账记 1 条（+50 分 +5 能）。
+	code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"RichMeow_Chat"}`)
 	if code != http.StatusOK || out["claimed"] != true {
-		t.Fatalf("auto chat_5: code=%d out=%v", code, out)
+		t.Fatalf("auto RichMeow_Chat: code=%d out=%v", code, out)
 	}
 	// 查台账总览（并发预取 + 合并对账）。
 	req := httptest.NewRequest(http.MethodGet, "/admin/growth/ledger", nil)
@@ -402,7 +405,7 @@ func TestGrowthLedgerRecordsClaimsAndOverview(t *testing.T) {
 	if ov.TotalAccounts != 2 || ov.PartialAccounts != 2 {
 		t.Fatalf("accounts = %d partial = %d, want 2/2 (stub 列表对两号都含 first_buddy claimed → 都 partial)", ov.TotalAccounts, ov.PartialAccounts)
 	}
-	// u1 = 2/17（chat_5 台账 + first_buddy 对账）；u2 = 1/17（仅对账）。
+	// u1 = 2/5（RichMeow_Chat 台账 + first_buddy 对账）；u2 = 1/5（仅对账）。
 	byUID := map[string]int{}
 	creditByUID := map[string]int64{}
 	for _, acc := range ov.Accounts {
@@ -412,7 +415,7 @@ func TestGrowthLedgerRecordsClaimsAndOverview(t *testing.T) {
 	if byUID["u1"] != 2 || byUID["u2"] != 1 {
 		t.Fatalf("done_count u1=%d u2=%d, want 2/1", byUID["u1"], byUID["u2"])
 	}
-	// 积分收益只有台账条目计入：u1 +50（chat_5），u2 0（first_buddy 无台账）。
+	// 积分收益只有台账条目计入：u1 +50（RichMeow_Chat），u2 0（first_buddy 无台账）。
 	if creditByUID["u1"] != 50 || creditByUID["u2"] != 0 {
 		t.Fatalf("credit u1=%d u2=%d, want 50/0", creditByUID["u1"], creditByUID["u2"])
 	}
@@ -443,7 +446,7 @@ func TestGrowthLedgerRecordsClaimsAndOverview(t *testing.T) {
 	if _, ok := h.ledgerReconCache.get(nil); ok {
 		t.Fatal("invalidate should drop cache")
 	}
-	// 落盘验证：文件含 u1 的 chat_5 条目（时间 + 分值）。
+	// 落盘验证：文件含 u1 的 RichMeow_Chat 条目（时间 + 分值）。
 	raw, err := os.ReadFile(h.growthLedger.path)
 	if err != nil {
 		t.Fatal(err)
@@ -466,7 +469,7 @@ func TestGrowthLedgerRecordsClaimsAndOverview(t *testing.T) {
 		t.Fatalf("ledger accounts = %+v", stored.Accounts)
 	}
 	cl := c0.Claims[0]
-	if cl.TaskCode != "chat_5" || cl.Credit != 50 || cl.At == "" {
+	if cl.TaskCode != "RichMeow_Chat" || cl.Credit != 50 || cl.At == "" {
 		t.Fatalf("ledger claims = %+v", c0.Claims)
 	}
 }
@@ -534,7 +537,7 @@ func TestGrowthJobMarkLifecycleAndResume(t *testing.T) {
 			t.Fatalf("resume job should only run pending u2, got %v", item["uid"])
 		}
 	}
-	if len(results) != 2 { // u2 的 chat_5 + first_buddy
+	if len(results) != 2 { // u2 的 RichMeow_Chat + first_buddy
 		t.Fatalf("resume results = %d, want 2", len(results))
 	}
 	if _, err := os.Stat(markPath); !os.IsNotExist(err) {
@@ -552,11 +555,11 @@ func TestAccountTaskAutoLocksPerAccount(t *testing.T) {
 	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "at"})
 	done := make(chan int, 2)
 	go func() {
-		code, _ := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"chat_5"}`)
+		code, _ := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"RichMeow_Chat"}`)
 		done <- code
 	}()
 	time.Sleep(10 * time.Millisecond) // 让第一个请求先拿锁
-	code, _ := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"chat_5"}`)
+	code, _ := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"RichMeow_Chat"}`)
 	if code != http.StatusConflict {
 		t.Fatalf("concurrent status = %d, want 409", code)
 	}
@@ -571,11 +574,11 @@ func TestGrowthEndpointsRejectGlobalAndMissing(t *testing.T) {
 		&auth.Auth{UID: "cn1", AccessToken: "at", Domain: "copilot.tencent.com"},
 		&auth.Auth{UID: "g1", AccessToken: "at", Domain: "www.workbuddy.ai"},
 	)
-	code, _ := growthPostAccount(t, h, "nobody", "/tasks/auto", `{"task_code":"chat_5"}`)
+	code, _ := growthPostAccount(t, h, "nobody", "/tasks/auto", `{"task_code":"RichMeow_Chat"}`)
 	if code != http.StatusNotFound {
 		t.Fatalf("missing account status = %d, want 404", code)
 	}
-	code, _ = growthPostAccount(t, h, "g1", "/tasks/auto", `{"task_code":"chat_5"}`)
+	code, _ = growthPostAccount(t, h, "g1", "/tasks/auto", `{"task_code":"RichMeow_Chat"}`)
 	if code != http.StatusBadRequest {
 		t.Fatalf("global account status = %d, want 400", code)
 	}
@@ -589,17 +592,184 @@ func TestAcceptAllSkipsAcceptedAndClaimed(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("status = %d, want 200", code)
 	}
-	// 只有 Philanthropy 是 not_accepted；chat_5 accepted、first_buddy claimed。
-	if n, _ := out["accepted"].(float64); n != 1 {
-		t.Fatalf("accepted = %v, want 1", out["accepted"])
+	// 唯一 not_accepted 的 Philanthropy 已移除，不能再接受。
+	if n, _ := out["accepted"].(float64); n != 0 {
+		t.Fatalf("accepted = %v, want 0", out["accepted"])
 	}
 }
 
 func TestClaimEndpointReportsAlreadyClaimed(t *testing.T) {
 	stub := &growthStub{tasks: growthTasksSample, claimCredit: 0, claimEnergy: 0}
 	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "at"})
-	code, out := growthPostAccount(t, h, "u1", "/tasks/claim", `{"task_code":"chat_5"}`)
+	code, out := growthPostAccount(t, h, "u1", "/tasks/claim", `{"task_code":"RichMeow_Chat"}`)
 	if code != 200 || out["already_claimed"] != true {
 		t.Fatalf("zero reward should map to already_claimed: code=%d out=%v", code, out)
+	}
+}
+
+func TestRetiredGrowthTasksRejectedBeforeQueueOrUpstream(t *testing.T) {
+	retired := []string{"chat_5", "Model_chat_GLM5.2", "Buddy_App", "Buddy_App_QQ", "automation_1", "template_5", "playbook_prompt", "create_canvas", "expert_5", "Expert_team_use_3", "Hp_Appearance", "skill_1", "Expert_lighthouse", "black_cat", "Expert_Philanthropy", "unknown"}
+	for _, code := range retired {
+		t.Run(code, func(t *testing.T) {
+			stub := &growthStub{tasks: growthTasksSample}
+			h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "fake"})
+			for _, tc := range []struct {
+				path, body string
+				status     int
+			}{
+				{"/tasks/accept", fmt.Sprintf(`{"task_codes":[%q]}`, code), http.StatusBadRequest},
+				{"/tasks/accept", fmt.Sprintf(`{"task_codes":["first_buddy",%q]}`, code), http.StatusBadRequest},
+				{"/tasks/claim", fmt.Sprintf(`{"task_code":%q}`, code), http.StatusBadRequest},
+				{"/tasks/auto", fmt.Sprintf(`{"task_code":%q}`, code), http.StatusNotImplemented},
+			} {
+				status, _ := growthPostAccount(t, h, "u1", tc.path, tc.body)
+				if status != tc.status {
+					t.Fatalf("%s status=%d want=%d", tc.path, status, tc.status)
+				}
+			}
+			if len(h.growthJobs.active()) != 0 || stub.listCalls != 0 || stub.reportCalls != 0 || stub.acceptCalls != 0 || stub.claimCalls != 0 {
+				t.Fatal("retired task queued work or reached upstream")
+			}
+		})
+	}
+}
+
+type growthSnapshotFixture struct{ records map[string][]byte }
+
+func (s growthSnapshotFixture) CollectionLoad() (map[string][]byte, error) {
+	return s.records, nil
+}
+func (s growthSnapshotFixture) CollectionSave(map[string][]byte, []string) error { return nil }
+
+func TestAccountTasksFiltersRetiredCollectionSnapshot(t *testing.T) {
+	stub := &growthStub{tasks: `[]`}
+	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "fake"})
+	tasks := []upstream.Task{{TaskCode: "chat_5"}, {TaskCode: "Expert_Philanthropy"}}
+	for _, code := range upstream.CurrentGrowthTaskCodes() {
+		tasks = append(tasks, upstream.Task{TaskCode: code})
+	}
+	data, _ := json.Marshal(tasks)
+	raw, _ := json.Marshal(collection.Snapshot{Target: collection.Target{UID: "u1", Resource: "tasks"}, Data: data})
+	m, err := collection.New(collection.Options{
+		Store:       growthSnapshotFixture{map[string][]byte{"snapshot/u1/tasks": raw}},
+		StartPaused: true,
+		Run: func(context.Context, collection.Target, collection.Snapshot) (json.RawMessage, error) {
+			t.Error("snapshot read started online collection")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	h.cfg.Collection = m
+	r := httptest.NewRequest(http.MethodGet, "/admin/account/u1/tasks", nil)
+	r.Header.Set("Authorization", "Bearer "+testAPIKey)
+	w := httptest.NewRecorder()
+	h.mux.ServeHTTP(w, r)
+	var result struct {
+		Tasks       []upstream.Task `json:"tasks"`
+		AutoActions map[string]bool `json:"auto_actions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || w.Code != 200 {
+		t.Fatalf("snapshot response: status=%d err=%v", w.Code, err)
+	}
+	if len(result.Tasks) != 5 || len(result.AutoActions) != 3 || stub.listCalls != 0 {
+		t.Fatalf("tasks=%v actions=%v calls=%d", result.Tasks, result.AutoActions, stub.listCalls)
+	}
+	for _, task := range result.Tasks {
+		if !upstream.IsCurrentGrowthTask(task.TaskCode) {
+			t.Fatalf("retired cached task displayed: %s", task.TaskCode)
+		}
+	}
+	for _, code := range []string{"wb_wechat_oa_subscribe_task", "skill_share"} {
+		if result.AutoActions[code] {
+			t.Fatalf("new task gained unverified automation: %s", code)
+		}
+	}
+}
+
+func TestFirstBuddyDoesNotAcceptOrClaimRetiredPrerequisite(t *testing.T) {
+	fastGrowthActions(t)
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/v2/report", "/activity/growth/buddy/agreement", "/activity/growth/buddy/first":
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+		default:
+			t.Errorf("unexpected prerequisite request %s", r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	h := &Handler{cfg: Config{Upstream: &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}}}
+	if _, err := runFirstBuddy(h, &auth.Auth{UID: "fixture", AccessToken: "fake"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 3 {
+		t.Fatalf("prerequisite requests=%v", paths)
+	}
+}
+
+func TestAcceptAllRestrictsOldUpstreamListToCurrentFiveTasks(t *testing.T) {
+	fastGrowthActions(t)
+	tasks := []upstream.Task{{TaskCode: "chat_5", AcceptStatus: "not_accepted"}, {TaskCode: "Expert_Philanthropy", AcceptStatus: "not_accepted"}}
+	for _, code := range upstream.CurrentGrowthTaskCodes() {
+		tasks = append(tasks, upstream.Task{TaskCode: code, AcceptStatus: "not_accepted"})
+	}
+	raw, _ := json.Marshal(tasks)
+	h, _ := newGrowthHandler(t, &growthStub{tasks: string(raw)}, &auth.Auth{UID: "u1", AccessToken: "fake"})
+	var accepted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/tasks") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"tasks": tasks}})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/accept") {
+			var body struct {
+				TaskCodes []string `json:"task_codes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			accepted = append(accepted, body.TaskCodes...)
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+			return
+		}
+		t.Errorf("unexpected request %s", r.URL.Path)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(srv.Close)
+	h.cfg.Upstream.ChatBaseCN = srv.URL
+	status, out := growthPostAccount(t, h, "u1", "/tasks/accept_all", `{}`)
+	if status != http.StatusOK || out["accepted"] != float64(5) || len(accepted) != 5 {
+		t.Fatalf("status=%d result=%v accepted=%v", status, out, accepted)
+	}
+	for _, code := range accepted {
+		if !upstream.IsCurrentGrowthTask(code) {
+			t.Fatalf("retired task accepted: %s", code)
+		}
+	}
+}
+
+func TestNewCurrentTasksAllowManualActionsWithoutAutomation(t *testing.T) {
+	for _, code := range []string{"wb_wechat_oa_subscribe_task", "skill_share"} {
+		t.Run(code, func(t *testing.T) {
+			stub := &growthStub{tasks: `[]`}
+			h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "fake"})
+			status, _ := growthPostAccount(t, h, "u1", "/tasks/accept", fmt.Sprintf(`{"task_codes":[%q]}`, code))
+			if status != http.StatusOK {
+				t.Fatalf("manual accept status=%d", status)
+			}
+			status, _ = growthPostAccount(t, h, "u1", "/tasks/claim", fmt.Sprintf(`{"task_code":%q}`, code))
+			if status != http.StatusOK {
+				t.Fatalf("manual claim status=%d", status)
+			}
+			status, _ = growthPostAccount(t, h, "u1", "/tasks/auto", fmt.Sprintf(`{"task_code":%q}`, code))
+			if status != http.StatusNotImplemented || stub.acceptCalls != 1 || stub.claimCalls != 1 || stub.reportCalls != 0 {
+				t.Fatalf("new task gained automation: status=%d calls=%d/%d/%d", status, stub.acceptCalls, stub.claimCalls, stub.reportCalls)
+			}
+		})
 	}
 }

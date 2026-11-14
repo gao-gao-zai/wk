@@ -228,22 +228,18 @@ func (m *Manager) count(j *Job) {
 		}
 	}
 }
-func (m *Manager) Submit(req Request) (Job, error) {
-	done, admitted := lifecycle.Default.Enter()
-	if !admitted {
-		return Job{}, fmt.Errorf("服务正在排空")
-	}
-	defer done()
-	m.mu.Lock()
-	defer m.mu.Unlock()
+
+// submitReadyLocked checks admission against the current queue and lifecycle.
+// Callers must hold m.mu, including after any external account callbacks.
+func (m *Manager) submitReadyLocked() error {
 	if m.closed {
-		return Job{}, fmt.Errorf("采集器已停止")
+		return fmt.Errorf("采集器已停止")
 	}
 	if !m.active {
-		return Job{}, fmt.Errorf("采集后台尚未接管")
+		return fmt.Errorf("采集后台尚未接管")
 	}
 	if len(m.works) > 10000 {
-		return Job{}, fmt.Errorf("采集队列已满")
+		return fmt.Errorf("采集队列已满")
 	}
 	active := 0
 	for _, j := range m.jobs {
@@ -252,8 +248,25 @@ func (m *Manager) Submit(req Request) (Job, error) {
 		}
 	}
 	if active >= 20 {
-		return Job{}, fmt.Errorf("最多允许 20 个进行中的采集任务")
+		return fmt.Errorf("最多允许 20 个进行中的采集任务")
 	}
+	return nil
+}
+
+func (m *Manager) Submit(req Request) (Job, error) {
+	done, admitted := lifecycle.Default.Enter()
+	if !admitted {
+		return Job{}, fmt.Errorf("服务正在排空")
+	}
+	defer done()
+	m.mu.Lock()
+	err := m.submitReadyLocked()
+	m.mu.Unlock()
+	if err != nil {
+		return Job{}, err
+	}
+	// Account callbacks can acquire the shared PostgreSQL pool lock. Keep them
+	// outside m.mu so snapshot readers, cancellation and shutdown can proceed.
 	if req.Source == "" {
 		req.Source = "manual"
 	}
@@ -288,6 +301,21 @@ func (m *Manager) Submit(req Request) (Job, error) {
 			seen[t.key()] = true
 		}
 	}
+	eligible := map[string]bool{}
+	if m.opt.Eligible != nil {
+		for _, t := range unique {
+			if _, checked := eligible[t.UID]; !checked {
+				eligible[t.UID] = m.opt.Eligible(t.UID, req.IncludeDisabled)
+			}
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Preparation is not a reservation: another submit, cancellation or Close
+	// may have changed the queue while callbacks were running.
+	if err := m.submitReadyLocked(); err != nil {
+		return Job{}, err
+	}
 	additional := 0
 	for _, t := range unique {
 		w := m.works[t.key()]
@@ -307,7 +335,7 @@ func (m *Manager) Submit(req Request) (Job, error) {
 	for _, t := range unique {
 		i := &Item{Target: t, Status: "queued"}
 		j.Items = append(j.Items, i)
-		if m.opt.Eligible != nil && !m.opt.Eligible(t.UID, req.IncludeDisabled) {
+		if m.opt.Eligible != nil && !eligible[t.UID] {
 			i.Status = "skipped"
 			i.Error = "账号不存在、已禁用或不适用"
 			i.FinishedAt = time.Now().Unix()

@@ -1,251 +1,113 @@
 # 构建、部署与运维手册
 
-> **2026-11-01 AGPL 迁移更新：下文旧的容器内编译、临时 rootfs 打包和不带源码的发布示例已经过时，不用于新发行版。** 编译和测试只在 SSH `tdog` 宿主机执行。加载 `/srv/build-server/env/workbuddy2api.sh` 后运行 `bash scripts/build-release.sh /srv/build-server/artifacts/workbuddy2api/<run-id>`，以输出目录作为 Docker 构建上下文。Dockerfile 只复制预编译产物。
+> **2026-11-14 生效：dogyun 已完成首次迁移，常规业务升级统一使用 overlap。** 先让候选接新推理请求，再让旧 HTTP/SSE 自然结束，最后交接管理与后台。不能再先 hold 推理入口、等旧请求或整个后台批次排空后才切流。
 >
-> 发布和升级必须将同次构建的 `source.tar.gz`、`LICENSE`、`NOTICE`、`LICENSES/` 与二进制一起安装，源码归档位于可执行文件旁。反向代理须放行 `/legal` 和 `/legal/*` 给 API 及网页用户。发布前验证 `/legal/source` 返回归档且与发行校验和一致。归档包含 React/Go 源码、锁文件、Go vendor 和构建脚本，不含账号与运行配置。详细说明见 README 的 License 部分。
+> 项目执行约定见 [AGENTS.md](AGENTS.md)，本次故障与恢复证据见 [运维复盘](docs/operations/2026-11-14-overlap-deployment.md)。旧的 `007`、本机/容器内编译、停旧再开新、直接启动旧 serial 回滚等示例已撤下。首次迁移不属于后续常规发布步骤。
 
-面向**开发者**的构建与部署流程。面向使用者的快速启动（docker compose）见 [README.md](README.md)。
+## 1. 当前生产定位
 
-本文的部署目标是一个**通用的 Linux 服务器**（下文以 `srv` 代指，SSH 别名；实际示例中的 `007` 即此角色）。
-要求：root 或 sudo 权限、Docker 已安装、服务器与本机之间 SSH 免密可通。
+以下是 2026-11-14 验收快照；每次发布先读线上指针、私有控制状态及字段白名单，不能盲用历史 release/镜像/端口。
 
----
+| 对象 | 当前定位 |
+| --- | --- |
+| 构建/测试 | 本项目 `.build-test.json` 指定 SSH **`tyy2`** |
+| 生产 / 公网 | SSH **`dogyun`** / `https://wb.gaozaiya.cc` |
+| 发布指针 | `/opt/wk/current-release.json`、`/etc/wb2api-upgrade/current.json` |
+| 活动业务 | `wk-release-growth-current-routefix-20261114`，回环端口 `7864` |
+| 稳定 ingress | `wk-upgrade-ingress`；发布端口 `7863`，socat 转发到共享网络命名空间的 `127.0.0.1:7866` |
+| 稳定 gateway | `wk-handoff-gateway-overlap-20261114`，带 `-overlap`；控制 socket `/run/wb2api-upgrade/gateway-overlap.sock` |
+| gateway 状态文件 | 宿主 `/opt/wb2api-upgrade/gateway-overlap.state` |
+| 业务控制 socket | 宿主 `/run/wb2api-upgrade/<release>.sock`；容器 `/upgrade-run/<release>.sock` |
+| writer 锁 | 宿主 `/run/wb2api-upgrade/writer.lock`；容器 `/upgrade-run/writer.lock` |
+| 当前协调目录 | 宿主 `/opt/wk/data/upgrade-members-routefix-20261114`；容器 `/app/data/upgrade-members-routefix-20261114` |
+| 当前协调域 | `70d230270258628b270a340fd32b5aa7` |
+| 持久挂载 | `/opt/wk/config.json → /app/config.json`、`/opt/wk/auths → /app/auths`、`/opt/wk/data → /app/data`、`/run/wb2api-upgrade → /upgrade-run` |
+| 代理文件 | 保留 `/app/proxies.txt` 与 `/opt/wk/proxies.txt` 两个已有只读挂载 |
+| 监督单元 | `wb2api-current.service`、`wb2api-handoff.service`、`wb2api-ingress.service` |
 
-## 0. 前置条件（本机）
+业务和 gateway 与 ingress 共用网络命名空间。控制器检查候选的回环 HTTP 时也必须进入这个命名空间；不要把宿主的 `127.0.0.1:7864` 当作同一个监听。保留当前 `new-api-net`、network aliases 和实际挂载，不重新发明拓扑。
 
-| 工具 | 用途 | 检查 |
-|---|---|---|
-| Go ≥ 1.23 | 交叉编译 Linux 二进制 | `go version` |
-| Node 22 + pnpm | 构建控制台（react/） | `pnpm --version` |
-| Docker Desktop（或同类） | 打镜像 | `docker version` |
-| OpenSSH + 免密密钥 | 推送与远程操作 | `ssh srv 'echo ok'` |
+旧容器与镜像保留，但 Docker restart policy 为 `no`；systemd 只监督当前业务版本，`Restart=on-failure`。正常业务发布不重建/重启稳定 ingress、gateway 或 PostgreSQL；尤其不能随意 stop/restart 被当前业务单元依赖的 handoff 单元。
 
-SSH 免密示例（`~/.ssh/config`）：
+## 2. 发布前核对、构建与备份
 
-```
-Host 007
-    HostName <服务器 IP>
-    Port <端口>
-    User root
-    IdentityFile ~/.ssh/id_ed25519
-```
-
-> 下文 `ssh`/`scp` 命令里的 `007` 都指这个别名；部署到其它服务器时替换成你的别名即可。
-
----
-
-## 1. 构建
-
-### 1a. 标准 Docker 构建（网络正常时）
+1. 核对当前业务和 gateway 的 `mode=overlap`、协议 1、release 一致、无 held/transition/recovery_required；当前业务 ready 且为唯一后台 owner。检查当前 coordination domain 和配置中的协调目录。条件不成立就保留当前入口，报告具体原因，不能自动降级 serial。
+2. 从实际运行实例复制必要配置、环境、全部挂载、UID、网络及资源限制。候选独立 release、端口和 control socket，但使用**完全相同的 writer 锁、协调目录、域、配置/凭据/数据/数据库和 session salt**。日常升级不创建新 domain，不执行 reference 重绑定。
+3. 在 `tyy2` 隔离源码目录纳入此次实际要发布的未提交及未跟踪源码；保留 revision、dirty、逐文件 SHA256。先检查 SSH 与数据盘，再 source 项目 env。旧资料写 `tdog` 时以本项目配置为准。
 
 ```bash
-docker build -t workbuddy2api:latest .
+# 连接预检；不在本机或生产机编译
+ssh -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=yes tyy2 true
+
+# 以下在 tyy2 隔离任务中执行
+/usr/local/bin/build-storage-check
+source /srv/build-server/env/workbuddy2api.sh
 ```
 
-`Dockerfile` 是三阶段构建：node 构建 react → golang 编译 → alpine 运行时。
-需要拉取 `node:22-alpine`、`golang:1.23-alpine`、`alpine:3.20` 基础镜像，
-**本机连不上 docker.io 时用 1b**。
+4. 使用当前宿主机构建脚本/经核对的发布任务生成 binary、前端、完整 `source.tar.gz`、LICENSE、NOTICE、LICENSES。Docker 只复制宿主机产物。前端构建的 `--emptyOutDir` 会清空旧资源：应在源码归档及 Go 编译之前合入上一版仍会被旧页面引用的带 hash 资源，不能只保留新 index。归档与实际 binary 必须来自同一最终源码快照，排除生产配置、凭据和业务数据。
+5. 按变更运行 Go 回归，真实临时 PG 的 pool/coordination、必要 race，以及 `test-upgrade-controller.py`、`test-seamless-upgrade.py`、`test-overlap-server.py`。涉及共享 pool/采集/启动路径时，加 41 级别假账号、ready 后**立即** 4 路 SSE + health/status、真实 PG Routes/Leases/释放及至少 180 秒覆盖；不先预热 `/status`，不延长原超时掩盖问题。测试 DSN 仅指向本机临时库。
+6. 校验完整产物和传输 SHA256，记录字节数、构建主机和不可变 image ID。`dogyun` 使用 `scp -O`；Windows 不用文本管道传二进制。增量包只能在断言 base image ID 后 COPY 新 binary、配套 source 和许可文件；不现场编译，不顺带替换未变 gateway。
+7. 写入生产前在线备份 PG、必要 SQLite、config/auths/data、入口/容器/systemd/发布元数据。备份加密，验证可解密及格式可读；密钥使用既有受控机制，不写明文。记录当次账号集合摘要、凭据文档可读性/数量、关键状态及当前权威域；41 是本次历史值，下次应从线上取得基线。
 
-### 1b. 离线构建（docker.io 不可达时的 rootfs 导出方案）
+只输出脱敏字段，不打印完整配置、环境、DSN、认证头、私钥或生产日志。认证在执行进程内从现有配置/凭据机制注入。普通验收使用只读状态与缓存快照，真实上游生成/登录测试须有相应授权。
 
-思路：从**服务器上已有的旧镜像**导出 rootfs 当基础层，`FROM scratch` 叠加，
-再 COPY 本机交叉编译的二进制和前端产物——全程不需要访问 docker.io。
+## 3. 候选准备与常规 overlap 切换
 
-前置：服务器上已有旧版本镜像（首次部署走 1a 或让服务器自行 `docker pull alpine:3.20` 后 `docker save` 拉回来）。
+先创建停止状态的候选，以及独立的只读 `-preflight` 容器。预检容器与候选使用相同环境、镜像及挂载位置；预检不代表候选已经可以接流。候选必须使用：
 
-```powershell
-# Windows PowerShell，工作目录 = 仓库根
-
-# 1) 交叉编译 Linux 二进制
-$env:CGO_ENABLED='0'; $env:GOOS='linux'; $env:GOARCH='amd64'
-go build -trimpath -ldflags='-s -w' -o .build-out\wb2api .\cmd\server
-go build -trimpath -ldflags='-s -w' -o .build-out\login .\cmd\login
-
-# 2) 构建前端（产物在 react/dist）
-cd react
-.\node_modules\.bin\vite.CMD build
-cd ..
-# 同步到 Go 服务引用的 frontend/ 目录
-Remove-Item frontend\assets\* -Force
-Copy-Item react\dist\assets\* frontend\assets\ -Force
-Copy-Item react\dist\index.html frontend\index.html -Force
-
-# 3) 从服务器旧镜像导 rootfs
-ssh 007 'docker create --name wk-rootfs-tmp wk:linux-amd64 true'
-ssh 007 'docker export wk-rootfs-tmp -o /tmp/wk-rootfs.tar && docker rm wk-rootfs-tmp'
-scp 007:/tmp/wk-rootfs.tar .\wk-rootfs.tar
-ssh 007 'rm -f /tmp/wk-rootfs.tar'
-
-# 4) 拼镜像（Dockerfile.tmpbuild 内容见下方）
-docker build -f Dockerfile.tmpbuild --tag workbuddy2api:latest .
-Remove-Item .\wk-rootfs.tar, .\Dockerfile.tmpbuild -Force
-
-# 5) 导出 tar 待推送
-docker save workbuddy2api:latest -o .build-out\workbuddy2api-new.tar
+```text
+-upgrade-mode overlap -coordination-dir /app/data/upgrade-members-routefix-20261114
+-state-lock /upgrade-run/writer.lock -release <new-release> -control /upgrade-run/<new-release>.sock
 ```
 
-`Dockerfile.tmpbuild` 内容（脚本生成，也手写同效）：
+上述目录为当前生产值，创建候选前需与当前实例核对一致。候选启动后由现有 owner 约束为 standby，不得提前争抢后台。
 
-```dockerfile
-FROM scratch
-ADD wk-rootfs.tar /
-USER root
-RUN rm -f /app/config.json && chown -R app:app /app
-USER app
-WORKDIR /app
-COPY .build-out/wb2api /app/wb2api
-COPY .build-out/login /app/login
-COPY frontend /app/frontend
-ENV WB2A_LISTEN=:7863
-EXPOSE 7863
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
-ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]
-```
+每次准备独立发布 wrapper，在 `/run/wb2api-upgrade/deployment.lock` 下覆盖预检、交接、失败处理及指针/监督器提交；监控用**独立 systemd 单元**，有结束条件和运行时限。辅助进程继承守卫，超时要终止并等待整个辅助进程组，防止孤儿继续执行；监控不能随部署单元失败而退出。
 
-> `RUN rm -f /app/config.json`：rootfs 来自旧容器镜像，里面可能残留上一版
-> 打进去的配置文件；运行时配置以挂载卷为准，镜像里不能带。
-
-### 1c. 前端构建的坑
-
-- **不要用 `pnpm --dir react build`**：pnpm 的 supply-chain 检查会拦 esbuild
-  的 postinstall（`ERR_PNPM_IGNORED_BUILDS`）。直接跑 vite 即可：
-  `react\node_modules\.bin\vite.CMD build`（Linux/macOS 为 `./node_modules/.bin/vite build`）。
-- esbuild 平台二进制在 `react/node_modules/@esbuild/win32-x64/`，即使
-  `esbuild/esbuild.exe` 缺失（postinstall 没跑）vite 也能正常工作。
-- 构建产物 `index-<hash>.js` 的 hash 变了就要同步 `frontend/`（Go 服务的
-  静态资源目录），否则镜像里还是旧前端。
-
-### 1d. 依赖更新
-
-```powershell
-cd react
-pnpm install            # 需要 approve-builds 时按提示处理
-```
-
-Go 侧正常 `go mod tidy`。
-
----
-
-## 2. 部署到 Linux 服务器
-
-### 2a. 服务器侧目录约定（首次部署准备）
+以下命令是 wrapper 内的控制器调用结构；变量来自该次已核实的容器/指针及独立 journal，不包含秘密：
 
 ```bash
-# 服务器上执行一次
-mkdir -p /opt/wk
-# 配置（属主与容器内 UID 一致，10001 是 Dockerfile 里 adduser 的值）
-# 首次可从仓库 config.example.json 复制后编辑，api_key 必须是强随机值
-chown -R 10001:10001 /opt/wk
-
-# 需要的挂载内容：
-#   /opt/wk/config.json     主配置
-#   /opt/wk/auths/          账号授权文件目录
-#   /opt/wk/data/           运行数据（state.json / metrics.db / 分组存储等）
-#   /opt/wk/proxies.txt     短信直登代理列表（可选）
+# CLI 为兼容首次迁移仍默认 serial，必须显式传 --mode overlap。
+INGRESS_PID=$(docker inspect --format '{{.State.Pid}}' wk-upgrade-ingress)
+nsenter -t "$INGRESS_PID" -n python3 "$CONTROLLER" --mode overlap \
+  --old-container "$OLD_CONTAINER" --new-container "$NEW_CONTAINER" \
+  --check-container "$PREFLIGHT_CONTAINER" \
+  --old-release "$OLD_RELEASE" --new-release "$NEW_RELEASE" \
+  --old-control "$OLD_CONTROL" --new-control "$NEW_CONTROL" \
+  --gateway-control /run/wb2api-upgrade/gateway-overlap.sock \
+  --new-target "$NEW_LOOPBACK_ORIGIN" \
+  --drain-seconds "$DRAIN_SECONDS" --start-seconds "$START_SECONDS" \
+  --journal "$NEW_JOURNAL"
 ```
 
-### 2b. 推送与替换容器
+`CONTROLLER` 使用此次审阅过的 `scripts/seamless-upgrade.py`，不是历史 `switch_service.py`、`switch_retry.py` 或 `seamless-upgrade-rebind.py`。旧 journal 存在时必须先调查已提交阶段，不能删除后重跑。
 
-```bash
-# 本机：推镜像
-scp .build-out/workbuddy2api-new.tar 007:/tmp/workbuddy2api-new.tar
+控制器顺序为：
 
-# 服务器：加载并替换（保留旧容器名便于回滚）
-ssh 007 'bash -s' <<'EOF'
-set -e
-docker load -i /tmp/workbuddy2api-new.tar
-rm -f /tmp/workbuddy2api-new.tar
-docker tag workbuddy2api:latest wk:linux-amd64
-docker rename wk-linux-amd64 wk-linux-amd64-prev      # 旧容器改名保留
-docker stop -t 30 wk-linux-amd64-prev
-docker rm wk-linux-amd64-prev                          # 确认新版本正常后再删
-docker run -d --name wk-linux-amd64 \
-  --restart unless-stopped \
-  -e TZ=Asia/Shanghai \
-  -p 127.0.0.1:7863:7863 \
-  -v /opt/wk/proxies.txt:/opt/wk/proxies.txt:ro \
-  -v /opt/wk/auths:/app/auths \
-  -v /opt/wk/data:/app/data \
-  -v /opt/wk/config.json:/app/config.json \
-  wk:linux-amd64
-sleep 4
-# 若有 docker 网络别名（供同宿主机其它容器用域名访问，如 new-api 网关）：
-docker network connect --alias wk new-api-net wk-linux-amd64 || true
-EOF
-```
+1. 核对镜像、挂载、同 writer/协调目录及重启策略，运行只读预检。
+2. 启动候选 standby；校验 release、ready、`mode=overlap`、协议、**与旧版本相同的域**、候选尚非后台 owner，并实际检查候选回环 `/readyz`。
+3. 暂停旧后台新增工作，立即 `/switch-live` 把后续推理交给候选。**不先等旧请求或已接收的后台工作归零，不 hold 新推理。**
+4. 旧版本继续完成已准入 HTTP/SSE 与已接收后台工作。管理读取仍在旧 owner；重叠期间管理写入受保护。
+5. 旧推理/后台结束后，仅短暂 hold 管理入口，正常 stop 旧版本并确认真实退出；候选接管管理/后台，核对同域、owner、ready，再切管理并退役旧路由。
+6. 原子更新 `/etc/wb2api-upgrade/current.json`、活动 systemd 单元与发布指针，只监督新业务版本；旧容器保持 restart=no。记录 coordination directory/domain 与下次 `upgrade_mode=overlap`。
 
-要点：
-- `-p 127.0.0.1:7863:7863` 只绑回环，外部访问走反代或 docker 网络，**不要**直接暴露公网。
-- `-v /opt/wk/data:/app/data` 是**必须**：state.json、metrics.db、分组/密钥存储都在里面，不挂载重启即丢。
-- `TZ=Asia/Shanghai` 影响签到时刻（次日 04:00 硬冷却等）与日志时间戳。
+排空是**切新请求之后**的旧实例退役条件，不是升级开始前的全站等待。无限长流不能靠强杀来完成发布；超预算按控制器回执撤销或进入人工调查，不能回到“serial 等旧流”的套路。
 
-### 2c. 验证
+当前 gateway wait=90 秒。脚本要求管理预算至少 `drain-seconds + 2 × start-seconds + 15`；例如 30/20/90 满足条件，但不是所有流时长都适用。根据实际流时长制定预算；扩大预算也需保持稳定入口，不能临场重启 gateway 打断流。只读检查和有限等待不保证所有客户端链路零超时。
 
-```bash
-# 容器健康（健康检查内建，Up x minutes (healthy)）
-ssh 007 'docker ps --filter name=wk-linux-amd64 --format "{{.ID}} {{.Status}}"'
+## 4. 验收、失败与恢复边界
 
-# 服务健康：期望 {"healthy":N,"total":N}
-ssh 007 'curl -s http://127.0.0.1:7863/healthz'
+- 持续采样本机入口与公网的 `/healthz`、`/readyz`，先记录 HTTP 状态再解析；记录 release、耗时和脱敏网络错误。用私有控制 socket 确认 gateway/业务同域、同 release、唯一后台 owner、无 transition/recovery_required。
+- 比对当次账号集合、凭据文档数量/可读性和关键状态延续；核对 PG 未被替换、恢复或重启，原持久记录保留。检查新域中真实 Routes/Leases 及正确释放。已有请求自然完成，不能仅用“新健康接口 200”证明流未中断。
+- 连续观察至少 300 秒，覆盖启动及后续定时周期；核对前端 index 和当前/上一版静态资源、配套 `/legal/source` SHA256、鉴权、缓存任务快照、三监督单元与重启策略。结束临时监控，保存实际失败样本、发布清单与回执；不能把已知错误省略成零中断。
+- `aborted_old_serving`：确认实际已回到旧 overlap、候选工作收尾后，以新 journal 重试。不要假定所有失败都能自动恢复。
+- `recovery_required`、切流/stop 回执不明、计数未知：先读控制状态、容器 State 和阶段证据，保护已知入口；不盲目重复启动/停止，不重放用户请求，不清零活动数，不强杀长流或恢复整库。
+- 新共享域一旦 bootstrap，后台可能在 ready 前已经写入；共享 flush 不导回 legacy serial 存储。**禁止直接启动旧 serial，或切回串行运行前的过期共享域。** 兼容回滚使用当前域的 overlap 协议；不兼容 schema/协议另行处理，保留当前数据。
+- 状态页显示零账号时先判断共享池是否 fence，核对 PG 与凭据文件；不能据此清空池、覆盖配置、换域或导入备份。
+- 保留旧镜像/容器和加密备份，但“旧容器存在”不是安全回滚证明。包含旧 NUL 路由实现的业务 binary 不可作为 overlap 回滚版本。
 
-# 若接了 docker 网络别名，从网关容器验证：
-ssh 007 'docker exec new-api wget -qO- --timeout=5 http://wk:7863/healthz'
+## 5. 提交与日常运维
 
-# 前端版本：返回的 HTML 里 bundle hash 应等于本次构建的 index-<hash>.js
-ssh 007 'curl -s http://127.0.0.1:7863/ | grep -o "index-[A-Za-z0-9_-]*\.js"'
+提交仅在用户明确要求时进行，默认不 push；保留其他未提交修改。文档更新不触发编译或部署。构建主机选择、授权范围和密钥边界依项目及工作区约定。
 
-# 业务闭环：发一个真实请求，看请求日志的 credits 与 credit_source
-KEY=$(ssh 007 'grep -o "\"api_key\"[^,]*" /opt/wk/config.json | cut -d\" -f4')
-ssh 007 "curl -s -X POST http://127.0.0.1:7863/v1/chat/completions \
-  -H 'Authorization: Bearer $KEY' -H 'Content-Type: application/json' \
-  -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":10}'"
-```
-
-### 2d. 回滚
-
-替换脚本在 `docker rm wk-linux-amd64-prev` **之前**都保留了旧容器；
-新版本有问题时：
-
-```bash
-ssh 007 'docker stop wk-linux-amd64 && docker rm wk-linux-amd64 && \
-  docker rename wk-linux-amd64-prev wk-linux-amd64 && docker start wk-linux-amd64'
-```
-
-若旧容器已删但旧镜像 tag 还在：`docker tag <旧imageID> wk:linux-amd64` 后重跑 2b 的 run。
-
----
-
-## 3. 测试与提交约定
-
-```bash
-go build ./...
-go test ./...
-go vet ./...
-gofmt -l .        # 应为空
-```
-
-- **提交只在明确说"提交"时进行**；提交信息中文、说明动机而非流水账。
-- 默认**不推送**远端（`git push` 需明确要求）。
-- `tools/` 下的分析脚本不提交（个人运维用）。
-
----
-
-## 4. 常见问题
-
-**Q: 服务器磁盘上 metrics.db 越来越大？**
-请求日志保留策略默认 1 万条；控制台「管理设置 → 请求日志保留策略」可改为
-天数+条数双条件（例：30 天 + 20 万条），即时生效。
-
-**Q: 新镜像里前端没更新？**
-构建前端后忘记同步 `frontend/`（见 1b 第 2 步），或浏览器缓存了旧
-`index.html`——强刷（Ctrl+F5）。
-
-**Q: `docker load` 后容器起不来？**
-先看日志 `docker logs wk-linux-amd64`；最常见的两类：
-配置文件属主不对（应为 UID 10001，见 2a）和 `data/` 目录没挂载导致
-state.json 冲突。
-
-**Q: 怎么加新服务器？**
-`~/.ssh/config` 加别名（见第 0 节），服务器上跑一遍 2a 的目录准备，
-推送一个基础镜像（1a 构建后 `docker save | ssh ... docker load`），
-之后按 2b 走。
+日志体积通过控制台请求日志保留策略管理，不在部署中顺手删数据库；前端版本按资源 SHA256 校验。部署排障只提取所需状态/错误分类，不原样输出生产日志或通过命令行带出 API key。

@@ -18,9 +18,9 @@ import (
 
 func TestGrowthCompletedTaskClaimsWithoutRepeatingActions(t *testing.T) {
 	fastGrowthActions(t)
-	stub := &growthStub{tasks: `[{"task_code":"chat_5","target":5,"current":5,"accept_status":"accepted"}]`, claimCredit: 100}
+	stub := &growthStub{tasks: `[{"task_code":"RichMeow_Chat","target":5,"current":5,"accept_status":"accepted"}]`, claimCredit: 100}
 	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "fake"})
-	code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"chat_5"}`)
+	code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"RichMeow_Chat"}`)
 	if code != 200 || out["claimed"] != true {
 		t.Fatalf("status=%d result=%v", code, out)
 	}
@@ -31,9 +31,9 @@ func TestGrowthCompletedTaskClaimsWithoutRepeatingActions(t *testing.T) {
 
 func TestGrowthManualMutationsRespectAccountGuard(t *testing.T) {
 	for _, entry := range []struct{ path, body string }{
-		{"/tasks/accept", `{"task_codes":["chat_5"]}`},
+		{"/tasks/accept", `{"task_codes":["RichMeow_Chat"]}`},
 		{"/tasks/accept_all", `{}`},
-		{"/tasks/claim", `{"task_code":"chat_5"}`},
+		{"/tasks/claim", `{"task_code":"RichMeow_Chat"}`},
 	} {
 		t.Run(entry.path, func(t *testing.T) {
 			stub := &growthStub{tasks: runnerTasksStub}
@@ -53,13 +53,13 @@ func TestGrowthManualMutationsRespectAccountGuard(t *testing.T) {
 func TestGrowthManualClaimRecordsOneOffCompletion(t *testing.T) {
 	stub := &growthStub{tasks: runnerTasksStub, claimCredit: 10}
 	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "fake"})
-	code, out := growthPostAccount(t, h, "u1", "/tasks/claim", `{"task_code":"chat_5"}`)
-	if code != http.StatusOK || out["ok"] != true || h.growthTaskSkipReason("u1", &upstream.Task{TaskCode: "chat_5", TaskType: "single"}) == "" {
+	code, out := growthPostAccount(t, h, "u1", "/tasks/claim", `{"task_code":"RichMeow_Chat"}`)
+	if code != http.StatusOK || out["ok"] != true || h.growthTaskSkipReason("u1", &upstream.Task{TaskCode: "RichMeow_Chat", TaskType: "single"}) == "" {
 		t.Fatal("manual reward was not recorded for one-off completion checks")
 	}
 }
 
-func TestGrowthNightWindowSkipsBeforeAcceptance(t *testing.T) {
+func TestGrowthRetiredNightTaskSkippedEvenWhenClaimable(t *testing.T) {
 	h, _ := newGrowthHandler(t, &growthStub{}, &auth.Auth{UID: "u1", AccessToken: "fake"})
 	noon := time.Date(2026, 11, 12, 12, 0, 0, 0, time.Local)
 	task := &upstream.Task{TaskCode: "black_cat", AcceptStatus: "not_accepted"}
@@ -67,8 +67,8 @@ func TestGrowthNightWindowSkipsBeforeAcceptance(t *testing.T) {
 		t.Fatal("out-of-window night task was not skipped")
 	}
 	task.Claimable = true
-	if reason := h.growthTaskSkipReasonAt("u1", task, noon); reason != "" {
-		t.Fatalf("earned reward cannot be claimed outside action window: %s", reason)
+	if reason := h.growthTaskSkipReasonAt("u1", task, noon); reason == "" {
+		t.Fatal("retired task became available merely because it was claimable")
 	}
 }
 
@@ -77,10 +77,10 @@ func TestGrowthRouteFailureReturnsSynchronousResponsesWithoutHanging(t *testing.
 		path, body string
 		status     int
 	}{
-		{"/tasks/accept", `{"task_codes":["chat_5"]}`, http.StatusBadGateway},
+		{"/tasks/accept", `{"task_codes":["RichMeow_Chat"]}`, http.StatusBadGateway},
 		{"/tasks/accept_all", `{}`, http.StatusBadGateway},
-		{"/tasks/claim", `{"task_code":"chat_5"}`, http.StatusBadGateway},
-		{"/tasks/auto", `{"task_code":"chat_5"}`, http.StatusBadGateway},
+		{"/tasks/claim", `{"task_code":"RichMeow_Chat"}`, http.StatusBadGateway},
+		{"/tasks/auto", `{"task_code":"RichMeow_Chat"}`, http.StatusBadGateway},
 	} {
 		t.Run(entry.path, func(t *testing.T) {
 			stub := &growthStub{tasks: runnerTasksStub}
@@ -105,9 +105,9 @@ func TestGrowthSkipsUnavailableTasksWithoutActionsOrPolling(t *testing.T) {
 	fastGrowthActions(t)
 	for _, extra := range []string{`"locked":true`, `"status":"expired"`, `"accept_status":"not_eligible"`, `"status":"completed"`} {
 		t.Run(extra, func(t *testing.T) {
-			stub := &growthStub{tasks: `[{"task_code":"chat_5","target":5,"current":1,` + extra + `}]`}
+			stub := &growthStub{tasks: `[{"task_code":"RichMeow_Chat","target":5,"current":1,` + extra + `}]`}
 			h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "fake"})
-			code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"chat_5"}`)
+			code, out := growthPostAccount(t, h, "u1", "/tasks/auto", `{"task_code":"RichMeow_Chat"}`)
 			if code != 200 || out["skipped"] != true || stub.reportCalls != 0 || stub.claimCalls != 0 || stub.listCalls != 1 {
 				t.Fatalf("unavailable task executed: status=%d result=%v calls=%d/%d/%d", code, out, stub.reportCalls, stub.claimCalls, stub.listCalls)
 			}
@@ -117,11 +117,11 @@ func TestGrowthSkipsUnavailableTasksWithoutActionsOrPolling(t *testing.T) {
 
 func TestGrowthOneOffLedgerDoesNotSuppressRecurringTasks(t *testing.T) {
 	h, _ := newGrowthHandler(t, &growthStub{}, &auth.Auth{UID: "u1", AccessToken: "fake"})
-	h.growthLedger.record("u1", "fake", "chat_5", 100, 0)
-	if h.growthTaskSkipReason("u1", &upstream.Task{TaskCode: "chat_5", TaskType: "single"}) == "" {
+	h.growthLedger.record("u1", "fake", "RichMeow_Chat", 100, 0)
+	if h.growthTaskSkipReason("u1", &upstream.Task{TaskCode: "RichMeow_Chat", TaskType: "single"}) == "" {
 		t.Fatal("one-off claim was ignored")
 	}
-	if reason := h.growthTaskSkipReason("u1", &upstream.Task{TaskCode: "chat_5", TaskType: "daily"}); reason != "" {
+	if reason := h.growthTaskSkipReason("u1", &upstream.Task{TaskCode: "RichMeow_Chat", TaskType: "daily"}); reason != "" {
 		t.Fatalf("recurring task suppressed: %s", reason)
 	}
 }
@@ -135,7 +135,8 @@ func TestGrowthBatchNeverAcceptsUnsupportedOrUnavailableTasks(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/tasks"):
 			json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"tasks": []map[string]any{
 				{"task_code": "Expert_Philanthropy", "accept_status": "not_accepted"},
-				{"task_code": "chat_5", "target": 5, "current": 0, "status": "expired"},
+				{"task_code": "chat_5", "target": 5, "current": 0, "accept_status": "not_accepted"},
+				{"task_code": "RichMeow_Chat", "target": 5, "current": 0, "status": "expired"},
 				{"task_code": "first_buddy", "accept_status": "claimed"},
 			}}})
 		case strings.HasSuffix(r.URL.Path, "/accept"):
@@ -158,7 +159,8 @@ func TestGrowthBatchRechecksTasksCompletedByEarlierAction(t *testing.T) {
 	fastGrowthActions(t)
 	var actions, claims atomic.Int64
 	h, _ := newGrowthHandler(t, &growthStub{}, &auth.Auth{UID: "u1", AccessToken: "fake"})
-	for _, code := range []string{"Buddy_App", "Buddy_App_QQ"} {
+	// Simulate one current action completing another current task.
+	for _, code := range []string{"first_buddy", "RichMeow_Chat"} {
 		action := growthActionFor(code)
 		before := action.run
 		action.run = func(*Handler, *auth.Auth) (string, error) { actions.Add(1); return "offline shared event", nil }
@@ -171,8 +173,8 @@ func TestGrowthBatchRechecksTasksCompletedByEarlierAction(t *testing.T) {
 				current = 1
 			}
 			json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"tasks": []map[string]any{
-				{"task_code": "Buddy_App", "target": 1, "current": current, "accept_status": "accepted"},
-				{"task_code": "Buddy_App_QQ", "target": 1, "current": current, "accept_status": "accepted"},
+				{"task_code": "first_buddy", "target": 1, "current": current, "accept_status": "accepted"},
+				{"task_code": "RichMeow_Chat", "target": 1, "current": current, "accept_status": "accepted"},
 			}}})
 			return
 		}
@@ -194,9 +196,9 @@ func TestGrowthBatchRechecksTasksCompletedByEarlierAction(t *testing.T) {
 
 func TestGrowthBatchDoesNotCountUnconfirmedActionAsCompleted(t *testing.T) {
 	fastGrowthActions(t)
-	stub := &growthStub{tasks: `[{"task_code":"chat_5","target":5,"current":0,"accept_status":"accepted"}]`}
+	stub := &growthStub{tasks: `[{"task_code":"RichMeow_Chat","target":5,"current":0,"accept_status":"accepted"}]`}
 	h, _ := newGrowthHandler(t, stub, &auth.Auth{UID: "u1", AccessToken: "fake"})
-	action := growthActionFor("chat_5")
+	action := growthActionFor("RichMeow_Chat")
 	before := action.run
 	action.run = func(*Handler, *auth.Auth) (string, error) { return "上报成功", nil }
 	t.Cleanup(func() { action.run = before })

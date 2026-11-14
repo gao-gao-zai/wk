@@ -114,7 +114,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
           <Button type="text" icon={<SettingOutlined />} disabled={!!busy} onClick={() => setAdvanced(provider === 'ecode' ? 'ecode' : 'common')}>任务保护设置</Button>
         </div>
         <div className="enroll-muted" style={{ marginTop: 14 }}>平台和参数在启动时确定。需要更换平台时，请先停止当前批次；在途号码会按原平台收尾。</div>
-        {!busy && <Checkbox style={{ marginTop: 18 }} checked={config.autoenroll_growth_tasks !== false} onChange={e => onToggleGrowthTasks?.(e.target.checked)}>成功后执行成长任务 <Text type="secondary">（会发起真实对话）</Text></Checkbox>}
+        {!busy && <Checkbox style={{ marginTop: 18 }} checked={config.autoenroll_growth_tasks !== false} onChange={e => onToggleGrowthTasks?.(e.target.checked)}>成功后执行 3 项可自动成长任务 <Text type="secondary">（会发起真实上游事件上报、领养及领奖请求，不发送模型对话）</Text></Checkbox>}
       </Card>
       <SMSPlatforms settings={hz} running={!!busy} api={api} onSave={onSaveHaozhuma} onSaved={refresh} onAdvanced={setAdvanced} />
     </div>

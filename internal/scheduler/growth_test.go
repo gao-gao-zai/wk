@@ -269,8 +269,10 @@ func TestRunCheckinRunsStreakBonus(t *testing.T) {
 // blackcat
 // ---------------------------------------------------------------------------
 
-func TestRunBlackcatOutsideWindowSkips(t *testing.T) {
+func TestRetiredBlackcatScheduleMakesNoUpstreamRequests(t *testing.T) {
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
 		http.Error(w, "not found", 404)
 	}))
 	defer srv.Close()
@@ -281,6 +283,10 @@ func TestRunBlackcatOutsideWindowSkips(t *testing.T) {
 		t.Fatal("12:00 should not be in night window")
 	}
 	s, _, _ := newGrowthScheduler(srv, "u1")
-	// tasks list 404 → BlackcatNeed 报错 → 记日志继续，不 panic。
+	// An old enabled schedule cannot query tasks or send a billable chat,
+	// regardless of whether the test happens to run inside the night window.
 	s.RunBlackcatNow()
+	if calls.Load() != 0 {
+		t.Fatalf("retired blackcat schedule made %d requests", calls.Load())
+	}
 }

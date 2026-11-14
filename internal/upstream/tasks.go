@@ -132,6 +132,15 @@ func (c *Client) ListTasksContext(ctx context.Context, a *auth.Auth) ([]Task, er
 
 // AcceptTasks 接受任务（幂等：已 accepted 时上游返回成功或业务提示，均不视为致命错误）。
 func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
+	// Validate the complete batch before authenticating or making any request.
+	for _, code := range taskCodes {
+		if !IsCurrentGrowthTask(code) {
+			return ErrGrowthTaskUnavailable
+		}
+	}
+	if len(taskCodes) == 0 {
+		return nil
+	}
 	_, err := c.growthJSON(a, http.MethodPost, tasksAcceptPath, map[string]any{"task_codes": taskCodes})
 	return err
 }
@@ -139,6 +148,9 @@ func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
 // ClaimReward 领取单个任务奖励（Web 域端点，见文件头）。
 // 返回 (credit, energy, err)：credit/energy 为本次到账奖励（已领取过时为 0）。
 func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
+	if !IsCurrentGrowthTask(taskCode) {
+		return 0, 0, ErrGrowthTaskUnavailable
+	}
 	req, err := http.NewRequest(http.MethodPost,
 		c.webBase()+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", nil)
 	if err != nil {

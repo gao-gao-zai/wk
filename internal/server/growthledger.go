@@ -442,14 +442,10 @@ func (h *Handler) buildLedgerOverview(accounts []*auth.Auth, tasks [][]upstream.
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	auto := map[string]bool{}
-	for i := range growthActions {
-		auto[growthActions[i].TaskCode] = true
-	}
 	ov := ledgerOverview{Accounts: make([]ledgerSummary, 0, len(accounts))}
 	for idx, a := range accounts {
 		creds := a.Snapshot()
-		sum := ledgerSummary{UID: creds.UID, Nickname: creds.Nickname, TotalCount: len(growthActions)}
+		sum := ledgerSummary{UID: creds.UID, Nickname: creds.Nickname, TotalCount: len(upstream.CurrentGrowthTaskCodes())}
 		// 台账条目（本网关领取的，有时间与积分）。
 		claims := []ledgerClaim{}
 		if acc := l.byUID[creds.UID]; acc != nil {
@@ -464,13 +460,15 @@ func (h *Handler) buildLedgerOverview(accounts []*auth.Auth, tasks [][]upstream.
 		}
 		seen := map[string]bool{}
 		for _, c := range claims {
-			seen[c.TaskCode] = true
+			if upstream.IsCurrentGrowthTask(c.TaskCode) {
+				seen[c.TaskCode] = true
+			}
 		}
-		// 上游对账：claimed 但台账没有的可自动任务 → 计入 done（无时间/积分，
-		// 用户手动或部署本网关之前完成的）。不落盘。
+		// Keep all historical claims/rewards above, but count progress only for
+		// the five current tasks, including tasks completed manually upstream.
 		if idx < len(tasks) && tasks[idx] != nil {
 			for _, t := range tasks[idx] {
-				if t.Claimed && auto[t.TaskCode] && !seen[t.TaskCode] {
+				if t.Claimed && upstream.IsCurrentGrowthTask(t.TaskCode) && !seen[t.TaskCode] {
 					seen[t.TaskCode] = true
 					claims = append(claims, ledgerClaim{TaskCode: t.TaskCode})
 				}

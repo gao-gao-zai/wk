@@ -50,8 +50,8 @@ func TestGrowthWebsiteSnapshotKeepsPrivateRouteGuardAndCancellation(t *testing.T
 				}
 				scoped := route.Auth
 				operations := []func() error{
-					func() error { return c.AcceptTasks(scoped, []string{"chat_5"}) },
-					func() error { _, _, err := c.ClaimReward(scoped, "chat_5"); return err },
+					func() error { return c.AcceptTasks(scoped, []string{"RichMeow_Chat"}) },
+					func() error { _, _, err := c.ClaimReward(scoped, "RichMeow_Chat"); return err },
 					func() error { _, err := c.BuddyInfo(scoped); return err },
 					func() error {
 						return c.ReportWebEvent(scoped, "fixture", c.WebBaseCN+"/profile/growth-center", "fixture", "fixture")
@@ -147,13 +147,13 @@ func TestGrowthSnapshotScopeDoesNotJoinOrdinaryWebsiteLogin(t *testing.T) {
 		return []string{"192.0.2.1"}, false, func(context.Context) (*url.URL, func(), error) { return privateProxy, nil, nil }, nil
 	}
 	original := &auth.Auth{UID: "u", AccessToken: "fake-at", RefreshToken: "fake-rt"}
-	if err := c.AcceptTasks(original, []string{"chat_5"}); err != nil {
+	if err := c.AcceptTasks(original, []string{"RichMeow_Chat"}); err != nil {
 		t.Fatal(err)
 	}
 	ordinaryCalls := f.proxyCalls.Load()
 	route := c.PrepareGrowthRoute(context.Background(), original)
 	defer route.Release()
-	if err := c.AcceptTasks(route.Auth, []string{"chat_5"}); err != nil {
+	if err := c.AcceptTasks(route.Auth, []string{"RichMeow_Chat"}); err != nil {
 		t.Fatal(err)
 	}
 	if f.proxyCalls.Load() != ordinaryCalls {
@@ -166,7 +166,7 @@ func TestGrowthSnapshotScopeDoesNotJoinOrdinaryWebsiteLogin(t *testing.T) {
 		t.Fatalf("task reused ordinary route's login/session: %d", logins)
 	}
 	route.Release()
-	if err := c.AcceptTasks(original, []string{"chat_5"}); err != nil {
+	if err := c.AcceptTasks(original, []string{"RichMeow_Chat"}); err != nil {
 		t.Fatal("release changed ordinary cookie cache")
 	}
 }
