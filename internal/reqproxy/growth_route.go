@@ -3,10 +3,8 @@ package reqproxy
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net"
 	"net/url"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +12,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/growthlimit"
+	"workbuddy2api/internal/growthrouteerr"
 )
 
 // SetGrowthBudget is startup wiring; runner admission owns the same budget.
@@ -29,7 +28,7 @@ func (m *Manager) GrowthRoutePlan(ctx context.Context, uid, region string) ([]st
 	m.growthMu.Lock()
 	defer m.growthMu.Unlock()
 	if m.growthClosed {
-		return nil, false, nil, errors.New("growth proxy manager closed")
+		return nil, false, nil, growthrouteerr.New(growthrouteerr.ManagerClosed)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, nil, err
@@ -39,31 +38,33 @@ func (m *Manager) GrowthRoutePlan(ctx context.Context, uid, region string) ([]st
 		return nil, false, nil, err
 	}
 	if m.SharedError() != nil {
-		return nil, false, nil, errors.New("growth proxy state unavailable")
+		return nil, false, nil, growthrouteerr.New(growthrouteerr.StateUnavailable)
 	}
 	if !proxied {
 		return nil, true, func(ctx context.Context) (*url.URL, func(), error) {
 			m.growthMu.Lock()
 			defer m.growthMu.Unlock()
 			if m.growthClosed {
-				return nil, nil, errors.New("growth proxy manager closed")
+				return nil, nil, growthrouteerr.New(growthrouteerr.ManagerClosed)
 			}
 			if err := ctx.Err(); err != nil {
 				return nil, nil, err
 			}
 			_, nowProxied, err := m.selectGrowthNode(uid, region)
-			if err != nil || nowProxied {
-				return nil, nil, errors.New("growth proxy route changed after planning")
+			if err != nil {
+				return nil, nil, err
+			}
+			if nowProxied {
+				return nil, nil, growthrouteerr.New(growthrouteerr.RouteChanged)
 			}
 			if m.SharedError() != nil {
-				return nil, nil, errors.New("growth proxy state unavailable")
+				return nil, nil, growthrouteerr.New(growthrouteerr.StateUnavailable)
 			}
 			return nil, nil, nil
 		}, nil
 	}
 	expected, _ := json.Marshal(node)
 	frozen, ips := freezeGrowthNode(ctx, node, m.growthLookup)
-	frozenRaw, _ := json.Marshal(frozen)
 	if err = ctx.Err(); err != nil {
 		return nil, false, nil, err
 	}
@@ -71,23 +72,25 @@ func (m *Manager) GrowthRoutePlan(ctx context.Context, uid, region string) ([]st
 		m.growthMu.Lock()
 		defer m.growthMu.Unlock()
 		if m.growthClosed {
-			return nil, nil, errors.New("growth proxy manager closed")
+			return nil, nil, growthrouteerr.New(growthrouteerr.ManagerClosed)
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
 		current, stillProxied, err := m.selectGrowthNode(uid, region)
 		currentRaw, _ := json.Marshal(current)
-		if err != nil || !stillProxied || string(currentRaw) != string(expected) {
-			return nil, nil, errors.New("growth proxy route changed after planning")
+		if err != nil {
+			return nil, nil, err
 		}
-		current, currentIPs := freezeGrowthNode(ctx, current, m.growthLookup)
-		currentRaw, _ = json.Marshal(current)
-		if string(currentRaw) != string(frozenRaw) || !slices.Equal(currentIPs, ips) {
-			return nil, nil, errors.New("growth proxy DNS changed after planning")
+		if !stillProxied || string(currentRaw) != string(expected) {
+			return nil, nil, growthrouteerr.New(growthrouteerr.RouteChanged)
 		}
+		// The private outbound uses the planning-time frozen IP, which is
+		// already covered by the admitted resource set. Resolving the hostname
+		// again would reject ordinary rotating DNS without changing that route.
+		// Unknown DNS keeps nil resources and remains globally exclusive.
 		if m.SharedError() != nil {
-			return nil, nil, errors.New("growth proxy state unavailable")
+			return nil, nil, growthrouteerr.New(growthrouteerr.StateUnavailable)
 		}
 		if err = ctx.Err(); err != nil {
 			return nil, nil, err
@@ -98,7 +101,8 @@ func (m *Manager) GrowthRoutePlan(ctx context.Context, uid, region string) ([]st
 }
 
 // Compatibility entrypoint; the production runner plans before admission and
-// acquires only for the active set. Both entrypoints revalidate node and DNS.
+// acquires only for the active set. Both entrypoints revalidate the original
+// node configuration and retain the plan's frozen connection IP/resources.
 func (m *Manager) GrowthRouteLease(ctx context.Context, uid, region string) (*url.URL, []string, func(), error) {
 	ips, _, acquire, err := m.GrowthRoutePlan(ctx, uid, region)
 	if err != nil {
@@ -111,19 +115,19 @@ func (m *Manager) GrowthRouteLease(ctx context.Context, uid, region string) (*ur
 // Caller holds growthMu; never hold the pool lock across kernel operations.
 func (m *Manager) acquireGrowthNode(ctx context.Context, node NodeSpec) (*url.URL, func(), error) {
 	if m.kernel == nil {
-		return nil, nil, errors.New("growth proxy kernel unavailable")
+		return nil, nil, growthrouteerr.New(growthrouteerr.KernelUnavailable)
 	}
 	if len(m.growthSlots) >= m.growthBudget.LeaseLimit() {
-		return nil, nil, errors.New("growth proxy active route limit reached")
+		return nil, nil, growthrouteerr.New(growthrouteerr.RouteLimit)
 	}
 	port, err := m.pool.allocGrowthPort()
 	if err != nil {
-		return nil, nil, errors.New("growth proxy port capacity unavailable (business/probe ports reserved)")
+		return nil, nil, growthrouteerr.New(growthrouteerr.PortCapacity)
 	}
 	tag := newID("growth")
 	if err = m.kernel.AddSlot(tag, port, node); err != nil {
 		m.pool.releaseProbePort(port)
-		return nil, nil, errors.New("growth proxy private route unavailable")
+		return nil, nil, growthKernelError(err)
 	}
 	if err = ctx.Err(); err != nil {
 		_ = m.kernel.RemoveSlot(tag)
@@ -147,7 +151,7 @@ func (m *Manager) selectGrowthNode(uid, region string) (NodeSpec, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.mu.err != nil {
-		return NodeSpec{}, false, errors.New("growth proxy state unavailable")
+		return NodeSpec{}, false, growthrouteerr.New(growthrouteerr.StateUnavailable)
 	}
 	if !p.store.st.Enabled {
 		return NodeSpec{}, false, nil
@@ -170,7 +174,7 @@ func (m *Manager) selectGrowthNode(uid, region string) (NodeSpec, bool, error) {
 			if len(p.nodes) == 0 {
 				return NodeSpec{}, false, nil
 			}
-			return NodeSpec{}, false, errors.New("growth proxy selection failed")
+			return NodeSpec{}, false, growthrouteerr.New(growthrouteerr.SelectionFailed)
 		}
 		n := p.pickNodeLocked(candidates)
 		chosen = &n
@@ -178,7 +182,7 @@ func (m *Manager) selectGrowthNode(uid, region string) (NodeSpec, bool, error) {
 	raw, err := json.Marshal(chosen.NodeSpec)
 	var node NodeSpec
 	if err != nil || json.Unmarshal(raw, &node) != nil {
-		return NodeSpec{}, false, errors.New("growth proxy node unavailable")
+		return NodeSpec{}, false, growthrouteerr.New(growthrouteerr.NodeUnavailable)
 	}
 	return node, true, nil
 }

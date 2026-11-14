@@ -443,6 +443,8 @@ TLS 握手样本数据来自 [yreidev/workbuddy2api-panel 39049fc](https://githu
 
 这些措施减少额外信息暴露，不保证消除出口、请求内容及行为时序之间的关联。
 
+保留的旧成长任务实现中，`Buddy_App` / `Buddy_App_QQ` 的 `buddyapp_enter_click` 事件将 `isFirstPage` 作为 JSON 布尔值 `true` 发送，与已核对的客户端研究记录一致。保留原有五条事件及其顺序；上游部分接收、部分格式拒收时仍报告失败，不自动重放已接收的事件。这两项目前不注册为可执行任务。
+
 ## 请求代理（reqproxy，实际请求账号的代理池）
 
 与 `sms.proxy`（注册用代理）完全独立的**新模块**：让号池账号的日常 API 请求
@@ -487,6 +489,8 @@ config.json 基础设施参数（全部可选，不配即用默认值）：
 模块开关、订阅、节点、规则、绑定全部存 `data/reqproxy/state.json`（WebUI 管理，
 改完即生效，5 秒内落盘）。管理 API 挂在 `/admin/reqproxy/*`（见
 `internal/server/reqproxy_handlers.go`）。
+
+成长任务在规划时解析代理域名，并把私有路由固定到当次地址集合中的一个 IP。执行前仍核对节点配置，但不因供应商轮询 DNS 的后续变化拒绝已固定的路由；无法确定地址时继续全局独占执行。路由准备失败会附加白名单 `reason` 原因码，例如 `port_capacity`、`kernel_inbound` 或 `route_changed`，不回显代理地址、认证参数或底层原始错误。
 
 ## 并发与性能
 

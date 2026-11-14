@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/growthrouteerr"
 )
 
 var ErrGrowthAuthStale = errors.New("growth account identity or credentials changed")
@@ -21,8 +22,9 @@ var errGrowthRouteClosed = errors.New("growth task route is closed")
 type GrowthRouteLeaseFunc func(context.Context, string, string) (*url.URL, []string, func(), error)
 
 // Planning is read-only: no listener, reserved port or persistent binding. The
-// acquisition closure must revalidate its exact node/IP plan before opening a
-// private route. Unknown proxy IPs require global exclusive scheduling.
+// acquisition closure must revalidate the original node configuration and use
+// the planned, frozen connection IP. Unknown proxy IPs require global exclusive
+// scheduling for the entire task.
 type GrowthRoutePlanFunc func(context.Context, string, string) ([]string, bool, func(context.Context) (*url.URL, func(), error), error)
 
 type growthRouteScope struct {
@@ -143,13 +145,13 @@ func (c *Client) PlanGrowthRoute(ctx context.Context, a *auth.Auth, guard func()
 		var direct bool
 		ips, direct, p.acquire, p.err = c.GrowthRoutePlan(ctx, s.UID, a.Region())
 		if p.err != nil {
-			p.err = errors.New("growth task proxy planning failed")
+			p.err = growthrouteerr.Public("growth task proxy planning failed", p.err)
 		} else if direct {
 			p.Resources = []string{"direct"}
 		} else {
 			p.Resources = proxyIPResources(ips)
 			if p.acquire == nil {
-				p.err = errors.New("growth task proxy acquisition unavailable")
+				p.err = growthrouteerr.Public("growth task proxy acquisition unavailable", growthrouteerr.New(growthrouteerr.AcquisitionUnavailable))
 			}
 		}
 	} else if c.GrowthRouteLease != nil {
@@ -187,7 +189,7 @@ func (p *GrowthRoutePlan) acquireRoute() *GrowthRoute {
 		var err error
 		proxy, release, err = p.acquire(ctx)
 		if err != nil {
-			scope.err = errors.New("growth task proxy route unavailable")
+			scope.err = growthrouteerr.Public("growth task proxy route unavailable", err)
 		}
 	}
 	if scope.err == nil {

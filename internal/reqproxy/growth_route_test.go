@@ -205,7 +205,7 @@ func TestGrowthPlanningLeavesEntireQueueWithoutPortReservations(t *testing.T) {
 	}
 }
 
-func TestGrowthPlanRejectsNodeAndDNSDriftBeforeLease(t *testing.T) {
+func TestGrowthPlanRejectsNodeDriftBeforeLease(t *testing.T) {
 	store, err := NewStore(filepath.Join(t.TempDir(), "plan.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -216,19 +216,10 @@ func TestGrowthPlanRejectsNodeAndDNSDriftBeforeLease(t *testing.T) {
 	node := httpNodeSpec("node", "proxy.fixture.invalid:8080")
 	pool.SetNodes([]NodeSpec{node})
 	markHealthy(t, pool, node.ID, 1)
-	answer := "192.0.2.1"
 	manager := &Manager{store: store, pool: pool, growthLookup: func(context.Context, string) ([]net.IPAddr, error) {
-		return []net.IPAddr{{IP: net.ParseIP(answer)}}, nil
+		return []net.IPAddr{{IP: net.ParseIP("192.0.2.1")}}, nil
 	}}
 	_, _, acquire, err := manager.GrowthRoutePlan(context.Background(), "a", "cn")
-	if err != nil {
-		t.Fatal(err)
-	}
-	answer = "192.0.2.2"
-	if _, _, err = acquire(context.Background()); err == nil || !strings.Contains(err.Error(), "DNS changed") {
-		t.Fatalf("DNS drift accepted: %v", err)
-	}
-	_, _, acquire, err = manager.GrowthRoutePlan(context.Background(), "a", "cn")
 	if err != nil {
 		t.Fatal(err)
 	}
